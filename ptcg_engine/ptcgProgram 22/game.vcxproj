@@ -111,6 +111,7 @@
     <ClInclude Include="EffectInstant.h" />
     <ClInclude Include="EffectProc.h" />
     <ClInclude Include="ExactSearchHooks.h" />
+    <ClInclude Include="ExactPlanner.h" />
     <ClInclude Include="FixedList.h" />
     <ClInclude Include="Framework.h" />
     <ClInclude Include="Game.h" />

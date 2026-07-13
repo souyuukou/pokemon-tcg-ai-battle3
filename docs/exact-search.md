@@ -54,10 +54,34 @@ values, and 0.3 GB headroom. Keep 30 seconds of the 600-second match bank.
 
 An interrupted node is stored as an interval, never as an exact value. The
 emergency action maximizes the proven lower bound and is marked `certified=false`.
-The bundled native API currently requires fabricated opponent identities for
-search initialization; this implementation refuses to do that. Rebuild the
-native engine with an information-state chance provider before enabling certified
-full-turn search in the competition agent.
+The legacy `SearchBegin` API requires fabricated opponent identities. The agent
+does not use that path for turn planning; `ExactDecide` below preserves unknown
+zones and reports an interval when an identity is genuinely required.
+
+## Native turn planner
+
+`ExactDecide` is the information-safe replacement for `SearchBegin` in the
+submission agent. It accepts the sanitized serialized observation, the fixed
+deck, aligned hand-card values, and one wall-clock budget. It returns the chosen
+physical option indexes, exact rational lower/upper bounds, certification, and
+search metrics.
+
+The planner stores the actor's unknown deck and prizes as one card-count pool.
+Draws and prize takes branch by card type with remaining-copy integer weights.
+When an effect legally reveals the deck, prize multisets are enumerated lazily
+with hypergeometric weights and the triggering action is replayed in each
+resulting information state. A shuffled known deck is a multiset, not a sampled
+permutation.
+
+Two root workers own independent `Game` scratch state, TT, key memory, and a
+shared per-worker deadline. Each TT is limited by both entry count and 550 MiB
+of stored key/value bytes. Unknown opponent identities are never populated with
+guessed cards: an actual identity dependency produces the full evaluator
+interval and `certified=false`.
+
+Windows x64 `cg.dll` and Linux x86-64 `libcg.so` include `ExactDecide`. The
+Python wrapper feature-detects the symbol so the unchanged ARM64 library uses a
+legal deterministic fallback.
 
 ## Git deck workflow
 

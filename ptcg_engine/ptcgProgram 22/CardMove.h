@@ -115,6 +115,11 @@ inline CardRef MoveCard(State& state, int playerIndex, AreaType fromArea, int fr
 		area = AreaType::Deck;
 	}
 	state.cardMoved(ref, area);
+	if (state.exact.enabled && toArea == AreaType::Deck
+		&& state.exact.deckUnknown[playerIndex]
+		&& fromArea != AreaType::Deck && fromArea != AreaType::DeckBottom) {
+		state.exact.addHiddenCard(state.getCard(ref).cardId);
+	}
 	if (!noLog) {
 		if (toArea != AreaType::PreEvolution) {
 			LogMoveCard(state, playerIndex, ref, logArea, toArea, openType);
@@ -259,7 +264,9 @@ inline void ShuffleDeck(State& state, int playerIndex, bool noLog = false) {
 	PlayerState& ps = state.players.at(playerIndex);
 	if (ps.deck.size() > 0) {
 		state.changed = true;
-		if (state.game->config.deviceRand) {
+		if (state.exact.enabled) {
+			state.exact.deckExchangeable[playerIndex] = true;
+		} else if (state.game->config.deviceRand) {
 			std::shuffle(ps.deck.begin(), ps.deck.end(), std::random_device());
 		} else {
 			std::shuffle(ps.deck.begin(), ps.deck.end(), state.game->rng);
@@ -285,6 +292,14 @@ inline void OpenReturnAndShuffle(State& state, int playerIndex) {
 // カードを引く
 inline void Draw(State& state, int playerIndex, int count) {
 	PlayerState& ps = state.players.at(playerIndex);
+	if (state.exact.enabled && count > 0 && ps.deck.size() > 0) {
+		if (state.exact.deckUnknown[playerIndex] || state.exact.deckExchangeable[playerIndex]) {
+			state.exact.pending = ExactPendingType::Draw;
+			state.exact.pendingPlayer = (signed char)playerIndex;
+			state.exact.pendingCount = (unsigned char)std::min(count, ps.deck.size());
+			return;
+		}
+	}
 	for (int i = 0; i < count; i++) {
 		if (ps.deck.size() > 0) {
 			state.changed = true;

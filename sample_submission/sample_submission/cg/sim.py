@@ -66,6 +66,13 @@ lib.SearchEnd.argtypes = [ctypes.c_void_p]
 
 lib.SearchRelease.argtypes = [ctypes.c_void_p, ctypes.c_int64]
 
+if hasattr(lib, "ExactDecide"):
+    lib.ExactDecide.restype = ctypes.c_char_p
+    lib.ExactDecide.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+        ctypes.c_int, ctypes.c_int]
+
 lib.AllCard.restype = ctypes.c_char_p
 
 lib.AllAttack.restype = ctypes.c_char_p

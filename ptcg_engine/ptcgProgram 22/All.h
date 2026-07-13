@@ -11,6 +11,7 @@
 #include "InitializeCard.h"
 #include "Api.h"
 #include "ExactSearchHooks.h"
+#include "ExactPlanner.h"
 
 inline void InitializeAll() {
   assert(CardTable.size() == 0);
