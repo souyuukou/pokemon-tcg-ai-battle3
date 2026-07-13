@@ -1,0 +1,28 @@
+# Large local corpora and replay caches
+/data/
+
+# Python generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Native build products
+.vs/
+build/
+out/
+**/x64/
+**/Debug/
+**/Release/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Local run artifacts
+artifacts/
+*.log
+*.tmp
+
