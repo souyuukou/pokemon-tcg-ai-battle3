@@ -8,7 +8,9 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_PROFILE = ROOT / "decks" / "majkel1337-85795098.json"
+PACKAGE_PROFILE = Path(__file__).resolve().parents[1] / "deck-profile.json"
+REPOSITORY_PROFILE = ROOT / "decks" / "majkel1337-85795098.json"
+DEFAULT_PROFILE = PACKAGE_PROFILE if PACKAGE_PROFILE.exists() else REPOSITORY_PROFILE
 
 
 @dataclass(frozen=True)
