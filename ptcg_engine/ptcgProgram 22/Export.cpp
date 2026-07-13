@@ -8,6 +8,7 @@
 #define NOMINMAX
 
 #include "All.h"
+#include <future>
 
 #ifdef _MSC_VER
 #	define GAME_API __declspec(dllexport)
@@ -36,6 +37,41 @@ static void CopyIdPtr(int* src, std::vector<int>& dest, int count, int& error) {
       break;
     }
   }
+}
+
+static void AppendLongLong(JsonBuilder& j, long long value) {
+  std::string text = std::to_string(value);
+  for (char c : text) j.append(c);
+}
+
+static void AppendUnsignedLongLong(JsonBuilder& j, unsigned long long value) {
+  std::string text = std::to_string(value);
+  for (char c : text) j.append(c);
+}
+
+static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& decision) {
+  JsonBuilder& j = data->jsonBuilder;
+  j.clear(); j.append('{');
+  j.appendKey("selected"); j.append('[');
+  for (int i : range(decision.score.action)) { j.comma(i); j.append(decision.score.action[i]); }
+  j.append(']');
+  j.appendCommaKey("lowerNumerator"); AppendLongLong(j, decision.score.lower.numerator);
+  j.appendCommaKey("lowerDenominator"); AppendUnsignedLongLong(j, decision.score.lower.denominator);
+  j.appendCommaKey("upperNumerator"); AppendLongLong(j, decision.score.upper.numerator);
+  j.appendCommaKey("upperDenominator"); AppendUnsignedLongLong(j, decision.score.upper.denominator);
+  j.appendCommaKeyValue("certified", decision.score.certified);
+  j.appendCommaKey("expandedNodes"); AppendUnsignedLongLong(j, decision.metrics.expanded);
+  j.appendCommaKey("mergedNodes"); AppendUnsignedLongLong(j, decision.metrics.merged);
+  j.appendCommaKeyValue("timedOut", decision.metrics.timedOut);
+  j.appendCommaKeyValue("arithmeticOverflow", decision.metrics.arithmeticOverflow);
+  j.appendCommaKey("leafNodes"); AppendUnsignedLongLong(j, decision.metrics.leaves);
+  j.appendCommaKey("opaqueNodes"); AppendUnsignedLongLong(j, decision.metrics.opaque);
+  j.appendCommaKey("exceptionNodes"); AppendUnsignedLongLong(j, decision.metrics.exceptions);
+  j.appendCommaKey("lastException");
+  j.appendDoubleQuote(std::u8string((const char8_t*)decision.metrics.lastException.c_str(), decision.metrics.lastException.size()));
+  j.appendCommaKeyValue("lastPendingDetail", decision.metrics.lastPendingDetail);
+  j.append('}');
+  return j.buf.c_str();
 }
 
 extern "C" {
@@ -143,6 +179,73 @@ extern "C" {
       }
     }
     return JsonResult(data, si);
+  }
+
+  GAME_API const char8_t* ExactDecide(ApiData* data, const char* serialized, int count,
+      int* deck, int* handValues, int deckCount, int budgetMilliseconds) {
+    if (data->apiDataType != 2 || deckCount <= 0 || deckCount > DECK_SIZE) {
+      data->jsonBuilder.clear();
+      data->jsonBuilder.appendStr("{\"error\":30}");
+      return data->jsonBuilder.buf.c_str();
+    }
+    try {
+      SetBattleData(data, serialized, count);
+      ExactDecision decision;
+      const State& root = data->state;
+      if (root.selectMin == 1 && root.selectMax == 1 && root.options.size() > 1) {
+        struct WorkerResult { std::vector<ExactScore> actions; ExactMetrics metrics; };
+        auto worker = [&](int parity) {
+          WorkerResult output;
+          Game game = data->game;
+          ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds);
+          for (int option = parity; option < (int)root.options.size(); option += 2) {
+            State local = root; local.game = &game;
+            ExactDecision item = planner.evaluateRootAction(local, option);
+            output.actions.push_back(item.score);
+            output.metrics = item.metrics;
+          }
+          return output;
+        };
+        auto future0 = std::async(std::launch::async, worker, 0);
+        auto future1 = std::async(std::launch::async, worker, 1);
+        WorkerResult results[2] = { future0.get(), future1.get() };
+        bool first = true, allCertified = true;
+        ExactFraction maxUpper = ExactFraction::integer(-100'000'000);
+        for (const WorkerResult& wr : results) {
+          for (const ExactScore& item : wr.actions) {
+          if (first || ExactCompare(item.lower, decision.score.lower) > 0
+              || (ExactCompare(item.lower, decision.score.lower) == 0 && item.action < decision.score.action)) {
+            decision.score = item; first = false;
+          }
+          if (ExactCompare(item.upper, maxUpper) > 0) maxUpper = item.upper;
+          allCertified = allCertified && item.certified;
+          }
+          decision.metrics.expanded += wr.metrics.expanded;
+          decision.metrics.merged += wr.metrics.merged;
+          decision.metrics.leaves += wr.metrics.leaves;
+          decision.metrics.opaque += wr.metrics.opaque;
+          decision.metrics.exceptions += wr.metrics.exceptions;
+          decision.metrics.timedOut = decision.metrics.timedOut || wr.metrics.timedOut;
+          decision.metrics.arithmeticOverflow = decision.metrics.arithmeticOverflow || wr.metrics.arithmeticOverflow;
+          if (!wr.metrics.lastException.empty()) decision.metrics.lastException = wr.metrics.lastException;
+          if (wr.metrics.lastPendingDetail != 0) decision.metrics.lastPendingDetail = wr.metrics.lastPendingDetail;
+        }
+        if (first) {
+          decision.score = {};
+        } else {
+          decision.score.upper = maxUpper;
+          decision.score.certified = allCertified && ExactCompare(decision.score.lower, decision.score.upper) == 0;
+        }
+      } else {
+        ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds);
+        decision = planner.decide(data->state);
+      }
+      return ExactDecisionJson(data, decision);
+    } catch (...) {
+      data->jsonBuilder.clear();
+      data->jsonBuilder.appendStr("{\"error\":99}");
+      return data->jsonBuilder.buf.c_str();
+    }
   }
 
   GAME_API void SearchEnd(ApiData* data) {

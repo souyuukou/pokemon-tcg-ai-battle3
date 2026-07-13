@@ -671,14 +671,29 @@ inline void TargetList(const State& state, const Target& target, std::vector<Are
 			}
 			const PlayerState& ps = state.players[playerIndex];
 			for (AreaType areaType : target.areas) {
+				auto deferUnknown = [&](const auto& list, ExactPendingType ownType) {
+					if (!state.exact.enabled) return false;
+					for (CardRef ref : list) {
+						if (ref.isNull()) {
+							State& mutableState = const_cast<State&>(state);
+							mutableState.exact.pending = (playerIndex == state.exact.actor ? ownType : ExactPendingType::Opaque);
+							mutableState.exact.pendingPlayer = (signed char)playerIndex;
+							mutableState.exact.pendingDetail = (short)((int)areaType + 100 * playerIndex);
+							return true;
+						}
+					}
+					return false;
+				};
 				switch (areaType)
 				{
 				case AreaType::Deck:
+					if (deferUnknown(ps.deck, ExactPendingType::RevealDeck)) return;
 					for (CardRef ref : ps.deck) {
 						AddIfTarget(state, ref, target, output, effectCard);
 					}
 					break;
 				case AreaType::Hand:
+					if (deferUnknown(ps.hand, ExactPendingType::Opaque)) return;
 					if (target.skipEnemyTarget && playerIndex != state.getCard(effectCard.card).playerIndex) {
 						for (CardRef ref : ps.hand) {
 							output.push_back(state.makeAreaRef(ref));
@@ -705,6 +720,7 @@ inline void TargetList(const State& state, const Target& target, std::vector<Are
 					}
 					break;
 				case AreaType::Prize:
+					if (deferUnknown(ps.prize, ExactPendingType::TakePrize)) return;
 					for (CardRef ref : ps.prize) {
 						AddIfTarget(state, ref, target, output, effectCard);
 					}

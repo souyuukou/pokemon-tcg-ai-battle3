@@ -38,6 +38,9 @@ class MatchBudget:
     def can_expand(self) -> bool:
         return self.remaining > self.limits.reserve_seconds and current_rss_bytes() < self.limits.rss_limit_bytes
 
+    def reset(self) -> None:
+        self.started = time.monotonic()
+
 
 def current_rss_bytes() -> int:
     """Current RSS without a third-party dependency."""

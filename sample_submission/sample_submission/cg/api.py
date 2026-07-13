@@ -638,5 +638,27 @@ def search_release(search_id: int) -> None:
     """
     lib.SearchRelease(agent_ptr, search_id)
 
+def exact_decide(agent_observation: Observation, deck: list[int], hand_values: list[int],
+                 budget_milliseconds: int) -> dict:
+    """Run actor-relative exact turn search and return action, bounds, and metrics."""
+    global agent_ptr
+    if not hasattr(lib, "ExactDecide"):
+        raise RuntimeError("ExactDecide is not available in this native library")
+    if "agent_ptr" not in globals():
+        agent_ptr = lib.AgentStart()
+    serialized = agent_observation.search_begin_input
+    if serialized is None:
+        raise ValueError("Not agent observation.")
+    if len(deck) != len(hand_values):
+        raise ValueError("deck and hand_values length mismatch")
+    deck_arg = (ctypes.c_int * len(deck))(*deck)
+    value_arg = (ctypes.c_int * len(hand_values))(*hand_values)
+    raw = lib.ExactDecide(agent_ptr, serialized.encode("ascii"), len(serialized),
+                          deck_arg, value_arg, len(deck), int(budget_milliseconds))
+    result = json.loads(raw.decode())
+    if result.get("error"):
+        raise RuntimeError(f"ExactDecide failed: {result['error']}")
+    return result
+
 #endregion functions
 
