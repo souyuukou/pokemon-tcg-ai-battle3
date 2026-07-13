@@ -40,3 +40,33 @@ def context_is_audited(context: object) -> bool:
     name = getattr(context, "name", str(context)).upper()
     return name in SAFE_CONTEXTS
 
+
+def bounded_count_vectors(capacities: Sequence[int], minimum: int, maximum: int):
+    """Exact unordered selections of identical classes (energy/hand copies)."""
+    if minimum < 0 or maximum < minimum: raise ValueError("invalid count range")
+    vector = [0] * len(capacities)
+    def rec(index: int, total: int):
+        if index == len(capacities):
+            if minimum <= total <= maximum: yield tuple(vector)
+            return
+        for count in range(min(capacities[index], maximum - total) + 1):
+            vector[index] = count
+            yield from rec(index + 1, total + count)
+        vector[index] = 0
+    yield from rec(0, 0)
+
+
+def orbit_allocations(size: int, units: int, per_member_cap: int):
+    """Integer partitions across exchangeable Pokémon, canonicalized by sorting."""
+    if size < 0 or units < 0 or per_member_cap < 0: raise ValueError("negative allocation")
+    current: list[int] = []
+    def rec(left_members: int, left_units: int, ceiling: int):
+        if left_members == 0:
+            if left_units == 0: yield tuple(current)
+            return
+        for value in range(min(ceiling, per_member_cap, left_units), -1, -1):
+            current.append(value)
+            yield from rec(left_members - 1, left_units - value, value)
+            current.pop()
+    yield from rec(size, units, per_member_cap)
+
