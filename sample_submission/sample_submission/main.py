@@ -1,23 +1,18 @@
 import os
-import random
-
 from cg.api import Observation, to_observation_class
+from exact_solver.agent_policy import choose_action
+from exact_solver.profile import load_profile
 
 def read_deck_csv() -> list[int]:
-    """Read deck.csv.
-    
-    Returns:
-        list[int]: A list of card IDs in the deck.
-    """
-    file_path = "deck.csv"
-    if not os.path.exists(file_path):
-        file_path = "/kaggle_simulations/agent/" + file_path
-    with open(file_path, "r") as file:
-        csv = file.read().split("\n")
-    deck = []
-    for i in range(60):
-        deck.append(int(csv[i]))
-    return deck
+    """Load the branch-selectable, hash-verified deck profile."""
+    try:
+        return list(load_profile().cards)
+    except (FileNotFoundError, ValueError):
+        file_path = "deck.csv"
+        if not os.path.exists(file_path):
+            file_path = "/kaggle_simulations/agent/" + file_path
+        with open(file_path, "r") as file:
+            return [int(v) for v in file.read().splitlines()[:60]]
 
 def agent(obs_dict: dict) -> list[int]:
     """Implement Your Pokémon Trading Card Game Agent.
@@ -35,4 +30,5 @@ def agent(obs_dict: dict) -> list[int]:
         # The deck must comply with the Pokémon Trading Card Game rules.
         return read_deck_csv()
     
-    return random.sample(list(range(len(obs.select.option))), obs.select.maxCount)  # select randomly
+    action, _certified, _reason = choose_action(obs)
+    return action

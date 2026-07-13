@@ -10,6 +10,7 @@
 #include "CardImpl.h"
 #include "InitializeCard.h"
 #include "Api.h"
+#include "ExactSearchHooks.h"
 
 inline void InitializeAll() {
   assert(CardTable.size() == 0);
