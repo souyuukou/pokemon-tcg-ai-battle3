@@ -4,7 +4,8 @@ import time
 
 import pytest
 
-from cg.api import exact_decide, exact_decide_v2, to_observation_class
+from cg.api import (exact_decide, exact_decide_v2, exact_turn_advance,
+                    exact_turn_begin, exact_turn_release, to_observation_class)
 from cg.game import battle_finish, battle_select, battle_start_seeded
 from exact_solver.profile import load_profile
 
@@ -57,6 +58,26 @@ def test_exact_decide_v2_accepts_known_opponent_profile():
         battle_finish()
 
 
+def test_completed_turn_policy_reroots_without_research():
+    session_id = None
+    try:
+        profile, deck, observation = _seeded_first_main(21)
+        assert len(observation["select"]["option"]) == 1
+        first = exact_turn_begin(to_observation_class(observation), deck, _hand_values(profile),
+                                 1_000, opponent_deck=deck)
+        session_id = first["sessionId"]
+        second = exact_turn_advance(session_id, to_observation_class(observation), 100)
+        assert first["selected"] == second["selected"] == [0]
+        assert first["certified"] is second["certified"] is True
+        assert second["policyHits"] >= 1
+        assert second["avoidedExpandedNodes"] >= 1
+        assert second["resumedNodes"] == 0
+    finally:
+        if session_id is not None:
+            exact_turn_release(session_id)
+        battle_finish()
+
+
 @pytest.mark.skipif(os.environ.get("PTCG_RUN_SLOW_EXACT") != "1",
                     reason="set PTCG_RUN_SLOW_EXACT=1 for the 600-second acceptance run")
 def test_seed6_first_main_is_fully_certified_under_match_limits():
@@ -91,4 +112,34 @@ def test_seed6_first_main_is_fully_certified_under_match_limits():
         assert result["rootWorkers"] <= 2
         assert peak_rss < 3 * 1024**3
     finally:
+        battle_finish()
+
+
+@pytest.mark.skipif(os.environ.get("PTCG_RUN_SLOW_EXACT") != "1",
+                    reason="set PTCG_RUN_SLOW_EXACT=1 for the turn-policy acceptance run")
+def test_seed6_completed_policy_serves_the_rest_of_the_turn():
+    session_id = None
+    try:
+        profile, deck, observation = _seeded_first_main(6)
+        first = exact_turn_begin(to_observation_class(observation), deck, _hand_values(profile), 570_000)
+        session_id = first["sessionId"]
+        assert first["certified"] is True
+        assert first["selected"] == [0]
+        assert first["policyNodes"] > 0
+        turn = observation["current"]["turn"]
+        observation = battle_select(first["selected"])
+        calls = 0
+        while observation.get("select") is not None and observation["current"]["turn"] == turn:
+            started = time.perf_counter()
+            result = exact_turn_advance(session_id, to_observation_class(observation), 10_000)
+            assert time.perf_counter() - started < 0.1
+            assert result["certified"] is True
+            assert result["policyHits"] > calls
+            assert result["resumedNodes"] == 0
+            calls += 1
+            observation = battle_select(result["selected"])
+        assert calls >= 1
+    finally:
+        if session_id is not None:
+            exact_turn_release(session_id)
         battle_finish()

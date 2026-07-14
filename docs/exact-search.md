@@ -89,6 +89,21 @@ of an unknown opponent zone therefore still fails closed. Detailed metrics
 separate unknown-opponent reads, unsupported concrete reads, interrupted
 transitions, depth guards, raw choices, and quotient-merged choices.
 
+`ExactTurnBegin` retains the selected root worker's transposition table and a
+compact contingent policy for the rest of the turn.  Actor decision nodes are
+indexed by a serial-independent semantic observation key; actions are stored as
+semantic option descriptors and remapped to the current physical option array.
+`ExactTurnAdvance` conditions on the next observation and returns a certified
+policy hit without expanding nodes when the information state is unambiguous.
+If multiple hidden beliefs produce different actions or values for the same
+observable key, lookup fails closed and resumes exact search from the live
+observation. `ExactTurnRelease` frees all native session memory at turn end.
+
+The Python policy owns a `PolicyContext` per player.  Each context has its own
+600-second chess clock, native session, and decision metrics; only time spent in
+that player's action calls is charged.  This prevents self-play from sharing a
+single budget or charging one player for the opponent's search.
+
 Count-only and existence-only conditions on a hidden deck use the zone size and
 do not request card identities. Concrete searches suspend the transition,
 enumerate bounded card-count allocations with combination weights, materialize
@@ -101,6 +116,10 @@ seed 6 reaches a first-turn Poké Pad position whose only root choices are Poké
 Pad and End. Both Windows and Linux enumerate 1,264,533 evaluated leaves and
 return the exact value 4100 with `certified=true`, `opaqueNodes=0`; observed
 wall time is approximately 118 seconds on the two-core development target.
+With retained policy generation enabled the same position takes approximately
+130 seconds on the development machine; its three subsequent Poke Pad choices
+are served by the certified policy in under one millisecond each with no resumed
+search nodes.
 
 ## Git deck workflow
 
