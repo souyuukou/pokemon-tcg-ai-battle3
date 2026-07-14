@@ -73,16 +73,60 @@ with hypergeometric weights and the triggering action is replayed in each
 resulting information state. A shuffled known deck is a multiset, not a sampled
 permutation.
 
-Two root workers own independent `Game` scratch state, TT, key memory, and a
-shared per-worker deadline. Each TT is limited by both entry count and 550 MiB
-of stored key/value bytes. Unknown opponent identities are never populated with
-guessed cards: an actual identity dependency produces the full evaluator
-interval and `certified=false`.
+Two root workers own independent `Game` scratch state and partial cursors. They
+share a 64-shard table of immutable completed entries; SipHash chooses a shard
+and the complete canonical bytes are compared inside the digest bucket. Root
+actions are probed fairly, then advanced in bounded node quanta. Actions with
+the same canonical successor use one representative while all physical root
+intervals remain in the API result. Unknown opponent identities are never
+populated with guessed cards: an actual identity dependency produces the full
+evaluator interval and `certified=false`.
+
+`ExactCanonicalState` is used at every native node. It explicitly encodes State
+scalars, Card state, references, attachments, ordered stacks, and exchangeable
+zone multisets. It never hashes C++ padding, unused FixedList storage, physical
+serials, or absolute move counters. This is required for resumability: the old
+raw serializer produced different keys when the same root action was replayed.
+Canonical bytes use lossless zero-run encoding before hashing and storage.
+
+Interrupted Decision nodes retain exact action intervals and a round-robin
+cursor. Chance nodes retain certified integer mass. Terminal turn leaves are
+evaluated directly and are not inserted into the TT because they are cheap and
+almost always unique. RSS is sampled in native enumeration loops; 2.7 GiB
+stops further search safely and returns the current proven interval.
 
 Windows x64 `cg.dll` and Linux x86-64 `libcg.so` include `ExactDecide`. The
 Python wrapper feature-detects the symbol so the unchanged ARM64 library uses a
 legal deterministic fallback.
 
+`ExactDecideV2` additionally accepts an optional known opponent deck for
+closed-world validation. Production calls omit it; an identity-dependent read
+of an unknown opponent zone therefore still fails closed. Detailed metrics
+separate unknown-opponent reads, unsupported concrete reads, interrupted
+transitions, depth guards, raw choices, and quotient-merged choices.
+
+`ExactTurnBegin` retains the selected root worker's transposition table and a
+compact contingent policy for the rest of the turn.  Actor decision nodes are
+indexed by a serial-independent semantic observation key; actions are stored as
+semantic option descriptors and remapped to the current physical option array.
+`ExactTurnAdvance` conditions on the next observation and returns a certified
+policy hit without expanding nodes when the information state is unambiguous.
+If multiple hidden beliefs produce different actions or values for the same
+observable key, lookup fails closed and resumes exact search from the live
+observation. `ExactTurnRelease` frees all native session memory at turn end.
+`ExactTurnProgress` is read-only and reports the current root action, depth,
+canonical/successor merges, resumed work, elapsed time, and memory.
+
+The Python policy owns a `PolicyContext` per player.  Each context has its own
+600-second chess clock, native session, and decision metrics; only time spent in
+that player's action calls is charged.  This prevents self-play from sharing a
+single budget or charging one player for the opponent's search.
+
+Count-only and existence-only conditions on a hidden deck use the zone size and
+do not request card identities. Concrete searches suspend the transition,
+enumerate bounded card-count allocations with combination weights, materialize
+the selected world, and replay from the pre-transition checkpoint. Identical
+copies in an exchangeable searched deck share one semantic action.
 ## Git deck workflow
 
 `main` contains generic engine/search code. Deck/evaluator changes belong in
