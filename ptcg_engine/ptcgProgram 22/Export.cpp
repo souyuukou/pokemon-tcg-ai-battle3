@@ -101,6 +101,36 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
   j.appendCommaKey("sessionInvalidations"); AppendUnsignedLongLong(j, decision.metrics.sessionInvalidations);
   j.appendCommaKey("sessionBytes"); AppendUnsignedLongLong(j, decision.metrics.sessionBytes);
   j.appendCommaKey("deadlineOverrunMs"); AppendLongLong(j, decision.metrics.deadlineOverrunMs);
+	 j.appendCommaKey("canonicalStateMerges"); AppendUnsignedLongLong(j, decision.metrics.canonicalStateMerges);
+	 j.appendCommaKey("successorMerges"); AppendUnsignedLongLong(j, decision.metrics.successorMerges);
+	 j.appendCommaKey("distributionMerges"); AppendUnsignedLongLong(j, decision.metrics.distributionMerges);
+	 j.appendCommaKey("rootSharedTTHits"); AppendUnsignedLongLong(j, decision.metrics.rootSharedTTHits);
+	 j.appendCommaKey("beliefWorldsBefore"); AppendUnsignedLongLong(j, decision.metrics.beliefWorldsBefore);
+	 j.appendCommaKey("beliefWorldsAfter"); AppendUnsignedLongLong(j, decision.metrics.beliefWorldsAfter);
+	 j.appendCommaKey("largestEquivalenceClass"); AppendUnsignedLongLong(j, decision.metrics.largestEquivalenceClass);
+	 j.appendCommaKey("resumedActionCount"); AppendUnsignedLongLong(j, decision.metrics.resumedActionCount);
+	 j.appendCommaKey("resumedChanceMass"); AppendUnsignedLongLong(j, decision.metrics.resumedChanceMass);
+	 j.appendCommaKeyValue("currentRootAction", decision.metrics.currentRootAction);
+	 j.appendCommaKey("peakRssBytes"); AppendUnsignedLongLong(j, decision.metrics.peakRssBytes);
+	 j.appendCommaKeyValue("memoryLimitReached", decision.metrics.memoryLimitReached);
+	 j.appendCommaKey("partialDecisionHits"); AppendUnsignedLongLong(j, decision.metrics.partialDecisionHits);
+	 j.appendCommaKey("partialChanceHits"); AppendUnsignedLongLong(j, decision.metrics.partialChanceHits);
+	 j.appendCommaKey("partialTableBytes"); AppendUnsignedLongLong(j, decision.metrics.partialTableBytes);
+	 j.appendCommaKey("rootRetryKeyMatches"); AppendUnsignedLongLong(j, decision.metrics.rootRetryKeyMatches);
+	 j.appendCommaKey("rootRetryKeyMismatches"); AppendUnsignedLongLong(j, decision.metrics.rootRetryKeyMismatches);
+	 j.appendCommaKey("rootActions"); j.append('[');
+	 for (int ri : range(decision.rootActions)) {
+	   j.comma(ri); j.append('{');
+	   j.appendKey("selected"); j.append('[');
+	   for (int ai : range(decision.rootActions[ri].action)) { j.comma(ai); j.append(decision.rootActions[ri].action[ai]); }
+	   j.append(']');
+	   j.appendCommaKey("lowerNumerator"); AppendLongLong(j, decision.rootActions[ri].lower.numerator);
+	   j.appendCommaKey("lowerDenominator"); AppendUnsignedLongLong(j, decision.rootActions[ri].lower.denominator);
+	   j.appendCommaKey("upperNumerator"); AppendLongLong(j, decision.rootActions[ri].upper.numerator);
+	   j.appendCommaKey("upperDenominator"); AppendUnsignedLongLong(j, decision.rootActions[ri].upper.denominator);
+	   j.appendCommaKeyValue("certified", decision.rootActions[ri].certified); j.append('}');
+	 }
+	 j.append(']');
   if (sessionId >= 0) { j.appendCommaKey("sessionId"); AppendLongLong(j, sessionId); }
   j.append('}');
   return j.buf.c_str();
@@ -124,6 +154,23 @@ static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
   into.sessionInvalidations += from.sessionInvalidations;
   into.sessionBytes += from.sessionBytes;
   into.deadlineOverrunMs = std::max(into.deadlineOverrunMs, from.deadlineOverrunMs);
+	into.canonicalStateMerges += from.canonicalStateMerges;
+	into.successorMerges += from.successorMerges;
+	into.distributionMerges += from.distributionMerges;
+	into.rootSharedTTHits += from.rootSharedTTHits;
+	into.beliefWorldsBefore += from.beliefWorldsBefore;
+	into.beliefWorldsAfter += from.beliefWorldsAfter;
+	into.largestEquivalenceClass = std::max(into.largestEquivalenceClass, from.largestEquivalenceClass);
+	into.resumedActionCount += from.resumedActionCount;
+	into.resumedChanceMass += from.resumedChanceMass;
+	if (from.currentRootAction >= 0) into.currentRootAction = from.currentRootAction;
+	into.peakRssBytes = std::max(into.peakRssBytes, from.peakRssBytes);
+	into.memoryLimitReached = into.memoryLimitReached || from.memoryLimitReached;
+	into.partialDecisionHits += from.partialDecisionHits;
+	into.partialChanceHits += from.partialChanceHits;
+	into.partialTableBytes += from.partialTableBytes;
+	into.rootRetryKeyMatches += from.rootRetryKeyMatches;
+	into.rootRetryKeyMismatches += from.rootRetryKeyMismatches;
   if (!from.lastException.empty()) into.lastException = from.lastException;
   if (from.lastPendingDetail != 0) into.lastPendingDetail = from.lastPendingDetail;
   if (from.lastPendingPlayer >= 0) into.lastPendingPlayer = from.lastPendingPlayer;
@@ -142,25 +189,85 @@ struct ExactTurnSession {
 
   std::unique_ptr<Game> game;
   std::unique_ptr<ExactPlanner> planner;
+	std::unique_ptr<Worker> alternateWorker;
   ExactMetrics discardedMetrics;
   int turn = -1;
   int actor = -1;
+	ExactDecision lastDecision;
+	std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
 
   ExactDecision begin(const State& source, const int* deck, const int* handValues, int deckCount,
       const int* opponentDeck, int opponentDeckCount, int budgetMilliseconds) {
     turn = source.turn; actor = source.selectPlayer;
+		started = std::chrono::steady_clock::now();
     ExactDecision decision;
     if (source.selectMin == 1 && source.selectMax == 1 && source.options.size() > 1) {
+		auto sharedTable = std::make_shared<ExactSharedTransposition>();
+		auto absoluteDeadline = std::chrono::steady_clock::now()
+			+ std::chrono::milliseconds(std::max(1, budgetMilliseconds));
+		std::vector<int> representative(source.options.size());
+		std::unordered_map<std::string, int, ExactStringHasher> successorRepresentative;
+		for (int option = 0; option < (int)source.options.size(); ++option) {
+			Game probeGame = *source.game;
+			State probeState = source; probeState.game = &probeGame;
+			ExactPlanner probe(deck, handValues, deckCount, 1,
+				opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount);
+			std::string key = probe.canonicalRootSuccessor(probeState, option);
+			auto [found, inserted] = successorRepresentative.emplace(std::move(key), option);
+			representative[option] = inserted ? option : found->second;
+		}
+		std::vector<int> orderedOptions;
+		for (int option = 0; option < (int)source.options.size(); ++option)
+			if (representative[option] == option && source.options[option].type == SelectOptionType::End) orderedOptions.push_back(option);
+		for (int option = 0; option < (int)source.options.size(); ++option)
+			if (representative[option] == option && source.options[option].type != SelectOptionType::End) orderedOptions.push_back(option);
       std::array<std::unique_ptr<Worker>, 2> workers;
       auto run = [&](int parity) {
         auto output = std::make_unique<Worker>();
         output->game = *source.game;
         output->planner = std::make_unique<ExactPlanner>(deck, handValues, deckCount, budgetMilliseconds,
-          opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount);
-        for (int option = parity; option < (int)source.options.size(); option += 2) {
-          State local = source; local.game = &output->game;
-          output->actions.push_back(output->planner->evaluateRootAction(local, option).score);
-        }
+          opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount, sharedTable);
+		output->actions.resize(source.options.size());
+		std::vector<int> assigned;
+		for (int position = parity; position < (int)orderedOptions.size(); position += 2)
+			assigned.push_back(orderedOptions[position]);
+		for (int option : assigned) output->actions[option].action = { option };
+		if (source.options.size() <= 2) {
+			for (int option : assigned) {
+				State local = source; local.game = &output->game;
+				output->actions[option] = output->planner->evaluateRootAction(local, option).score;
+			}
+		} else {
+			int fairShare = std::max(50, budgetMilliseconds / std::max(1, (int)assigned.size()));
+			int firstRoundSlice = std::min(1'000, fairShare);
+			const int sliceMilliseconds = std::min(60'000, fairShare);
+			bool firstRound = true;
+			while (std::chrono::steady_clock::now() < absoluteDeadline) {
+				bool pending = false, attempted = false, resourceStopped = false;
+				for (int option : assigned) {
+					if (output->actions[option].certified) continue;
+					pending = true;
+					auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+						absoluteDeadline - std::chrono::steady_clock::now()).count();
+					if (remaining <= 0) break;
+					int slice = (int)std::min<long long>(remaining, firstRound ? firstRoundSlice : sliceMilliseconds);
+					output->planner->setBudgetMilliseconds(std::max(1, slice));
+					State local = source; local.game = &output->game;
+					ExactScore fresh = output->planner->evaluateRootAction(local, option).score;
+					ExactScore& saved = output->actions[option];
+					if (saved.action.empty()) saved = fresh;
+					else {
+						if (ExactCompare(fresh.lower, saved.lower) > 0) saved.lower = fresh.lower;
+						if (ExactCompare(fresh.upper, saved.upper) < 0) saved.upper = fresh.upper;
+						saved.certified = ExactCompare(saved.lower, saved.upper) == 0;
+					}
+					attempted = true;
+					if (output->planner->resourceStopped()) { resourceStopped = true; break; }
+				}
+				firstRound = false;
+				if (!pending || !attempted || resourceStopped) break;
+			}
+		}
         return output;
       };
       auto future0 = std::async(std::launch::async, run, 0);
@@ -169,8 +276,12 @@ struct ExactTurnSession {
       bool first = true, allCertified = true;
       ExactFraction maxUpper = ExactFraction::integer(-100'000'000);
       int selectedWorker = 0;
+	  std::unordered_map<int, ExactScore> representativeScores;
       for (int wi = 0; wi < 2; ++wi) {
         for (const ExactScore& item : workers[wi]->actions) {
+		  if (item.action.empty()) continue;
+		  representativeScores[item.action.front()] = item;
+		  decision.rootActions.push_back({ item.action, item.lower, item.upper, item.certified });
           if (first || ExactCompare(item.lower, decision.score.lower) > 0
               || (ExactCompare(item.lower, decision.score.lower) == 0 && item.action < decision.score.action)) {
             decision.score = item; selectedWorker = wi; first = false;
@@ -180,6 +291,15 @@ struct ExactTurnSession {
         }
         MergeExactMetrics(decision.metrics, workers[wi]->planner->currentMetrics());
       }
+	  for (int option = 0; option < (int)representative.size(); ++option) {
+		if (representative[option] == option) continue;
+		auto found = representativeScores.find(representative[option]);
+		if (found == representativeScores.end()) continue;
+		ExactScore alias = found->second; alias.action = { option };
+		decision.rootActions.push_back({ alias.action, alias.lower, alias.upper, alias.certified });
+		decision.metrics.successorMerges++;
+		decision.metrics.largestEquivalenceClass = std::max<unsigned long long>(decision.metrics.largestEquivalenceClass, 2);
+	  }
       decision.metrics.rootWorkers = 2;
       if (!first) {
         decision.score.upper = maxUpper;
@@ -187,10 +307,9 @@ struct ExactTurnSession {
       }
       int other = 1 - selectedWorker;
       discardedMetrics = workers[other]->planner->currentMetrics();
-      discardedMetrics.sessionBytes = 0;
+	  alternateWorker = std::move(workers[other]);
       game = std::make_unique<Game>(std::move(workers[selectedWorker]->game));
       planner = std::move(workers[selectedWorker]->planner);
-      decision.metrics.sessionBytes = planner->currentMetrics().sessionBytes;
     } else {
       game = std::make_unique<Game>(*source.game);
       planner = std::make_unique<ExactPlanner>(deck, handValues, deckCount, budgetMilliseconds,
@@ -198,6 +317,7 @@ struct ExactTurnSession {
       State local = source; local.game = game.get();
       decision = planner->decide(local);
     }
+		lastDecision = decision;
     return decision;
   }
 
@@ -209,16 +329,52 @@ struct ExactTurnSession {
       return decision;
     }
     State local = source; local.game = game.get();
+	bool alternatePolicyHit = false;
     if (!planner->lookupPolicy(local, decision)) {
-      decision = planner->resume(local, budgetMilliseconds);
+	  if (alternateWorker != nullptr && alternateWorker->planner != nullptr) {
+		State alternate = source; alternate.game = &alternateWorker->game;
+		alternatePolicyHit = alternateWorker->planner->lookupPolicy(alternate, decision);
+	  }
+	  if (!alternatePolicyHit) decision = planner->resume(local, budgetMilliseconds);
     }
-    ExactMetrics combined = discardedMetrics;
+	ExactMetrics combined = alternatePolicyHit ? planner->currentMetrics() : discardedMetrics;
     MergeExactMetrics(combined, decision.metrics);
     combined.rootWorkers = 2;
     decision.metrics = combined;
+		lastDecision = decision;
     return decision;
   }
+
+	long long elapsedMilliseconds() const {
+		return std::chrono::duration_cast<std::chrono::milliseconds>(
+			std::chrono::steady_clock::now() - started).count();
+	}
 };
+
+static const char8_t* ExactProgressJson(ApiData* data, long long sessionId, const ExactTurnSession& session) {
+  const ExactMetrics& metrics = session.lastDecision.metrics;
+  JsonBuilder& j = data->jsonBuilder;
+  j.clear(); j.append('{');
+  j.appendKey("sessionId"); AppendLongLong(j, sessionId);
+  j.appendCommaKeyValue("turn", session.turn);
+  j.appendCommaKeyValue("actor", session.actor);
+  j.appendCommaKeyValue("currentRootAction", metrics.currentRootAction);
+  j.appendCommaKeyValue("maxDepth", metrics.maxDepth);
+  j.appendCommaKey("expandedNodes"); AppendUnsignedLongLong(j, metrics.expanded);
+  j.appendCommaKey("resumedActionCount"); AppendUnsignedLongLong(j, metrics.resumedActionCount);
+  j.appendCommaKey("resumedChanceMass"); AppendUnsignedLongLong(j, metrics.resumedChanceMass);
+  j.appendCommaKey("largestEquivalenceClass"); AppendUnsignedLongLong(j, metrics.largestEquivalenceClass);
+  j.appendCommaKey("canonicalStateMerges"); AppendUnsignedLongLong(j, metrics.canonicalStateMerges);
+  j.appendCommaKey("successorMerges"); AppendUnsignedLongLong(j, metrics.successorMerges);
+  j.appendCommaKey("distributionMerges"); AppendUnsignedLongLong(j, metrics.distributionMerges);
+  j.appendCommaKey("sessionBytes"); AppendUnsignedLongLong(j, metrics.sessionBytes);
+	 j.appendCommaKey("peakRssBytes"); AppendUnsignedLongLong(j, metrics.peakRssBytes);
+	 j.appendCommaKeyValue("memoryLimitReached", metrics.memoryLimitReached);
+  j.appendCommaKey("elapsedMilliseconds"); AppendLongLong(j, session.elapsedMilliseconds());
+  j.appendCommaKeyValue("certified", session.lastDecision.score.certified);
+  j.append('}');
+  return j.buf.c_str();
+}
 
 static std::mutex ExactSessionMutex;
 static std::unordered_map<ApiData*, std::unordered_map<long long, std::unique_ptr<ExactTurnSession>>> ExactSessions;
@@ -509,6 +665,20 @@ extern "C" {
       data->jsonBuilder.clear(); data->jsonBuilder.appendStr("{\"error\":99}");
       return data->jsonBuilder.buf.c_str();
     }
+  }
+
+  GAME_API const char8_t* ExactTurnProgress(ApiData* data, long long sessionId) {
+    if (data->apiDataType != 2) {
+      data->jsonBuilder.clear(); data->jsonBuilder.appendStr("{\"error\":30}");
+      return data->jsonBuilder.buf.c_str();
+    }
+    std::lock_guard<std::mutex> lock(ExactSessionMutex);
+    auto owner = ExactSessions.find(data);
+    if (owner == ExactSessions.end() || !owner->second.contains(sessionId)) {
+      data->jsonBuilder.clear(); data->jsonBuilder.appendStr("{\"error\":31}");
+      return data->jsonBuilder.buf.c_str();
+    }
+    return ExactProgressJson(data, sessionId, *owner->second.at(sessionId));
   }
 
   GAME_API void ExactTurnRelease(ApiData* data, long long sessionId) {

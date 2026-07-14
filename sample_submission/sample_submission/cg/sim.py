@@ -103,6 +103,10 @@ if hasattr(lib, "ExactTurnAdvance"):
     lib.ExactTurnAdvance.argtypes = [
         ctypes.c_void_p, ctypes.c_int64, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
 
+if hasattr(lib, "ExactTurnProgress"):
+    lib.ExactTurnProgress.restype = ctypes.c_char_p
+    lib.ExactTurnProgress.argtypes = [ctypes.c_void_p, ctypes.c_int64]
+
 if hasattr(lib, "ExactTurnRelease"):
     lib.ExactTurnRelease.argtypes = [ctypes.c_void_p, ctypes.c_int64]
 

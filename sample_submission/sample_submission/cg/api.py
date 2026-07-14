@@ -737,5 +737,17 @@ def exact_turn_release(session_id: int) -> None:
     if hasattr(lib, "ExactTurnRelease") and "agent_ptr" in globals():
         lib.ExactTurnRelease(agent_ptr, int(session_id))
 
+def exact_turn_progress(session_id: int) -> dict:
+    """Return non-mutating progress and memory diagnostics for a turn session."""
+    global agent_ptr
+    if not hasattr(lib, "ExactTurnProgress"):
+        raise RuntimeError("ExactTurnProgress is not available in this native library")
+    if "agent_ptr" not in globals():
+        raise RuntimeError("No exact turn session has been started")
+    raw = lib.ExactTurnProgress(agent_ptr, int(session_id))
+    result = json.loads(raw.decode())
+    if result.get("error"): raise RuntimeError(f"ExactTurnProgress failed: {result['error']}")
+    return result
+
 #endregion functions
 
