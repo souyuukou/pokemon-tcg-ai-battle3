@@ -263,6 +263,7 @@ struct ExactTurnSession {
 					}
 					attempted = true;
 					if (output->planner->resourceStopped()) { resourceStopped = true; break; }
+					if (!firstRound) break; // finish one representative before starting the next
 				}
 				firstRound = false;
 				if (!pending || !attempted || resourceStopped) break;
