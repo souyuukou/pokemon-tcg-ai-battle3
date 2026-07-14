@@ -41,6 +41,8 @@ class PolicyContext:
     last_turn: int | None = None
     session_id: int | None = None
     last_decision: dict | None = None
+    budget_turn: int | None = None
+    turn_search_seconds: float = 0.0
 
     def reset(self) -> None:
         if self.session_id is not None:
@@ -53,6 +55,8 @@ class PolicyContext:
         self.last_turn = None
         self.session_id = None
         self.last_decision = None
+        self.budget_turn = None
+        self.turn_search_seconds = 0.0
 
 
 _default_context = PolicyContext(_budget)
@@ -79,6 +83,16 @@ def _fallback_score(option) -> int:
     }.get(int(option.type), 0)
 
 
+def _turn_slice_milliseconds(ctx: PolicyContext, is_new_turn: bool, usable_ms: int) -> int:
+    """Return this call's slice while enforcing one absolute per-turn cap."""
+    turn_cap = int(os.environ.get("PTCG_EXACT_TURN_MS", "90000"))
+    selection_cap = int(os.environ.get("PTCG_EXACT_SELECTION_MS", "10000"))
+    remaining_turn_ms = turn_cap - int(ctx.turn_search_seconds * 1000)
+    if remaining_turn_ms <= 0:
+        raise RuntimeError("exact turn search budget reached")
+    return max(1, min(remaining_turn_ms, turn_cap if is_new_turn else selection_cap, usable_ms))
+
+
 def choose_action(obs, *, context: PolicyContext | None = None,
                   opponent_deck: list[int] | None = None) -> tuple[list[int], bool, str]:
     """Return action, certification flag, reason.
@@ -88,9 +102,15 @@ def choose_action(obs, *, context: PolicyContext | None = None,
     this policy never calls it with fabricated identities.
     """
     ctx = context or _default_context
+    observed_turn = obs.current.turn if obs.current is not None else None
+    if observed_turn != ctx.budget_turn:
+        ctx.budget_turn = observed_turn
+        ctx.turn_search_seconds = 0.0
     call_started = time.monotonic()
     def finish(action, certified, reason):
-        ctx.budget.charge(time.monotonic() - call_started)
+        elapsed = time.monotonic() - call_started
+        ctx.budget.charge(elapsed)
+        ctx.turn_search_seconds += elapsed
         return action, certified, reason
 
     select = obs.select
@@ -111,9 +131,7 @@ def choose_action(obs, *, context: PolicyContext | None = None,
         hand_values = [int(values.get(str(card_id), values.get("default", 100))) for card_id in profile.cards]
         is_new_turn = obs.current is not None and obs.current.turn != ctx.last_turn
         usable_ms = max(1, int((ctx.budget.remaining - ctx.budget.limits.reserve_seconds) * 1000))
-        turn_cap = int(os.environ.get("PTCG_EXACT_TURN_MS", "180000"))
-        selection_cap = int(os.environ.get("PTCG_EXACT_SELECTION_MS", "10000"))
-        requested_ms = min(turn_cap if is_new_turn else selection_cap, usable_ms)
+        requested_ms = _turn_slice_milliseconds(ctx, is_new_turn, usable_ms)
         if is_new_turn:
             if ctx.session_id is not None:
                 exact_turn_release(ctx.session_id)

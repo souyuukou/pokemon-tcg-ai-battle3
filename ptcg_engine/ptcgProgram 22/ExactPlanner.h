@@ -599,6 +599,27 @@ private:
 		bool initialized = false, handActive = false, completed = false;
 		size_t accountedBytes = 0;
 	};
+	struct FixedTurnRevealAllocation {
+		std::vector<int> prizeCounts;
+		ExactWeight weight;
+	};
+	struct PartialFixedTurnRevealEntry {
+		std::vector<FixedTurnRevealAllocation> allocations;
+		size_t index = 0;
+		ExactFraction completedLower = ExactFraction::integer(0);
+		ExactFraction completedUpper = ExactFraction::integer(0);
+		ExactWeight totalWeight, processedWeight;
+		size_t accountedBytes = 0;
+	};
+	struct PartialMultiDrawEntry {
+		BoundedCompositionCursor cursor;
+		std::vector<int> bounds, counts;
+		ExactFraction completedLower = ExactFraction::integer(0);
+		ExactFraction completedUpper = ExactFraction::integer(0);
+		ExactWeight totalWeight, processedWeight, pendingWeight;
+		bool initialized = false, pending = false;
+		size_t accountedBytes = 0;
+	};
 	std::unordered_map<int, int> actorProfileCount;
 	std::unordered_map<int, int> opponentProfileCount;
 	std::unordered_map<int, int> handValue;
@@ -619,12 +640,17 @@ private:
 	std::unordered_map<std::string, PartialChanceEntry, ExactStringHasher> partialChances;
 	std::unordered_map<std::string, PartialRevealEntry, ExactStringHasher> partialReveals;
 	std::unordered_map<std::string, PartialBeliefRevealEntry, ExactStringHasher> partialBeliefReveals;
+	// std::map keeps the outer reveal entry stable when a searched card starts a
+	// nested fixed-turn reveal and inserts another resumable entry.
+	std::map<std::string, PartialFixedTurnRevealEntry> partialFixedTurnReveals;
+	std::map<std::string, PartialMultiDrawEntry> partialMultiDraws;
 	std::unordered_map<std::string, ExactScore, ExactStringHasher> beliefTransposition;
 	mutable std::unordered_map<std::string, long long, ExactStringHasher> evaluationCache;
-	// Fixed-deck turn-one Poké Pad quotient.  The key retains the complete public
-	// state and semantic search options, but omits identities in the already
-	// shuffled remainder of the deck.  See revealAndReplayOwnDeckStreaming.
+	// Fixed-deck turn-one search quotient.  The key retains the complete public
+	// state, semantic search options, and every deck count that can affect a later
+	// turn-one search, while omitting identities irrelevant until the next turn.
 	std::unordered_map<std::string, ExactScore, ExactStringHasher> fixedFirstTurnRevealScores;
+	std::unordered_map<std::string, ExactScore, ExactStringHasher> fixedFirstTurnMainScores;
 	size_t beliefTranspositionBytes = 0;
 	static constexpr size_t MaxPolicyEntries = 100'000;
 	static constexpr size_t MaxPolicyBytes = 64ULL * 1024ULL * 1024ULL;
@@ -665,6 +691,28 @@ private:
 
 	std::string keyFor(const State& input) const {
 		return ExactCanonicalState::Build(input);
+	}
+
+	std::string fixedTurnOneMainKey(const State& state) const {
+		if (!singletonRevealStreaming || state.turn != 1 || state.selectPlayer != actor
+			|| state.selectType != SelectType::Main || state.exact.deckUnknown[actor]
+			|| !isMajkelFixedProfile(actorProfileCount)) return {};
+		// Enriching Energy can draw four cards later in this turn, so identities
+		// outside the search-target quotient still affect its exact transition.
+		for (CardRef ref : state.players[actor].hand)
+			if (!ref.isNull() && state.getCard(ref).cardId == 13) return {};
+		std::string key = "FIXED-TURN1-MAIN\x1f";
+		key += observationKeyFor(state, actor, nullptr, false);
+		static constexpr std::array<int, 6> relevantIds{ 66, 305, 343, 741, 742, 743 };
+		std::array<int, relevantIds.size()> counts{};
+		for (CardRef ref : state.players[actor].deck) if (!ref.isNull()) {
+			int id = state.getCard(ref).cardId;
+			for (int i = 0; i < (int)relevantIds.size(); ++i) if (id == relevantIds[i]) {
+				counts[i]++; break;
+			}
+		}
+		for (int count : counts) appendSemantic(key, count);
+		return key;
 	}
 
 	PartialDecisionEntry* partialDecisionFor(const std::string& key) {
@@ -1625,6 +1673,155 @@ private:
 		return solveBelief(std::move(worlds));
 	}
 
+	bool isFixedTurnOneSearchRequest(const State& parent, const ExactHiddenState& request) const {
+		if (parent.turn != 1 || !isMajkelFixedProfile(actorProfileCount)) return false;
+		for (CardRef ref : parent.players[actor].hand)
+			if (!ref.isNull() && parent.getCard(ref).cardId == 13) return false;
+		return request.pendingEffectCardId == 1152 || request.pendingEffectCardId == 1086
+			|| request.pendingEffectCardId == 19;
+	}
+
+	ExactScore revealAndReplayFixedTurnOneSearch(const State& parent, const ExactHiddenState& request,
+		const std::vector<int>& action, int prizeSize, int totalHidden, const ExactWeight& totalWeight) {
+		const int player = request.pendingPlayer;
+		std::string revealKey = keyFor(parent) + "\x1fR5-FIXED-TURN1\x1f" + actionEquivalenceKey(parent, action);
+		appendSemantic(revealKey, request.pendingDetail); appendSemantic(revealKey, request.pendingEffectCardId);
+		appendSemantic(revealKey, request.pendingEffectPlayer);
+		auto [found, inserted] = partialFixedTurnReveals.try_emplace(revealKey);
+		PartialFixedTurnRevealEntry& partial = found->second;
+		if (inserted) {
+			static constexpr std::array<int, 6> relevantIds{ 66, 305, 343, 741, 742, 743 };
+			std::array<int, relevantIds.size()> typeIndex{}; typeIndex.fill(-1);
+			std::vector<int> relevantBounds(relevantIds.size(), 0);
+			std::vector<bool> relevantType(parent.exact.typeCount[player], false);
+			int totalRelevant = 0;
+			for (int i = 0; i < parent.exact.typeCount[player]; ++i) {
+				for (int r = 0; r < (int)relevantIds.size(); ++r) if (parent.exact.cardId[player][i] == relevantIds[r]) {
+					typeIndex[r] = i; relevantBounds[r] = parent.exact.cardCount[player][i];
+					relevantType[i] = true; totalRelevant += relevantBounds[r]; break;
+				}
+			}
+			const int totalIrrelevant = totalHidden - totalRelevant;
+			ExactWeight generated;
+			for (int relevantPrizeTotal = 0; relevantPrizeTotal <= std::min(prizeSize, totalRelevant); ++relevantPrizeTotal) {
+				int irrelevantPrizeTotal = prizeSize - relevantPrizeTotal;
+				if (irrelevantPrizeTotal < 0 || irrelevantPrizeTotal > totalIrrelevant) continue;
+				BoundedCompositionCursor cursor; cursor.reset(relevantBounds, relevantPrizeTotal);
+				std::vector<int> relevantCounts;
+				while (cursor.next(relevantCounts)) {
+					FixedTurnRevealAllocation allocation;
+					allocation.prizeCounts.assign(parent.exact.typeCount[player], 0);
+					allocation.weight = chooseCount(totalIrrelevant, irrelevantPrizeTotal);
+					for (int r = 0; r < (int)relevantIds.size(); ++r) {
+						if (typeIndex[r] >= 0) allocation.prizeCounts[typeIndex[r]] = relevantCounts[r];
+						allocation.weight = ExactWeight::multiply(allocation.weight,
+							chooseCount(relevantBounds[r], relevantCounts[r]));
+					}
+					int left = irrelevantPrizeTotal;
+					for (int i = 0; i < parent.exact.typeCount[player] && left > 0; ++i) if (!relevantType[i]) {
+						int take = std::min(left, (int)parent.exact.cardCount[player][i]);
+						allocation.prizeCounts[i] = take; left -= take;
+					}
+					if (left != 0 || allocation.weight.zero()) continue;
+					generated += allocation.weight;
+					partial.allocations.push_back(std::move(allocation));
+				}
+			}
+			if (generated != totalWeight) {
+				metrics.chanceMassMismatches++; metrics.probabilityExact = false;
+				partialFixedTurnReveals.erase(found); return unknown();
+			}
+			partial.totalWeight = totalWeight;
+			partial.accountedBytes = revealKey.size() + sizeof(PartialFixedTurnRevealEntry);
+			for (const auto& allocation : partial.allocations)
+				partial.accountedBytes += sizeof(FixedTurnRevealAllocation) + allocation.prizeCounts.size() * sizeof(int);
+			partialBytes += partial.accountedBytes;
+		} else {
+			metrics.partialRevealHits++;
+			if (partial.totalWeight != totalWeight) return unknown();
+		}
+		auto incomplete = [&](const ExactScore* current = nullptr, ExactWeight currentWeight = {}) {
+			ExactFraction lower = partial.completedLower, upper = partial.completedUpper;
+			ExactWeight covered = partial.processedWeight;
+			if (current != nullptr) {
+				lower = ExactFraction::add(lower, current->lower.scaled(currentWeight, totalWeight));
+				upper = ExactFraction::add(upper, current->upper.scaled(currentWeight, totalWeight));
+				covered += currentWeight;
+			}
+			ExactWeight remaining = covered >= totalWeight ? ExactWeight() : ExactWeight::subtract(totalWeight, covered);
+			lower = ExactFraction::add(lower, ExactFraction::integer(-100'000'000).scaled(remaining, totalWeight));
+			upper = ExactFraction::add(upper, ExactFraction::integer(100'000'000).scaled(remaining, totalWeight));
+			return ExactScore{ lower, upper, {}, false };
+		};
+		std::vector<int> handCounts(parent.exact.typeCount[player], 0);
+		while (partial.index < partial.allocations.size()) {
+			if (expired()) { metrics.partialChanceNodes++; return incomplete(); }
+			const FixedTurnRevealAllocation& allocation = partial.allocations[partial.index];
+			auto world = std::make_unique<State>(parent);
+			try {
+				materializeUnknownZones(*world, player, allocation.prizeCounts, handCounts);
+				if (!advance(*world, action)) return unknown();
+			} catch (...) { return unknown(); }
+			std::string quotientKey = observationKeyFor(*world, actor, nullptr, false);
+			static constexpr std::array<int, 6> relevantIds{ 66, 305, 343, 741, 742, 743 };
+			quotientKey += "\x1f" "TURN1-SEARCH";
+			for (int id : relevantIds) {
+				int count = 0;
+				for (CardRef ref : world->players[actor].deck) if (!ref.isNull() && world->getCard(ref).cardId == id) count++;
+				appendSemantic(quotientKey, count);
+			}
+			std::string sharedKey = "FIXED-TURN1-SEARCH\x1f" + quotientKey;
+			ExactScore score;
+			bool sharedHit = false;
+			auto local = fixedFirstTurnRevealScores.find(quotientKey);
+			bool cacheHit = local != fixedFirstTurnRevealScores.end();
+			if (cacheHit) score = local->second;
+			else if (usingSharedTable) cacheHit = sharedHit = transposition->find(sharedKey, score);
+			if (cacheHit) {
+				metrics.successorMerges++; metrics.merged++;
+				if (sharedHit) metrics.rootSharedTTHits++;
+			} else {
+				struct StreamingGuard { bool& flag; bool previous;
+					StreamingGuard(bool& value) : flag(value), previous(value) { flag = true; }
+					~StreamingGuard() { flag = previous; }
+				} streaming(singletonRevealStreaming);
+				// Root workers normally yield every 20k nodes.  A concrete search
+				// world cannot retain partial TT entries in streaming mode, so yielding
+				// halfway through it would restart the same world forever.  Give one
+				// world a bounded larger quantum; the wall-clock and RSS checks remain
+				// active inside every expansion.
+				struct QuantumGuard { unsigned long long& limit; unsigned long long previous;
+					QuantumGuard(unsigned long long& value, unsigned long long expanded)
+						: limit(value), previous(value) {
+						if (value != std::numeric_limits<unsigned long long>::max())
+							value = std::max(value, expanded + 500'000ULL);
+					}
+					~QuantumGuard() { limit = previous; }
+				} quantum(nodeQuantumDeadline, metrics.expanded);
+				score = solveOwned(std::move(world));
+				if (score.certified) {
+					fixedFirstTurnRevealScores.emplace(std::move(quotientKey), score);
+					if (usingSharedTable) transposition->store(std::move(sharedKey), score);
+				}
+			}
+			if (!score.certified) return incomplete(&score, allocation.weight);
+			partial.completedLower = ExactFraction::add(partial.completedLower,
+				score.lower.scaled(allocation.weight, totalWeight));
+			partial.completedUpper = ExactFraction::add(partial.completedUpper,
+				score.upper.scaled(allocation.weight, totalWeight));
+			partial.processedWeight += allocation.weight; noteWeight(partial.processedWeight);
+			partial.index++; metrics.enumeratedHiddenWorlds++;
+		}
+		if (partial.processedWeight != totalWeight) {
+			metrics.chanceMassMismatches++; metrics.probabilityExact = false; return unknown();
+		}
+		ExactScore result{ partial.completedLower, partial.completedUpper, {},
+			ExactCompare(partial.completedLower, partial.completedUpper) == 0 };
+		partialBytes -= std::min(partialBytes, partial.accountedBytes);
+		partialFixedTurnReveals.erase(revealKey);
+		return result;
+	}
+
 	ExactScore revealAndReplayOwnDeckStreaming(const State& parent, const ExactHiddenState& request,
 		const std::vector<int>& action) {
 		int player = request.pendingPlayer;
@@ -1640,6 +1837,8 @@ private:
 			chooseCount(totalHidden - prizeSize, handSize));
 		noteWeight(totalWeight);
 		if (totalWeight.zero()) return unknown();
+		if (handSize == 0 && isFixedTurnOneSearchRequest(parent, request))
+			return revealAndReplayFixedTurnOneSearch(parent, request, action, prizeSize, totalHidden, totalWeight);
 		std::string revealKey = keyFor(parent) + "\x1fR4\x1f" + actionEquivalenceKey(parent, action);
 		appendSemantic(revealKey, request.pendingDetail);
 		appendSemantic(revealKey, request.pendingEffectCardId);
@@ -1707,22 +1906,39 @@ private:
 				if (!advance(*world, action)) return unknown();
 			} catch (...) { return unknown(); }
 			ExactScore score;
-			const bool fixedTurnOnePokePad = parent.turn == 1
-				&& request.pendingEffectCardId == 1152 && isMajkelFixedProfile(actorProfileCount);
+			const bool fixedTurnOneSearch = parent.turn == 1
+				&& (request.pendingEffectCardId == 1152 || request.pendingEffectCardId == 1086
+					|| request.pendingEffectCardId == 19)
+				&& isMajkelFixedProfile(actorProfileCount)
+				&& std::none_of(parent.players[actor].hand.begin(), parent.players[actor].hand.end(),
+					[&](CardRef ref) { return !ref.isNull() && parent.getCard(ref).cardId == 13; });
 			std::string quotientKey;
-			if (fixedTurnOnePokePad) {
-				// In this fixed deck Poké Pad can fetch Dunsparce, Shaymin, or Abra.
-				// None has a turn-one deck-reading Ability.  Once the semantic target
-				// options are retained, the shuffled identities left in the deck cannot
-				// affect another transition before the turn leaf.  V3's hidden features
-				// are likewise derived from the public zones/profile, not that physical
-				// partition.  This is therefore an exact quotient for this audited turn,
-				// rather than a probability or evaluator approximation.
+			std::string sharedQuotientKey;
+			if (fixedTurnOneSearch) {
+				// Poké Pad can access every non-Rule-Box Pokémon and Buddy-Buddy
+				// Poffin can access the Basic subset.  The six counts below therefore
+				// determine every later turn-one deck-query result in this fixed deck.
+				// The remaining identities cannot affect a transition before the leaf,
+				// and V3's hidden features are derived from profile/public zones.
 				quotientKey = observationKeyFor(*world, actor, nullptr, false);
+				static constexpr std::array<int, 6> relevantIds{ 66, 305, 343, 741, 742, 743 };
+				std::array<int, relevantIds.size()> deckCounts{};
+				for (CardRef ref : world->players[actor].deck) if (!ref.isNull()) {
+					int id = world->getCard(ref).cardId;
+					for (int i = 0; i < (int)relevantIds.size(); ++i)
+						if (id == relevantIds[i]) { deckCounts[i]++; break; }
+				}
+				quotientKey += "\x1f" "TURN1-SEARCH";
+				for (int count : deckCounts) appendSemantic(quotientKey, count);
+				sharedQuotientKey = "FIXED-TURN1-SEARCH\x1f" + quotientKey;
+				bool sharedHit = false;
 				auto cached = fixedFirstTurnRevealScores.find(quotientKey);
-				if (cached != fixedFirstTurnRevealScores.end()) {
-					score = cached->second;
+				bool cacheHit = cached != fixedFirstTurnRevealScores.end();
+				if (cacheHit) score = cached->second;
+				else if (usingSharedTable) cacheHit = sharedHit = transposition->find(sharedQuotientKey, score);
+				if (cacheHit) {
 					metrics.successorMerges++; metrics.merged++;
+					if (sharedHit) metrics.rootSharedTTHits++;
 				}
 			}
 			if (!score.certified) {
@@ -1732,8 +1948,10 @@ private:
 					~StreamingGuard() { flag = previous; }
 				} streaming(singletonRevealStreaming);
 				score = solveOwned(std::move(world));
-				if (fixedTurnOnePokePad && score.certified)
+				if (fixedTurnOneSearch && score.certified) {
 					fixedFirstTurnRevealScores.emplace(std::move(quotientKey), score);
+					if (usingSharedTable) transposition->store(std::move(sharedQuotientKey), score);
+				}
 			}
 			if (!score.certified) return incomplete(&score, partial->pendingWeight);
 			partial->completedLower = ExactFraction::add(partial->completedLower,
@@ -2091,10 +2309,110 @@ private:
 			for (CardRef ref : list) if (!ref.isNull()) counts[state.getCard(ref).cardId]++;
 			for (auto [id, count] : counts) result.push_back({ id, ExactWeight(count) });
 		}
+		std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
+			return left.first < right.first;
+		});
+		return result;
+	}
+
+	ExactScore multiDrawChance(const State& state, const std::string& nodeKey) {
+		auto types = chanceCardTypes(state);
+		const int drawCount = state.exact.pendingCount;
+		if (types.empty() || drawCount <= 1) return unknown();
+		std::vector<int> bounds; bounds.reserve(types.size());
+		int available = 0;
+		for (const auto& item : types) {
+			if (!item.second.fitsUnsignedLongLong()
+				|| item.second.unsignedLongLong() > (unsigned long long)std::numeric_limits<int>::max()) return unknown();
+			bounds.push_back((int)item.second.unsignedLongLong()); available += bounds.back();
+		}
+		if (drawCount > available) return unknown();
+		std::string resumeKey = nodeKey + "\x1fMULTI-DRAW";
+		auto [found, inserted] = partialMultiDraws.try_emplace(resumeKey);
+		PartialMultiDrawEntry& partial = found->second;
+		if (inserted || !partial.initialized) {
+			partial.bounds = bounds; partial.counts.assign(bounds.size(), 0);
+			partial.cursor.reset(bounds, drawCount);
+			partial.totalWeight = chooseCount(available, drawCount);
+			partial.initialized = true;
+			partial.accountedBytes = resumeKey.size() + sizeof(PartialMultiDrawEntry)
+				+ bounds.size() * sizeof(int) * 8;
+			partialBytes += partial.accountedBytes;
+		} else if (partial.bounds != bounds || partial.totalWeight != chooseCount(available, drawCount)) {
+			return unknown();
+		}
+		const ExactWeight& total = partial.totalWeight;
+		noteWeight(total);
+		auto incomplete = [&](const ExactScore* current = nullptr) {
+			ExactFraction lower = partial.completedLower, upper = partial.completedUpper;
+			ExactWeight covered = partial.processedWeight;
+			if (current != nullptr) {
+				lower = ExactFraction::add(lower, current->lower.scaled(partial.pendingWeight, total));
+				upper = ExactFraction::add(upper, current->upper.scaled(partial.pendingWeight, total));
+				covered += partial.pendingWeight;
+			}
+			ExactWeight remaining = covered >= total ? ExactWeight() : ExactWeight::subtract(total, covered);
+			lower = ExactFraction::add(lower, ExactFraction::integer(-100'000'000).scaled(remaining, total));
+			upper = ExactFraction::add(upper, ExactFraction::integer(100'000'000).scaled(remaining, total));
+			return ExactScore{ lower, upper, {}, false };
+		};
+		// A combination can be much larger than the normal 20k-node root
+		// scheduling quantum.  Preserve the wall-clock/RSS deadline while allowing
+		// one exact multiset outcome to finish and become reusable in the TT.
+		struct QuantumGuard { unsigned long long& limit; unsigned long long previous;
+			QuantumGuard(unsigned long long& value, unsigned long long expanded)
+				: limit(value), previous(value) {
+				if (value != std::numeric_limits<unsigned long long>::max())
+					value = std::max(value, expanded + 500'000ULL);
+			}
+			~QuantumGuard() { limit = previous; }
+		} quantum(nodeQuantumDeadline, metrics.expanded);
+		while (true) {
+			if (!partial.pending) {
+				if (!partial.cursor.next(partial.counts)) break;
+				partial.pendingWeight = ExactWeight(1);
+				for (int i = 0; i < (int)partial.counts.size(); ++i)
+					partial.pendingWeight = ExactWeight::multiply(partial.pendingWeight,
+						chooseCount(partial.bounds[i], partial.counts[i]));
+				partial.pending = true;
+			}
+			if (expired()) {
+				metrics.partialChanceNodes++;
+				return incomplete();
+			}
+			auto child = std::make_unique<State>(state);
+			try {
+				for (int i = 0; i < (int)partial.counts.size(); ++i)
+					for (int n = 0; n < partial.counts[i]; ++n) resolveDraw(*child, types[i].first);
+			} catch (...) { return unknown(); }
+			ExactScore score = solveOwned(std::move(child));
+			if (!score.certified) { metrics.partialChanceNodes++; return incomplete(&score); }
+			partial.completedLower = ExactFraction::add(partial.completedLower,
+				score.lower.scaled(partial.pendingWeight, total));
+			partial.completedUpper = ExactFraction::add(partial.completedUpper,
+				score.upper.scaled(partial.pendingWeight, total));
+			if (!partial.completedLower.valid || !partial.completedUpper.valid) {
+				metrics.arithmeticOverflow = true; return unknown();
+			}
+			partial.processedWeight += partial.pendingWeight; noteWeight(partial.processedWeight);
+			metrics.enumeratedHiddenWorlds++;
+			partial.pendingWeight = ExactWeight(); partial.pending = false;
+		}
+		if (partial.processedWeight != total) {
+			metrics.chanceMassMismatches++; metrics.probabilityExact = false; return unknown();
+		}
+		ExactScore result{ partial.completedLower, partial.completedUpper, {},
+			ExactCompare(partial.completedLower, partial.completedUpper) == 0 };
+		partialBytes -= std::min(partialBytes, partial.accountedBytes);
+		partialMultiDraws.erase(resumeKey);
 		return result;
 	}
 
 	ExactScore chance(const State& state, const std::string& nodeKey) {
+		if (state.exact.pending == ExactPendingType::Draw && state.exact.pendingCount > 1
+			&& (state.exact.deckUnknown[state.exact.pendingPlayer]
+				|| state.exact.deckExchangeable[state.exact.pendingPlayer]))
+			return multiDrawChance(state, nodeKey);
 		auto types = chanceCardTypes(state);
 		if (types.empty()) return unknown();
 		PartialChanceEntry* partial = singletonRevealStreaming ? nullptr : partialChanceFor(nodeKey);
@@ -2302,6 +2620,25 @@ private:
 			auto value = ExactFraction::integer(evaluate(state));
 			return { value, value, {}, !state.exact.provisionalOpponentPolicy };
 		}
+		// A search has made this concrete world a singleton information set, but
+		// turn-one Main states still contain many commuting action orders.  The
+		// compact fixed-deck key preserves every card count that can affect another
+		// turn-one deck query while omitting the irrelevant prize identities already
+		// quotiented by revealAndReplayFixedTurnOneSearch.
+		std::string fixedMainKey = fixedTurnOneMainKey(state);
+		if (!fixedMainKey.empty()) {
+			ExactScore fixedCached;
+			auto local = fixedFirstTurnMainScores.find(fixedMainKey);
+			bool fixedHit = local != fixedFirstTurnMainScores.end();
+			bool sharedHit = false;
+			if (fixedHit) fixedCached = local->second;
+			else if (usingSharedTable) fixedHit = sharedHit = transposition->find(fixedMainKey, fixedCached);
+			if (fixedHit) {
+				metrics.merged++; metrics.canonicalStateMerges++;
+				if (sharedHit) metrics.rootSharedTTHits++;
+				return fixedCached;
+			}
+		}
 		std::string key;
 		if (!singletonRevealStreaming) key = keyFor(state);
 		const bool shareable = usingSharedTable && !singletonRevealStreaming;
@@ -2359,6 +2696,10 @@ private:
 					localTransposition.emplace(std::move(key), result);
 				}
 			}
+		}
+		if (result.certified && !fixedMainKey.empty()) {
+			fixedFirstTurnMainScores.emplace(fixedMainKey, result);
+			if (usingSharedTable) transposition->store(std::move(fixedMainKey), result);
 		}
 		metrics.partialTableBytes = partialBytes;
 		metrics.sessionBytes = transposition->bytes() + localTranspositionBytes + policyBytes + partialBytes

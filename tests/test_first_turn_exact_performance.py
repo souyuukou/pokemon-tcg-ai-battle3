@@ -48,7 +48,13 @@ def test_seed6_first_turn_is_exact_and_finishes_inside_submission_budget():
         assert result["chanceMassMismatches"] == 0
         assert result["hiddenInformationLeakDetected"] is False
         assert result["rootWorkers"] == 2
-        assert result["successorMerges"] > 200_000
+        # Fixed-deck reveal outcomes are now combined analytically before they
+        # become physical successor States, so the old 200k post-step merge
+        # count is intentionally gone.  The remaining semantic Main states must
+        # still hit the collision-safe canonical cache.
+        assert result["canonicalStateMerges"] > 1_000
+        assert result["enumeratedHiddenWorlds"] < 2_000
+        assert result["expandedNodes"] < 100_000
         assert result["peakRssBytes"] < 3 * 1024**3
         assert all(action["certified"] for action in result["rootActions"])
 

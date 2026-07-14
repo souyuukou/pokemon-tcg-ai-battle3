@@ -1,6 +1,6 @@
 from fractions import Fraction
 from exact_solver.resources import MatchBudget, ResourceLimits, current_rss_bytes, solve_root_jobs
-from exact_solver.agent_policy import PolicyContext
+from exact_solver.agent_policy import PolicyContext, _turn_slice_milliseconds
 from exact_solver.solver import SearchResult
 
 
@@ -23,4 +23,17 @@ def test_self_play_policy_contexts_have_independent_budgets():
     assert left.budget is not right.budget
     left.budget.charge(10)
     assert right.budget.remaining - left.budget.remaining > 9
+
+
+def test_turn_slices_share_one_absolute_ninety_second_cap(monkeypatch):
+    monkeypatch.delenv("PTCG_EXACT_TURN_MS", raising=False)
+    monkeypatch.delenv("PTCG_EXACT_SELECTION_MS", raising=False)
+    context = PolicyContext()
+    assert _turn_slice_milliseconds(context, True, 500_000) == 90_000
+    context.turn_search_seconds = 85.25
+    assert _turn_slice_milliseconds(context, False, 500_000) == 4_750
+    context.turn_search_seconds = 90.0
+    import pytest
+    with pytest.raises(RuntimeError, match="turn search budget"):
+        _turn_slice_milliseconds(context, False, 500_000)
 
