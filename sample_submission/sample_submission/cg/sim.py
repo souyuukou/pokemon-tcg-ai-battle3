@@ -139,6 +139,15 @@ if hasattr(lib, "ExactEvaluateFeaturesV3"):
 if hasattr(lib, "ExactReplayTraceBegin"):
     lib.ExactReplayTraceBegin.restype = ctypes.c_int
     lib.ExactReplayTraceBegin.argtypes = [ctypes.c_void_p]
+if hasattr(lib, "ExactReplaySetDeckOrder"):
+    lib.ExactReplaySetDeckOrder.restype = ctypes.c_int
+    lib.ExactReplaySetDeckOrder.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                             ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+if hasattr(lib, "ExactReplaySetHiddenZones"):
+    lib.ExactReplaySetHiddenZones.restype = ctypes.c_int
+    lib.ExactReplaySetHiddenZones.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                               ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+                                               ctypes.POINTER(ctypes.c_int), ctypes.c_int]
 if hasattr(lib, "ExactReplayTraceDrain"):
     lib.ExactReplayTraceDrain.restype = ctypes.c_char_p
     lib.ExactReplayTraceDrain.argtypes = [ctypes.c_void_p]

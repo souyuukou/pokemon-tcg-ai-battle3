@@ -39,6 +39,9 @@ struct GameConfig {
 	bool sendDeck;
 	bool deviceRand;
 	bool initialDeckAlreadyShuffled;
+	// Replay restoration supplies the saved post-shuffle order, but later
+	// shuffles must observe the same RNG state as the recorded battle.
+	bool advanceInitialShuffleRng = false;
 	bool pauseAtExactTurnLeaf;
 };
 

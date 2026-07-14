@@ -7,8 +7,7 @@ import os
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_PROFILE = ROOT / "decks" / "majkel1337-85795098.json"
+DEFAULT_PROFILE = Path(__file__).resolve().parent / "decks" / "majkel1337-85795098.json"
 
 
 @dataclass(frozen=True)

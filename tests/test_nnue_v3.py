@@ -1,4 +1,5 @@
 import json
+import hashlib
 import math
 from pathlib import Path
 
@@ -9,7 +10,7 @@ from exact_solver.nnue_v3 import (ENTITY_DENSE, ENTITY_HIDDEN,
                                   GLOBAL_HIDDEN, GLOBAL_RELATIONS, POOLS,
                                   EntityFeatures, FeatureRecord, QuantizedModel,
                                   export_quantized, load_quantized,
-                                  predict_integer)
+                                  predict_integer, predict_integer_many)
 
 
 def _model(tokens=(0, 1, 2, 42, 1_000_007, 2_000_001, 3_000_042)) -> QuantizedModel:
@@ -40,18 +41,28 @@ def test_v3_round_trip_has_explicit_collision_free_token_table(tmp_path: Path):
     assert predict_integer(loaded, _record()) == predict_integer(_model(), _record())
 
 
-def test_bundled_zero_model_is_v3_and_below_memory_gate():
+def test_bundled_trained_model_is_v3_and_below_memory_gate():
     path = Path(__file__).resolve().parents[1] / "sample_submission" / "sample_submission" / "exact-evaluator-v3.bin"
     model = load_quantized(path)
     assert path.stat().st_size < 64 * 1024 * 1024
     assert model.tokens[0] == 0
-    assert np.count_nonzero(model.entity_sparse_weight) == 0
-    assert np.count_nonzero(model.global_sparse_weight) == 0
+    assert np.count_nonzero(model.entity_sparse_weight) > 0
+    assert np.count_nonzero(model.global_sparse_weight) > 0
+    assert model.dataset_hash != bytes(32)
+    report = json.loads(path.with_suffix(".report.json").read_text(encoding="utf-8"))
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == report["modelSha256"]
+    assert report["allGatesPassed"] is True
 
 
 def test_shared_entity_encoder_is_invariant_to_bench_order():
     model = _model()
     assert predict_integer(model, _record((1, 2))) == predict_integer(model, _record((2, 1)))
+
+
+def test_batched_integer_reference_matches_single_record_evaluation():
+    model = _model()
+    records = [_record((1, 2)), _record((2, 1))]
+    assert predict_integer_many(model, records) == [predict_integer(model, record) for record in records]
 
 
 def test_python_integer_reference_matches_native_bit_for_bit(tmp_path: Path):

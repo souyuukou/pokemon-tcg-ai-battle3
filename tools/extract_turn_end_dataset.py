@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import hashlib
 import json
 import sys
@@ -10,10 +11,22 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "sample_submission" / "sample_submission"))
 
 from cg.game import (battle_finish, battle_select, battle_start_ordered,
+                     exact_replay_set_hidden_zones,
                      exact_replay_trace_begin, exact_replay_trace_drain,
                      exact_replay_trace_end)
 
 SUPPORTED_ENGINE_VERSIONS = {"1.30.1"}
+
+
+def _rejection_reason(error: Exception) -> str:
+    message = str(error)
+    if message.startswith("illegal replay action"):
+        return "illegal replay action"
+    if message.startswith("cannot restore player"):
+        return "hidden-zone restoration mismatch"
+    if "Windows Error 0xe06d7363" in message:
+        return "native replay divergence"
+    return message.split(":", 1)[0]
 
 
 def _deck_step(replay: dict) -> tuple[int, list[int], list[int]]:
@@ -40,12 +53,43 @@ def _ordered_decks(replay: dict) -> tuple[list[int], list[int]]:
     raise ValueError("replay has no exact initial shuffled deck order")
 
 
+def _visualization_frames(replay: dict) -> list[dict]:
+    candidates = []
+    for step in replay.get("steps") or []:
+        for record in step[:2]:
+            frames = (record or {}).get("visualize") or []
+            if frames:
+                candidates.append(frames)
+    if not candidates:
+        raise ValueError("replay has no visualization frames")
+    return max(candidates, key=len)
+
+
+def _frame_hidden_zones(frame: dict) -> tuple[tuple[list[int], list[int]],
+                                                   tuple[list[int], list[int]]]:
+    players = ((frame or {}).get("current") or {}).get("players") or []
+    if len(players) != 2:
+        raise ValueError("replay frame has no two-player state")
+    decks = [[int(card["id"]) for card in (player.get("deck") or []) if card]
+             for player in players]
+    hands = [[int(card["id"]) for card in (player.get("hand") or []) if card]
+             for player in players]
+    if any(len(decks[player]) != int(players[player].get("deckCount", len(decks[player])))
+           for player in range(2)):
+        raise ValueError("replay frame hides a deck order")
+    if any(len(hands[player]) != int(players[player].get("handCount", len(hands[player])))
+           for player in range(2)):
+        raise ValueError("replay frame hides a hand")
+    return (hands[0], decks[0]), (hands[1], decks[1])
+
+
 def _replay_one(path: Path) -> list[dict]:
     replay = json.loads(path.read_text(encoding="utf-8"))
     if replay.get("module_version") not in SUPPORTED_ENGINE_VERSIONS:
         raise ValueError(f"unsupported engine version {replay.get('module_version')!r}")
     deck_at, submitted0, submitted1 = _deck_step(replay)
     deck0, deck1 = _ordered_decks(replay)
+    frames = _visualization_frames(replay)
     if sorted(deck0) != sorted(submitted0) or sorted(deck1) != sorted(submitted1):
         raise ValueError("initial ordered deck does not match submitted deck")
     seed = int((replay.get("configuration") or {}).get("seed", 0))
@@ -63,6 +107,7 @@ def _replay_one(path: Path) -> list[dict]:
                 if player < len(previous) and (previous[player] or {}).get("status") == "ACTIVE":
                     action_queue[player].append(list((current_step[player] or {}).get("action") or []))
         action_at = [0, 0]
+        action_count = 0
         while True:
             current = observation.get("current") or {}
             if int(current.get("result", -1)) >= 0:
@@ -74,6 +119,18 @@ def _replay_one(path: Path) -> list[dict]:
                 raise ValueError(f"replay is missing player {actor}'s next action")
             action = action_queue[actor][action_at[actor]]
             action_at[actor] += 1
+            if action_count >= len(frames):
+                raise ValueError("replay has fewer visualization frames than actions")
+            frame_zones = _frame_hidden_zones(frames[action_count])
+            # Search/looking continuations temporarily move cards outside hand
+            # and deck.  The native setter is transactional, so a mismatch is
+            # safely deferred until the next stable observation.
+            for player in range(2):
+                try:
+                    exact_replay_set_hidden_zones(player, *frame_zones[player])
+                except ValueError:
+                    pass
+            action_count += 1
             try:
                 observation = battle_select(action)
             except (IndexError, ValueError) as error:
@@ -119,18 +176,32 @@ def main() -> None:
     parser.add_argument("replays", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--max-files", type=int, default=0)
+    parser.add_argument("--sample-files", type=int, default=0,
+                        help="process this many paths evenly across the full chronological corpus")
+    parser.add_argument("--progress-every", type=int, default=500)
+    parser.add_argument("--verbose-rejections", action="store_true")
     parser.add_argument("--strict", action="store_true")
     args = parser.parse_args()
 
     paths = sorted(args.replays.rglob("*.json"))
+    corpus_files = len(paths)
+    if args.max_files and args.sample_files:
+        raise ValueError("--max-files and --sample-files are mutually exclusive")
     if args.max_files > 0:
         paths = paths[:args.max_files]
+    elif 0 < args.sample_files < len(paths):
+        count = args.sample_files
+        if count == 1:
+            paths = [paths[len(paths) // 2]]
+        else:
+            paths = [paths[index * (len(paths) - 1) // (count - 1)] for index in range(count)]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix(args.output.suffix + ".tmp")
     accepted = rejected = sample_count = 0
+    rejection_reasons: Counter[str] = Counter()
     digest = hashlib.sha256()
     with temporary.open("w", encoding="utf-8", newline="\n") as output:
-        for path in paths:
+        for index, path in enumerate(paths, 1):
             try:
                 samples = _replay_one(path)
                 for sample in samples:
@@ -139,18 +210,25 @@ def main() -> None:
                 accepted += 1; sample_count += len(samples)
             except Exception as error:
                 rejected += 1
-                print(f"reject {path}: {error}", file=sys.stderr)
+                rejection_reasons[_rejection_reason(error)] += 1
+                if args.verbose_rejections:
+                    print(f"reject {path}: {error}", file=sys.stderr)
                 if args.strict:
                     raise
+            if args.progress_every > 0 and index % args.progress_every == 0:
+                print(f"processed={index}/{len(paths)} accepted={accepted} "
+                      f"rejected={rejected} samples={sample_count}", file=sys.stderr)
     temporary.replace(args.output)
     manifest = {
         "schemaVersion": 3,
         "source": str(args.replays),
+        "corpusFiles": corpus_files,
         "filesSeen": len(paths),
         "acceptedReplays": accepted,
         "rejectedReplays": rejected,
         "samples": sample_count,
         "sha256": digest.hexdigest(),
+        "rejectionReasons": dict(rejection_reasons.most_common()),
     }
     args.output.with_suffix(args.output.suffix + ".manifest.json").write_text(
         json.dumps(manifest, indent=2), encoding="utf-8")

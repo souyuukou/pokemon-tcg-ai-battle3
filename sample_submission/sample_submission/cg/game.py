@@ -104,6 +104,28 @@ def exact_replay_trace_begin() -> None:
         raise RuntimeError("cannot start exact replay trace")
 
 
+def exact_replay_set_deck_order(player: int, card_ids: list[int]) -> None:
+    """Restore the exact deck order recorded before the next replay action."""
+    if not hasattr(lib, "ExactReplaySetDeckOrder") or not Battle.battle_ptr:
+        raise RuntimeError("exact replay deck restoration is not available")
+    values = (ctypes.c_int * len(card_ids))(*card_ids)
+    error = lib.ExactReplaySetDeckOrder(Battle.battle_ptr, int(player), values, len(card_ids))
+    if error:
+        raise ValueError(f"cannot restore player {player} deck order (error {error})")
+
+
+def exact_replay_set_hidden_zones(player: int, hand_ids: list[int], deck_ids: list[int]) -> None:
+    """Restore recorded hand/deck membership after hidden random outcomes."""
+    if not hasattr(lib, "ExactReplaySetHiddenZones") or not Battle.battle_ptr:
+        raise RuntimeError("exact replay hidden-zone restoration is not available")
+    hand = (ctypes.c_int * len(hand_ids))(*hand_ids)
+    deck = (ctypes.c_int * len(deck_ids))(*deck_ids)
+    error = lib.ExactReplaySetHiddenZones(Battle.battle_ptr, int(player),
+                                          hand, len(hand_ids), deck, len(deck_ids))
+    if error:
+        raise ValueError(f"cannot restore player {player} hidden zones (error {error})")
+
+
 def exact_replay_trace_drain() -> list[dict]:
     """Return and clear turn-end samples captured since the previous drain."""
     if not hasattr(lib, "ExactReplayTraceDrain") or not Battle.battle_ptr:

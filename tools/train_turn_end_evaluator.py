@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import json
 import math
@@ -20,7 +21,7 @@ from exact_solver.nnue_v3 import (BELIEF_SCALE, ENTITY_DENSE, ENTITY_HIDDEN,
                                   GLOBAL_HIDDEN, GLOBAL_RELATIONS, POOLS,
                                   WEIGHT_SCALE, EntityFeatures, FeatureRecord,
                                   QuantizedModel, export_quantized, fnv1a,
-                                  manifest_digest, predict_integer)
+                                  manifest_digest, predict_integer_many)
 
 
 @dataclass
@@ -31,6 +32,26 @@ class Example:
     target: float
     weight: float
     feature: FeatureRecord
+
+
+@dataclass
+class PackedBatch:
+    """A tensorized batch with sparse relations grouped for index_add."""
+
+    global_dense: object
+    global_sparse_relation: object
+    global_sparse_token: object
+    global_sparse_value: object
+    global_sparse_sample: object
+    entity_dense: object
+    entity_pool: object
+    entity_sample: object
+    entity_sparse_relation: object
+    entity_sparse_token: object
+    entity_sparse_value: object
+    entity_sparse_entity: object
+    target: object
+    weight: object
 
 
 def read_card_ids(path: Path) -> list[int]:
@@ -105,13 +126,59 @@ def fake_quant(value, scale: float, minimum: int, maximum: int):
     return value + (quantized - value).detach()
 
 
+def pack_batch(examples: list[Example], indices, token_index: dict[int, int], torch) -> PackedBatch:
+    global_dense = []
+    global_sparse = []
+    entity_dense = []
+    entity_pool = []
+    entity_sample = []
+    entity_sparse = []
+    targets = []
+    weights = []
+    for sample, raw_index in enumerate(indices):
+        example = examples[int(raw_index)]
+        global_dense.append(example.feature.global_dense)
+        targets.append(example.target)
+        weights.append(example.weight)
+        for relation, token, value in example.feature.global_sparse:
+            global_sparse.append((int(relation), token_index.get(int(token), 0),
+                                  int(value) / BELIEF_SCALE, sample))
+        for entity in example.feature.entities:
+            entity_index = len(entity_dense)
+            entity_dense.append(entity.dense)
+            entity_pool.append(int(entity.pool))
+            entity_sample.append(sample)
+            for relation, token, value in entity.sparse:
+                entity_sparse.append((int(relation), token_index.get(int(token), 0),
+                                      int(value) / BELIEF_SCALE, entity_index))
+
+    def columns(rows, column_count, dtypes):
+        if rows:
+            return tuple(torch.tensor([row[column] for row in rows], dtype=dtypes[column])
+                         for column in range(column_count))
+        return tuple(torch.empty(0, dtype=dtype) for dtype in dtypes)
+
+    gs = columns(global_sparse, 4, (torch.long, torch.long, torch.float32, torch.long))
+    es = columns(entity_sparse, 4, (torch.long, torch.long, torch.float32, torch.long))
+    return PackedBatch(
+        torch.tensor(global_dense, dtype=torch.float32), *gs,
+        torch.tensor(entity_dense, dtype=torch.float32).reshape(-1, ENTITY_DENSE),
+        torch.tensor(entity_pool, dtype=torch.long),
+        torch.tensor(entity_sample, dtype=torch.long), *es,
+        torch.tensor(targets, dtype=torch.float32),
+        torch.tensor(weights, dtype=torch.float32),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train the structured integer V3 turn-end evaluator")
     parser.add_argument("dataset", type=Path); parser.add_argument("output", type=Path)
     parser.add_argument("--card-table", type=Path, default=ROOT / "EN_Card_Data.csv")
     parser.add_argument("--manifest", type=Path); parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--qat-epochs", type=int, default=6); parser.add_argument("--max-samples", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--seed", type=int, default=20260714); parser.add_argument("--legacy-predictions", type=Path)
+    parser.add_argument("--report", type=Path)
     parser.add_argument("--require-gates", action="store_true")
     args = parser.parse_args()
 
@@ -132,8 +199,13 @@ def main() -> None:
             self.pool = torch.nn.Parameter(torch.empty(POOLS, ENTITY_HIDDEN, GLOBAL_HIDDEN))
             self.gb = torch.nn.Parameter(torch.zeros(GLOBAL_HIDDEN))
             self.ow = torch.nn.Parameter(torch.empty(GLOBAL_HIDDEN)); self.ob = torch.nn.Parameter(torch.zeros(()))
-            for value in (self.edw, self.gdw, self.pool): torch.nn.init.xavier_uniform_(value)
-            torch.nn.init.uniform_(self.ow, -.1, .1)
+            # Dense fields contain raw rule values (HP, turn counters, and card
+            # counts), so generic Xavier initialization saturates clipped ReLU
+            # before the first update.  Start in the linear range instead.
+            torch.nn.init.uniform_(self.edw, -.002, .002)
+            torch.nn.init.uniform_(self.gdw, -.002, .002)
+            torch.nn.init.uniform_(self.pool, -.01, .01)
+            torch.nn.init.uniform_(self.ow, -.01, .01)
 
         def parameters_for(self, qat: bool):
             if not qat: return self.edw, self.esw, self.eb, self.gdw, self.gsw, self.pool, self.gb, self.ow, self.ob
@@ -147,37 +219,61 @@ def main() -> None:
                     fake_quant(self.ow, WEIGHT_SCALE, -32768, 32767),
                     fake_quant(self.ob, WEIGHT_SCALE * WEIGHT_SCALE, -(1 << 63), (1 << 63)-1))
 
-        def one(self, feature: FeatureRecord, qat: bool):
+        def forward(self, batch: PackedBatch, qat=False):
             edw, esw, eb, gdw, gsw, pool, gb, ow, ob = self.parameters_for(qat)
-            gd = torch.tensor(feature.global_dense, dtype=torch.float32)
-            global_acc = gdw @ gd + gb
-            for relation, token, value in feature.global_sparse:
-                global_acc = global_acc + gsw[int(relation), token_index.get(int(token), 0)] * (int(value) / BELIEF_SCALE)
-            for entity in feature.entities:
-                dense = torch.tensor(entity.dense, dtype=torch.float32)
-                acc = edw @ dense + eb
-                for relation, token, value in entity.sparse:
-                    acc = acc + esw[int(relation), token_index.get(int(token), 0)] * (int(value) / BELIEF_SCALE)
-                global_acc = global_acc + torch.clamp(acc, 0, 127) @ pool[int(entity.pool)]
+            global_acc = batch.global_dense @ gdw.T + gb
+            if batch.global_sparse_relation.numel():
+                contribution = gsw[batch.global_sparse_relation, batch.global_sparse_token]
+                contribution = contribution * batch.global_sparse_value[:, None]
+                global_acc = global_acc.index_add(0, batch.global_sparse_sample, contribution)
+            if batch.entity_dense.shape[0]:
+                entity_acc = batch.entity_dense @ edw.T + eb
+                if batch.entity_sparse_relation.numel():
+                    contribution = esw[batch.entity_sparse_relation, batch.entity_sparse_token]
+                    contribution = contribution * batch.entity_sparse_value[:, None]
+                    entity_acc = entity_acc.index_add(0, batch.entity_sparse_entity, contribution)
+                activation = torch.clamp(entity_acc, 0, 127)
+                projection = torch.bmm(activation[:, None, :], pool[batch.entity_pool]).squeeze(1)
+                global_acc = global_acc.index_add(0, batch.entity_sample, projection)
             return torch.clamp(global_acc, 0, 127) @ ow + ob
 
-        def forward(self, indices, qat=False):
-            return torch.stack([self.one(examples[int(i)].feature, qat) for i in indices])
-
     model = EntityNnue(); optimizer = torch.optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-6)
+    if args.batch_size < 1:
+        raise ValueError("batch size must be positive")
     train = np.asarray(splits["train"], dtype=np.int64); rng = np.random.default_rng(args.seed)
+    training_batches = [pack_batch(examples, train[start:start+args.batch_size], token_index, torch)
+                        for start in range(0, len(train), args.batch_size)]
+    validation_batches = [pack_batch(examples, splits["validation"][start:start+args.batch_size],
+                                     token_index, torch)
+                          for start in range(0, len(splits["validation"]), args.batch_size)]
+    best_validation = math.inf
+    best_state = None
+    best_epoch = 0
     for epoch in range(args.epochs):
-        qat = epoch >= max(0, args.epochs - args.qat_epochs); permutation = rng.permutation(train)
+        qat = epoch >= max(0, args.epochs - args.qat_epochs)
         total = total_weight = 0.0
-        for start in range(0, len(permutation), 64):
-            batch = permutation[start:start+64]
+        for batch_index in rng.permutation(len(training_batches)):
+            batch = training_batches[int(batch_index)]
             prediction = model(batch, qat)
-            target = torch.tensor([examples[int(i)].target for i in batch])
-            weight = torch.tensor([examples[int(i)].weight for i in batch])
-            loss = ((prediction-target).square()*weight).sum()/weight.sum()
+            loss = ((prediction-batch.target).square()*batch.weight).sum()/batch.weight.sum()
             optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
-            total += float(loss.detach()*weight.sum()); total_weight += float(weight.sum())
-        print(f"epoch={epoch+1} qat={int(qat)} train_mse={total/total_weight:.7f}")
+            total += float(loss.detach()*batch.weight.sum()); total_weight += float(batch.weight.sum())
+        validation_total = validation_weight = 0.0
+        with torch.no_grad():
+            for batch in validation_batches:
+                loss_sum = (model(batch, qat)-batch.target).square().mul(batch.weight).sum()
+                validation_total += float(loss_sum)
+                validation_weight += float(batch.weight.sum())
+        validation_mse = validation_total / validation_weight if validation_weight else math.nan
+        print(f"epoch={epoch+1} qat={int(qat)} train_mse={total/total_weight:.7f} "
+              f"validation_mse={validation_mse:.7f}")
+        if (qat or args.qat_epochs == 0) and validation_mse < best_validation:
+            best_validation = validation_mse
+            best_epoch = epoch + 1
+            best_state = copy.deepcopy(model.state_dict())
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
 
     with torch.no_grad():
         quantized = QuantizedModel(
@@ -200,38 +296,54 @@ def main() -> None:
         from cg.api import exact_evaluate_features_v3, exact_load_evaluator_model, exact_unload_evaluator_model
         exact_load_evaluator_model(str(args.output.resolve()))
         try:
+            checked = examples[:min(256,len(examples))]
+            references = predict_integer_many(quantized, [example.feature for example in checked])
             native_bit_exact = all(exact_evaluate_features_v3(list(e.feature.global_dense),
                 [list(x) for x in e.feature.global_sparse],
                 [{"pool": x.pool, "dense": list(x.dense), "sparse": [list(y) for y in x.sparse]}
-                 for x in e.feature.entities]) == predict_integer(quantized, e.feature)
-                for e in examples[:min(256,len(examples))])
+                 for x in e.feature.entities]) == reference
+                for e, reference in zip(checked, references))
         finally: exact_unload_evaluator_model()
     except Exception as error: print(f"native bit check failed: {error}", file=sys.stderr)
 
     def predictions(indices):
-        with torch.no_grad(): floating = model(np.asarray(indices), False).numpy()
-        integer = np.asarray([predict_integer(quantized, examples[i].feature)/100_000_000 for i in indices])
+        floating_parts = []
+        with torch.no_grad():
+            for start in range(0, len(indices), args.batch_size):
+                batch = pack_batch(examples, indices[start:start+args.batch_size], token_index, torch)
+                floating_parts.append(model(batch, False).numpy())
+        floating = np.concatenate(floating_parts) if floating_parts else np.empty(0)
+        integer = np.asarray(predict_integer_many(quantized, [examples[i].feature for i in indices]),
+                             dtype=np.float64) / 100_000_000
         target = np.asarray([examples[i].target for i in indices]); return target, floating, integer
 
-    report = {"examples": len(examples), "splits": {k:len(v) for k,v in splits.items()}}
+    report = {"examples": len(examples), "splits": {k:len(v) for k,v in splits.items()},
+              "bestEpoch": best_epoch, "bestValidationMse": best_validation}
     gates = {"nativeBitExact": native_bit_exact, "hasUnseenTestSplit": bool(splits["test"])}
     if splits["test"]:
-        target, floating, integer = predictions(splits["test"]); zero_mse = float(np.mean(target**2))
-        float_mse = float(np.mean((floating-target)**2)); integer_mse = float(np.mean((integer-target)**2))
+        target, floating, integer = predictions(splits["test"])
+        test_weight = np.asarray([examples[i].weight for i in splits["test"]], dtype=np.float64)
+        weighted = lambda values: float(np.sum(values * test_weight) / np.sum(test_weight))
+        zero_mse = weighted(target**2)
+        float_mse = weighted((floating-target)**2); integer_mse = weighted((integer-target)**2)
         gates.update(zeroImprovement15=integer_mse <= zero_mse*.85,
-                     signAccuracy70=float(np.mean(np.sign(integer)==np.sign(target))) >= .70,
+                     signAccuracy70=weighted(np.sign(integer)==np.sign(target)) >= .70,
                      quantizationWithin1Percent=(integer_mse-float_mse)/max(float_mse,1e-12) <= .01)
-        report.update(testFloatMse=float_mse,testQuantizedMse=integer_mse,zeroMse=zero_mse)
-        if args.legacy_predictions:
-            legacy=json.loads(args.legacy_predictions.read_text()); differences=[]
-            by_replay=defaultdict(list)
-            for prediction,index in zip(integer,splits["test"]):
-                e=examples[index]; by_replay[e.replay_id].append((prediction-e.target)**2-(float(legacy[e.key])-e.target)**2)
-            paired=np.asarray([np.mean(v) for v in by_replay.values()]); bootstrap=rng.choice(paired,(2000,len(paired)),replace=True).mean(1)
-            gates["beatsLegacyPaired95"] = float(np.quantile(bootstrap,.975)) < 0
-        else: gates["beatsLegacyPaired95"] = False
+        report.update(testFloatMse=float_mse,testQuantizedMse=integer_mse,zeroMse=zero_mse,
+                      signAccuracy=weighted(np.sign(integer)==np.sign(target)))
+        baseline_by_key = json.loads(args.legacy_predictions.read_text()) if args.legacy_predictions else None
+        by_replay=defaultdict(list)
+        for prediction,index in zip(integer,splits["test"]):
+            e=examples[index]
+            baseline = float(baseline_by_key[e.key]) if baseline_by_key is not None else 0.0
+            by_replay[e.replay_id].append((prediction-e.target)**2-(baseline-e.target)**2)
+        paired=np.asarray([np.mean(v) for v in by_replay.values()])
+        bootstrap=rng.choice(paired,(2000,len(paired)),replace=True).mean(1)
+        gates["beatsLegacyPaired95"] = float(np.quantile(bootstrap,.975)) < 0
     report["gates"] = gates; report["allGatesPassed"] = bool(gates) and all(gates.values())
     print(json.dumps(report,indent=2))
+    report_path = args.report or args.output.with_suffix(args.output.suffix + ".report.json")
+    report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
     if args.require_gates and not report["allGatesPassed"]: raise SystemExit("V3 adoption gates failed")
 
 

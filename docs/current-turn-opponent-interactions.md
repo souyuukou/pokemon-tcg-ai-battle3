@@ -91,8 +91,8 @@ root プレイヤーのターン開始から、ターン終了効果とポケモ
 
 ## `deck/majkel1337-85795098` の監査結果
 
-固定デッキはブランチ上の manifest
-`decks/majkel1337-85795098.json`（SHA-256
+固定デッキは提出物に同梱した manifest
+`sample_submission/sample_submission/exact_solver/decks/majkel1337-85795098.json`（SHA-256
 `3f4515092dc59df397f365a9b79c7cf0c1cb73b9aa38bc47c1b18e9df4c2fdaf`）を正とする。
 現在の作業ブランチにある別の `deck.csv` はこの判定に使わない。
 

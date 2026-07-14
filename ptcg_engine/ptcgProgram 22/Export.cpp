@@ -188,6 +188,69 @@ extern "C" GAME_API int ExactReplayTraceBegin(ApiData* data) {
   data->exactReplayTraceEnabled = true; data->game.config.pauseAtExactTurnLeaf = true; return 0;
 }
 
+extern "C" GAME_API int ExactReplaySetDeckOrder(ApiData* data, int playerIndex,
+  const int* cardIds, int count) {
+  if (data == nullptr || data->apiDataType != 1) return 30;
+  if (playerIndex < 0 || playerIndex >= 2 || cardIds == nullptr || count < 0) return 1;
+  PlayerState& player = data->state.players[playerIndex];
+  if (player.deck.size() != count) return 2;
+  CardList remaining = player.deck;
+  CardList ordered;
+  for (int outputIndex = 0; outputIndex < count; ++outputIndex) {
+    int found = -1;
+    for (int inputIndex = 0; inputIndex < remaining.size(); ++inputIndex) {
+      if ((int)data->state.getCard(remaining[inputIndex]).cardId == cardIds[outputIndex]) {
+        found = inputIndex; break;
+      }
+    }
+    if (found < 0) return 3;
+    ordered.push_back(remaining.take(found));
+  }
+  if (!remaining.empty()) return 4;
+  player.deck = ordered;
+  return 0;
+}
+
+extern "C" GAME_API int ExactReplaySetHiddenZones(ApiData* data, int playerIndex,
+  const int* handIds, int handCount, const int* deckIds, int deckCount) {
+  if (data == nullptr || data->apiDataType != 1) return 30;
+  if (playerIndex < 0 || playerIndex >= 2 || handCount < 0 || deckCount < 0
+    || (handCount > 0 && handIds == nullptr) || (deckCount > 0 && deckIds == nullptr)) return 1;
+  PlayerState& player = data->state.players[playerIndex];
+  if (player.hand.size() + player.deck.size() != handCount + deckCount) return 2;
+  CardList remaining = player.hand;
+  for (CardRef ref : player.deck) remaining.push_back(ref);
+  std::unordered_map<int, int> actualCounts;
+  std::unordered_map<int, int> requestedCounts;
+  for (CardRef ref : remaining) actualCounts[(int)data->state.getCard(ref).cardId]++;
+  for (int i = 0; i < handCount; ++i) requestedCounts[handIds[i]]++;
+  for (int i = 0; i < deckCount; ++i) requestedCounts[deckIds[i]]++;
+  if (actualCounts != requestedCounts) return 3;
+  CardList hand;
+  CardList deck;
+  auto appendById = [&](CardList& destination, int cardId, AreaType area) {
+    int found = -1;
+    for (int inputIndex = 0; inputIndex < remaining.size(); ++inputIndex) {
+      if ((int)data->state.getCard(remaining[inputIndex]).cardId == cardId) {
+        found = inputIndex; break;
+      }
+    }
+    if (found < 0) return false;
+    CardRef ref = remaining.take(found);
+    data->state.cardMoved(ref, area);
+    destination.push_back(ref);
+    return true;
+  };
+  for (int i = 0; i < handCount; ++i)
+    if (!appendById(hand, handIds[i], AreaType::Hand)) return 4;
+  for (int i = 0; i < deckCount; ++i)
+    if (!appendById(deck, deckIds[i], AreaType::Deck)) return 5;
+  if (!remaining.empty()) return 6;
+  player.hand = hand;
+  player.deck = deck;
+  return 0;
+}
+
 extern "C" GAME_API void ExactReplayTraceEnd(ApiData* data) {
   if (data == nullptr) return;
   data->exactReplayTraceEnabled = false; data->game.config.pauseAtExactTurnLeaf = false;

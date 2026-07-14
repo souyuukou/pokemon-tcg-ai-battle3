@@ -181,9 +181,8 @@ def _rounded_divide(value: np.ndarray, divisor: int) -> np.ndarray:
     return np.where(value < 0, -result, result)
 
 
-def predict_integer(model: QuantizedModel, feature: FeatureRecord) -> int:
-    model.validate()
-    index = {int(token): i for i, token in enumerate(model.tokens)}
+def _predict_integer_validated(model: QuantizedModel, feature: FeatureRecord,
+                               index: dict[int, int]) -> int:
     gd = np.asarray(feature.global_dense, dtype=np.int64)
     if gd.shape != (GLOBAL_DENSE,):
         raise ValueError("invalid global dense shape")
@@ -210,6 +209,20 @@ def predict_integer(model: QuantizedModel, feature: FeatureRecord) -> int:
     if output < 0:
         score = -score
     return max(-NON_TERMINAL_LIMIT, min(NON_TERMINAL_LIMIT, score))
+
+
+def predict_integer(model: QuantizedModel, feature: FeatureRecord) -> int:
+    model.validate()
+    index = {int(token): i for i, token in enumerate(model.tokens)}
+    return _predict_integer_validated(model, feature, index)
+
+
+def predict_integer_many(model: QuantizedModel,
+                         features: Sequence[FeatureRecord]) -> list[int]:
+    """Evaluate many records while validating the immutable model only once."""
+    model.validate()
+    index = {int(token): i for i, token in enumerate(model.tokens)}
+    return [_predict_integer_validated(model, feature, index) for feature in features]
 
 
 def manifest_digest(path: str | Path | None) -> bytes:

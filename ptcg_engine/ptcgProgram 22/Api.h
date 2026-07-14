@@ -41,6 +41,7 @@ inline StartData ApiBattleStartSeeded(int* cards, unsigned int seed, bool determ
 	config.recordLog = true;
 	config.deviceRand = !deterministic;
 	config.initialDeckAlreadyShuffled = initialDeckAlreadyShuffled;
+	config.advanceInitialShuffleRng = initialDeckAlreadyShuffled;
 	for (int i = 0; i < 2; i++) {
 		std::unordered_map<std::u8string, int> nameCount;
 		bool aceSpec = false;
