@@ -931,10 +931,78 @@ extern "C" {
     }
     try {
       SetBattleData(data, serialized, count);
-      ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds,
-          opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount,
-          nullptr, data->exactEvaluator);
-      return ExactDecisionJson(data, planner.decide(data->state));
+      ExactDecision decision;
+      const State& root = data->state;
+      if (root.selectMin == 1 && root.selectMax == 1 && root.options.size() > 1) {
+        struct WorkerResult {
+          std::vector<std::pair<int, ExactScore>> actions;
+          ExactMetrics metrics;
+        };
+        const auto absoluteDeadline = std::chrono::steady_clock::now()
+          + std::chrono::milliseconds(std::max(1, budgetMilliseconds));
+        auto worker = [&](int parity) {
+          WorkerResult output;
+          Game game = data->game;
+          ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds,
+            opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount,
+            nullptr, data->exactEvaluator);
+          std::vector<int> assigned;
+          for (int option = parity; option < (int)root.options.size(); option += 2)
+            if (root.options[option].type == SelectOptionType::End) assigned.push_back(option);
+          for (int option = parity; option < (int)root.options.size(); option += 2)
+            if (root.options[option].type != SelectOptionType::End) assigned.push_back(option);
+          for (int option : assigned) {
+            ExactScore saved; saved.action = { option };
+            while (!saved.certified && std::chrono::steady_clock::now() < absoluteDeadline) {
+              auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                absoluteDeadline - std::chrono::steady_clock::now()).count();
+              if (remaining <= 0) break;
+              planner.setBudgetMilliseconds((int)std::max<long long>(1, remaining));
+              State local = root; local.game = &game;
+              ExactScore fresh = planner.evaluateRootAction(local, option).score;
+              if (ExactCompare(fresh.lower, saved.lower) > 0)
+                saved.lower = fresh.lower;
+              if (ExactCompare(fresh.upper, saved.upper) < 0)
+                saved.upper = fresh.upper;
+              saved.certified = fresh.certified || ExactCompare(saved.lower, saved.upper) == 0;
+              if (planner.resourceStopped()) break;
+            }
+            output.actions.push_back({ option, saved });
+            output.metrics = planner.currentMetrics();
+          }
+          return output;
+        };
+        auto future0 = std::async(std::launch::async, worker, 0);
+        auto future1 = std::async(std::launch::async, worker, 1);
+        WorkerResult results[2] = { future0.get(), future1.get() };
+        bool first = true, allCertified = true;
+        ExactFraction maxUpper = ExactFraction::integer(-100'000'000);
+        for (const WorkerResult& result : results) {
+          for (const auto& indexed : result.actions) {
+            ExactScore item = indexed.second;
+            item.action = { indexed.first };
+            decision.rootActions.push_back({ item.action, item.lower, item.upper, item.certified });
+            if (first || ExactCompare(item.lower, decision.score.lower) > 0
+                || (ExactCompare(item.lower, decision.score.lower) == 0 && item.action < decision.score.action)) {
+              decision.score = item; first = false;
+            }
+            if (ExactCompare(item.upper, maxUpper) > 0) maxUpper = item.upper;
+            allCertified = allCertified && item.certified;
+          }
+          MergeExactMetrics(decision.metrics, result.metrics);
+        }
+        decision.metrics.rootWorkers = 2;
+        if (!first) {
+          decision.score.upper = maxUpper;
+          decision.score.certified = allCertified && ExactCompare(decision.score.lower, decision.score.upper) == 0;
+        }
+      } else {
+        ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds,
+            opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount,
+            nullptr, data->exactEvaluator);
+        decision = planner.decide(data->state);
+      }
+      return ExactDecisionJson(data, decision);
     } catch (...) {
       data->jsonBuilder.clear(); data->jsonBuilder.appendStr("{\"error\":99}");
       return data->jsonBuilder.buf.c_str();

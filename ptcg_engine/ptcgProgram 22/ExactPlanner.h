@@ -621,6 +621,10 @@ private:
 	std::unordered_map<std::string, PartialBeliefRevealEntry, ExactStringHasher> partialBeliefReveals;
 	std::unordered_map<std::string, ExactScore, ExactStringHasher> beliefTransposition;
 	mutable std::unordered_map<std::string, long long, ExactStringHasher> evaluationCache;
+	// Fixed-deck turn-one Poké Pad quotient.  The key retains the complete public
+	// state and semantic search options, but omits identities in the already
+	// shuffled remainder of the deck.  See revealAndReplayOwnDeckStreaming.
+	std::unordered_map<std::string, ExactScore, ExactStringHasher> fixedFirstTurnRevealScores;
 	size_t beliefTranspositionBytes = 0;
 	static constexpr size_t MaxPolicyEntries = 100'000;
 	static constexpr size_t MaxPolicyBytes = 64ULL * 1024ULL * 1024ULL;
@@ -633,6 +637,11 @@ private:
 	size_t policyBytes = 0;
 	int recursionDepth = 0;
 	bool canonicalMainEnabled = false;
+	// Full own-deck reveals produce singleton information sets.  Inside one of
+	// those worlds, retaining canonical TT/policy keys costs substantially more
+	// than the shallow first-turn subtree and cannot merge with another hidden
+	// allocation.  The outer exact reveal cursor remains resumable.
+	bool singletonRevealStreaming = false;
 	unsigned long long resourceCheckCounter = 0;
 	unsigned long long nodeQuantumDeadline = std::numeric_limits<unsigned long long>::max();
 
@@ -779,7 +788,7 @@ private:
 	}
 
 	std::string observationKeyFor(const State& state, int requestedObserver = -1,
-		const ExactKnowledgeState* knowledge = nullptr) const {
+		const ExactKnowledgeState* knowledge = nullptr, bool includeKnownDeck = true) const {
 		const int observer = requestedObserver >= 0 ? requestedObserver : state.selectPlayer;
 		std::string key;
 		appendSemantic(key, state.turn); appendSemantic(key, state.turnActionCount);
@@ -799,8 +808,8 @@ private:
 			appendCardList(key, state, ps.prize, false, true, true);
 			appendCardList(key, state, ps.hand, false, true, player != observer);
 			appendSemantic(key, ps.deck.size());
-			if ((state.selectDeck && state.selectPlayer == observer && player == observer)
-				|| (knowledge != nullptr && knowledge->deckKnown[player]))
+			if (includeKnownDeck && ((state.selectDeck && state.selectPlayer == observer && player == observer)
+				|| (knowledge != nullptr && knowledge->deckKnown[player])))
 				appendCardList(key, state, ps.deck, false, true, false);
 			appendSemantic(key, ps.poisonDamageCounter); appendSemantic(key, (int)ps.badStatus);
 			appendSemantic(key, ps.burned ? 1 : 0);
@@ -1599,6 +1608,16 @@ private:
 		const std::vector<int>& action) {
 		if (request.pendingEffectCardId == 1197 && pendingArea(request) == AreaType::Hand)
 			return solveProvisionalXerosicStreaming(parent, request, action);
+		// A player who searches their own complete deck can distinguish every
+		// (hand, prize) allocation represented below.  Different hand counts are
+		// visible in their hand; with equal hand counts, different prize counts
+		// imply a different observed deck multiset.  Consequently every allocation
+		// is a singleton information set and may be evaluated as an exact streaming
+		// chance outcome.  This avoids retaining tens of thousands of full State
+		// copies without introducing strategy fusion.
+		if (request.pendingPlayer == actor && parent.selectPlayer == actor
+			&& pendingArea(request) == AreaType::Deck)
+			return revealAndReplayOwnDeckStreaming(parent, request, action);
 		std::vector<BeliefWorld> worlds;
 		auto knowledge = initialKnowledge();
 		if (!expandRevealBelief(parent, request, action, ExactWeight(1), knowledge, worlds) || worlds.empty()) return unknown();
@@ -1606,8 +1625,11 @@ private:
 		return solveBelief(std::move(worlds));
 	}
 
-	[[maybe_unused]] ExactScore revealAndReplayLegacy(const State& parent, const std::vector<int>& action) {
-		int player = parent.exact.pendingPlayer >= 0 ? parent.exact.pendingPlayer : actor;
+	ExactScore revealAndReplayOwnDeckStreaming(const State& parent, const ExactHiddenState& request,
+		const std::vector<int>& action) {
+		int player = request.pendingPlayer;
+		if (player != actor || parent.selectPlayer != actor
+			|| pendingArea(request) != AreaType::Deck) return unknown();
 		if (!parent.exact.profileKnown[player]) return unknown();
 		int prizeSize = 0; for (CardRef ref : parent.players[player].prize) if (ref.isNull()) prizeSize++;
 		int handSize = 0; for (CardRef ref : parent.players[player].hand) if (ref.isNull()) handSize++;
@@ -1618,7 +1640,10 @@ private:
 			chooseCount(totalHidden - prizeSize, handSize));
 		noteWeight(totalWeight);
 		if (totalWeight.zero()) return unknown();
-		std::string revealKey = keyFor(parent) + "\x1fR\x1f" + actionEquivalenceKey(parent, action);
+		std::string revealKey = keyFor(parent) + "\x1fR4\x1f" + actionEquivalenceKey(parent, action);
+		appendSemantic(revealKey, request.pendingDetail);
+		appendSemantic(revealKey, request.pendingEffectCardId);
+		appendSemantic(revealKey, request.pendingEffectPlayer);
 		PartialRevealEntry* partial = partialRevealFor(revealKey, parent.exact.typeCount[player]);
 		if (partial == nullptr) return unknown();
 		if (!partial->initialized) {
@@ -1681,7 +1706,35 @@ private:
 				materializeUnknownZones(*world, player, partial->prizeCounts, partial->handCounts);
 				if (!advance(*world, action)) return unknown();
 			} catch (...) { return unknown(); }
-			ExactScore score = solveOwned(std::move(world));
+			ExactScore score;
+			const bool fixedTurnOnePokePad = parent.turn == 1
+				&& request.pendingEffectCardId == 1152 && isMajkelFixedProfile(actorProfileCount);
+			std::string quotientKey;
+			if (fixedTurnOnePokePad) {
+				// In this fixed deck Poké Pad can fetch Dunsparce, Shaymin, or Abra.
+				// None has a turn-one deck-reading Ability.  Once the semantic target
+				// options are retained, the shuffled identities left in the deck cannot
+				// affect another transition before the turn leaf.  V3's hidden features
+				// are likewise derived from the public zones/profile, not that physical
+				// partition.  This is therefore an exact quotient for this audited turn,
+				// rather than a probability or evaluator approximation.
+				quotientKey = observationKeyFor(*world, actor, nullptr, false);
+				auto cached = fixedFirstTurnRevealScores.find(quotientKey);
+				if (cached != fixedFirstTurnRevealScores.end()) {
+					score = cached->second;
+					metrics.successorMerges++; metrics.merged++;
+				}
+			}
+			if (!score.certified) {
+				struct StreamingGuard {
+					bool& flag; bool previous;
+					StreamingGuard(bool& value) : flag(value), previous(value) { flag = true; }
+					~StreamingGuard() { flag = previous; }
+				} streaming(singletonRevealStreaming);
+				score = solveOwned(std::move(world));
+				if (fixedTurnOnePokePad && score.certified)
+					fixedFirstTurnRevealScores.emplace(std::move(quotientKey), score);
+			}
 			if (!score.certified) return incomplete(&score, partial->pendingWeight);
 			partial->completedLower = ExactFraction::add(partial->completedLower,
 				score.lower.scaled(partial->pendingWeight, totalWeight));
@@ -2044,7 +2097,7 @@ private:
 	ExactScore chance(const State& state, const std::string& nodeKey) {
 		auto types = chanceCardTypes(state);
 		if (types.empty()) return unknown();
-		PartialChanceEntry* partial = partialChanceFor(nodeKey);
+		PartialChanceEntry* partial = singletonRevealStreaming ? nullptr : partialChanceFor(nodeKey);
 		ExactWeight total; for (const auto& item : types) total += item.second;
 		noteWeight(total);
 		ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
@@ -2123,7 +2176,7 @@ private:
 		bool allCertified = true;
 		std::unordered_set<std::string> equivalentActions;
 		std::unordered_map<std::string, std::pair<ExactScore, unsigned long long>, ExactStringHasher> successorScores;
-		PartialDecisionEntry* partial = partialDecisionFor(nodeKey);
+		PartialDecisionEntry* partial = singletonRevealStreaming ? nullptr : partialDecisionFor(nodeKey);
 		size_t actionOrdinal = 0;
 		bool completed = forEachLegalAction(state, [&](const std::vector<int>& action) {
 			metrics.rawOutcomes++;
@@ -2151,7 +2204,7 @@ private:
 			auto child = std::make_unique<State>(state);
 			if (!advance(*child, action)) return true;
 			ExactScore score;
-			if (canonicalMainEnabled && child->selectType == SelectType::Main
+			if (!singletonRevealStreaming && canonicalMainEnabled && child->selectType == SelectType::Main
 				&& child->exact.pending == ExactPendingType::None) {
 				std::string successorKey = keyFor(*child);
 				auto successor = successorScores.find(successorKey);
@@ -2203,12 +2256,12 @@ private:
 			else result.lower = ExactFraction::integer(-100'000'000);
 			result.certified = false;
 			metrics.partialDecisionNodes++;
-			rememberPolicy(state, result, metrics.expanded - expandedBefore);
+			if (!singletonRevealStreaming) rememberPolicy(state, result, metrics.expanded - expandedBefore);
 			return result;
 		}
 		if (maximize) result.upper = aggregate; else result.lower = aggregate;
 		result.certified = allCertified && ExactCompare(result.lower, result.upper) == 0;
-		rememberPolicy(state, result, metrics.expanded - expandedBefore);
+		if (!singletonRevealStreaming) rememberPolicy(state, result, metrics.expanded - expandedBefore);
 		return result;
 	}
 
@@ -2249,12 +2302,13 @@ private:
 			auto value = ExactFraction::integer(evaluate(state));
 			return { value, value, {}, !state.exact.provisionalOpponentPolicy };
 		}
-		std::string key = keyFor(state);
-		const bool shareable = usingSharedTable;
+		std::string key;
+		if (!singletonRevealStreaming) key = keyFor(state);
+		const bool shareable = usingSharedTable && !singletonRevealStreaming;
 		ExactScore cached;
 		bool cacheHit = false;
 		if (shareable) cacheHit = transposition->find(key, cached);
-		else {
+		else if (!singletonRevealStreaming) {
 			auto found = localTransposition.find(key);
 			if (found != localTransposition.end()) { cached = found->second; cacheHit = true; }
 		}
@@ -2285,7 +2339,7 @@ private:
 		} else {
 			result = decision(state, state.selectPlayer == actor, key);
 		}
-		if (result.certified) {
+		if (result.certified && !singletonRevealStreaming) {
 			auto partialDecision = partialDecisions.find(key);
 			if (partialDecision != partialDecisions.end()) {
 				partialBytes -= std::min(partialBytes, partialDecision->second.accountedBytes);
