@@ -95,6 +95,59 @@ evaluated directly and are not inserted into the TT because they are cheap and
 almost always unique. RSS is sampled in native enumeration loops; 2.7 GiB
 stops further search safely and returns the current proven interval.
 
+## Replay-trained CPU evaluator
+
+V2 is a deck-independent sparse NNUE with 40 dense inputs, 30 collision-free
+card/relationship planes, and 32 int32 accumulators. The model contains an
+explicit sorted vocabulary for every registered card and attack ID; only a
+future unknown ID maps to `UNK`. Card identities are separated by owner and
+zone. Attachments are separated by Active/Bench target, attacks include their
+exact native energy shortage, and Pokémon HP/persistent restrictions are linked
+to the Pokémon card ID. Own hidden deck/prize expectations are converted from
+exact belief mass to Q8 only at the evaluator boundary. Opponent materialized
+hand, deck, and prize identities never enter the feature stream.
+
+Weights are int16, hidden biases/accumulators are int32, and the output path is
+int64 with clipped ReLU. Evaluation has no floating-point operation or per-leaf
+heap allocation. Terminal wins and losses bypass the model and remain fixed at
+`+/-100,000,000`; nonterminal output is clamped to `+/-90,000,000`. The C++
+extractor is also the only feature extractor used for training data.
+
+`ExactReplayTraceBegin` makes the normal engine pause after turn-end effects and
+Pokémon Checkup but before the next `TurnStart`. `BattleStartOrdered` loads the
+post-shuffle deck order recorded by Kaggle, because its environment seed does
+not reproduce the engine's use of device randomness. The extractor replays the
+complete action stream and rejects the entire match on a version mismatch,
+illegal action, random divergence, truncation, or nonterminal ending. It never
+keeps a valid prefix from a rejected match. Samples are actor-relative turn
+leaves with final reward `{-1,0,1}` and per-match total loss weight one.
+
+Train a replacement model with:
+
+```powershell
+python tools/extract_turn_end_dataset.py data/kaggle_replays data/turn-leaves.jsonl
+python tools/train_turn_end_evaluator.py data/turn-leaves.jsonl exact-evaluator-v2.bin `
+  --manifest data/turn-leaves.jsonl.manifest.json --epochs 30 --qat-epochs 8
+```
+
+Replays are split as complete matches by `(date, replayId)`: oldest 80% train,
+next 10% validation, latest 10% test. The adoption report checks the zero
+baseline, sign accuracy, quantization degradation, native/reference bit
+identity, and an optional paired replay-level bootstrap against V1 predictions.
+`--require-gates` refuses to publish a model unless every supplied gate passes.
+
+V1 loading remains available for old deck branches, but it is reported as
+`informationSetSafe=false` and can never produce `certified=true`. For V2,
+certification means only that the exact expectation of the fixed quantized
+evaluator was computed over all chance outcomes and legal information-set
+policies; it is exposed as
+`certificationScope="exact_evaluator_expectation"` and does not claim the learned
+evaluator is a perfect estimate of eventual match outcome.
+
+`ExactLoadEvaluatorModel` and `ExactUnloadEvaluatorModel` expose explicit model
+lifetime control. Active turn sessions retain an immutable shared model after it
+is detached from future searches.
+
 Windows x64 `cg.dll` and Linux x86-64 `libcg.so` include `ExactDecide`. The
 Python wrapper feature-detects the symbol so the unchanged ARM64 library uses a
 legal deterministic fallback.

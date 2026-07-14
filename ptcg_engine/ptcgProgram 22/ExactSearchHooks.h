@@ -6,12 +6,11 @@
 // Leaf is after end-of-turn effects and Pokémon Checkup, but before the next
 // player's TurnStart/draw.  This predicate does not mutate State.
 inline bool IsExactTurnLeaf(const State& state) {
-	if (state.phase != GamePhase::PokemonCheckupEnd || state.functionStack.empty()) {
-		return false;
-	}
-	auto it = FunctionIndexTable.find((long long)(void*)TurnStart);
-	return it != FunctionIndexTable.end()
-		&& state.functionStack.back().functionIndex == it->second;
+	// PokemonCheckupEnd is assigned only after all checkup/turn-end effects
+	// finish and is replaced at the start of TurnStart.  Depending on whether
+	// a caller pauses inside State::step, the just-completed stack frame may
+	// still be present, so the function-stack shape is not a stable boundary.
+	return state.phase == GamePhase::PokemonCheckupEnd;
 }
 
 // Returns whether physical prize indices are semantically exchangeable at the

@@ -36,6 +36,9 @@ lib.BattleStart.argtypes = [ctypes.POINTER(ctypes.c_int)]
 if hasattr(lib, "BattleStartSeeded"):
     lib.BattleStartSeeded.restype = StartData
     lib.BattleStartSeeded.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint]
+if hasattr(lib, "BattleStartOrdered"):
+    lib.BattleStartOrdered.restype = StartData
+    lib.BattleStartOrdered.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint]
 
 lib.AgentStart.restype = ctypes.c_void_p
 
@@ -106,6 +109,28 @@ if hasattr(lib, "ExactTurnAdvance"):
 if hasattr(lib, "ExactTurnProgress"):
     lib.ExactTurnProgress.restype = ctypes.c_char_p
     lib.ExactTurnProgress.argtypes = [ctypes.c_void_p, ctypes.c_int64]
+
+if hasattr(lib, "ExactLoadEvaluatorModel"):
+    lib.ExactLoadEvaluatorModel.restype = ctypes.c_char_p
+    lib.ExactLoadEvaluatorModel.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+if hasattr(lib, "ExactUnloadEvaluatorModel"):
+    lib.ExactUnloadEvaluatorModel.argtypes = [ctypes.c_void_p]
+if hasattr(lib, "ExactArithmeticDiagnostics"):
+    lib.ExactArithmeticDiagnostics.restype = ctypes.c_char_p
+if hasattr(lib, "ExactEvaluateFeaturesV2"):
+    lib.ExactEvaluateFeaturesV2.restype = ctypes.c_int64
+    lib.ExactEvaluateFeaturesV2.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_int16), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
+
+if hasattr(lib, "ExactReplayTraceBegin"):
+    lib.ExactReplayTraceBegin.restype = ctypes.c_int
+    lib.ExactReplayTraceBegin.argtypes = [ctypes.c_void_p]
+if hasattr(lib, "ExactReplayTraceDrain"):
+    lib.ExactReplayTraceDrain.restype = ctypes.c_char_p
+    lib.ExactReplayTraceDrain.argtypes = [ctypes.c_void_p]
+if hasattr(lib, "ExactReplayTraceEnd"):
+    lib.ExactReplayTraceEnd.argtypes = [ctypes.c_void_p]
 
 if hasattr(lib, "ExactTurnRelease"):
     lib.ExactTurnRelease.argtypes = [ctypes.c_void_p, ctypes.c_int64]

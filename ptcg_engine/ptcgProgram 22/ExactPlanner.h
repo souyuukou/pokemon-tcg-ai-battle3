@@ -2,6 +2,8 @@
 
 #include "ExactSearchHooks.h"
 #include "ExactCanonicalState.h"
+#include "ExactCpuEvaluator.h"
+#include "ExactBigRational.h"
 
 #include <chrono>
 #include <numeric>
@@ -36,10 +38,12 @@ struct ExactFraction {
 	long long numerator = 0;
 	unsigned long long denominator = 1;
 	bool valid = true;
+	std::shared_ptr<const ExactBigRational> big;
 
 	static ExactFraction integer(long long value) { return { value, 1, true }; }
 
 	void normalize() {
+		if (big) return;
 		if (!valid || denominator == 0) { valid = false; return; }
 		unsigned long long magnitude = numerator < 0 ? (unsigned long long)(-(numerator + 1)) + 1 : (unsigned long long)numerator;
 		auto g = std::gcd(magnitude, denominator);
@@ -63,31 +67,70 @@ struct ExactFraction {
 
 	ExactFraction scaled(unsigned long long weight, unsigned long long total) const {
 		if (!valid || total == 0) return { 0, 1, false };
+		unsigned long long originalWeight = weight, originalTotal = total;
+		if (big) {
+			auto value = std::make_shared<ExactBigRational>(*big); value->scale(weight, total);
+			ExactFraction out; out.big = std::move(value); return out;
+		}
 		ExactFraction result = *this;
 		auto g1 = std::gcd(weight, total); weight /= g1; total /= g1;
 		unsigned long long magnitude = result.numerator < 0 ? (unsigned long long)(-(result.numerator + 1)) + 1 : (unsigned long long)result.numerator;
 		auto g2 = std::gcd(magnitude, total); result.numerator /= (long long)g2; total /= g2;
 		auto g3 = std::gcd(result.denominator, weight); result.denominator /= g3; weight /= g3;
 		long long n; unsigned long long d;
-		if (!checkedMul(result.numerator, weight, n) || !checkedMulU(result.denominator, total, d)) return { 0, 1, false };
+		if (!checkedMul(result.numerator, weight, n) || !checkedMulU(result.denominator, total, d)) {
+			auto value = std::make_shared<ExactBigRational>(numerator, denominator); value->scale(originalWeight, originalTotal);
+			ExactFraction out; out.big = std::move(value); return out;
+		}
 		result.numerator = n; result.denominator = d; result.normalize(); return result;
+	}
+
+	ExactFraction scaled(const ExactWeight& weight, const ExactWeight& total) const {
+		if (!valid || total.zero()) return { 0, 1, false };
+		if (weight.fitsUnsignedLongLong() && total.fitsUnsignedLongLong())
+			return scaled(weight.unsignedLongLong(), total.unsignedLongLong());
+		ExactBigRational value = big ? *big : ExactBigRational(numerator, denominator);
+		value.scale(weight, total);
+		ExactFraction out; out.big = std::make_shared<ExactBigRational>(std::move(value)); return out;
 	}
 
 	static ExactFraction add(const ExactFraction& a, const ExactFraction& b) {
 		if (!a.valid || !b.valid) return { 0, 1, false };
+		if (a.big || b.big) {
+			ExactBigRational av = a.big ? *a.big : ExactBigRational(a.numerator, a.denominator);
+			ExactBigRational bv = b.big ? *b.big : ExactBigRational(b.numerator, b.denominator);
+			ExactFraction out; out.big = std::make_shared<ExactBigRational>(ExactBigRational::add(av, bv)); return out;
+		}
 		auto g = std::gcd(a.denominator, b.denominator);
 		unsigned long long am = b.denominator / g, bm = a.denominator / g;
 		long long an, bn;
 		unsigned long long d;
-		if (!checkedMul(a.numerator, am, an) || !checkedMul(b.numerator, bm, bn)) return { 0, 1, false };
+		if (!checkedMul(a.numerator, am, an) || !checkedMul(b.numerator, bm, bn)) {
+			ExactFraction out; out.big = std::make_shared<ExactBigRational>(ExactBigRational::add(
+				ExactBigRational(a.numerator, a.denominator), ExactBigRational(b.numerator, b.denominator))); return out;
+		}
 		if ((bn > 0 && an > std::numeric_limits<long long>::max() - bn)
-			|| (bn < 0 && an < std::numeric_limits<long long>::min() - bn)) return { 0, 1, false };
-		if (!checkedMulU(a.denominator, am, d)) return { 0, 1, false };
+			|| (bn < 0 && an < std::numeric_limits<long long>::min() - bn)) {
+			ExactFraction out; out.big = std::make_shared<ExactBigRational>(ExactBigRational::add(
+				ExactBigRational(a.numerator, a.denominator), ExactBigRational(b.numerator, b.denominator))); return out;
+		}
+		if (!checkedMulU(a.denominator, am, d)) {
+			ExactFraction out; out.big = std::make_shared<ExactBigRational>(ExactBigRational::add(
+				ExactBigRational(a.numerator, a.denominator), ExactBigRational(b.numerator, b.denominator))); return out;
+		}
 		ExactFraction result{ an + bn, d, true }; result.normalize(); return result;
 	}
+
+	std::string numeratorText() const { return big ? big->numerator.text() : std::to_string(numerator); }
+	std::string denominatorText() const { return big ? big->denominatorText() : std::to_string(denominator); }
 };
 
 inline int ExactCompare(const ExactFraction& a, const ExactFraction& b) {
+	if (a.big || b.big) {
+		ExactBigRational av = a.big ? *a.big : ExactBigRational(a.numerator, a.denominator);
+		ExactBigRational bv = b.big ? *b.big : ExactBigRational(b.numerator, b.denominator);
+		return ExactBigRational::compare(av, bv);
+	}
 	if (a.numerator < 0 && b.numerator >= 0) return -1;
 	if (a.numerator >= 0 && b.numerator < 0) return 1;
 	auto magnitude = [](long long n) { return n < 0 ? (unsigned long long)(-(n + 1)) + 1 : (unsigned long long)n; };
@@ -261,9 +304,21 @@ struct ExactMetrics {
 	bool memoryLimitReached = false;
 	unsigned long long partialDecisionHits = 0;
 	unsigned long long partialChanceHits = 0;
+	unsigned long long partialRevealHits = 0;
+	unsigned long long enumeratedHiddenWorlds = 0;
 	unsigned long long partialTableBytes = 0;
 	unsigned long long rootRetryKeyMatches = 0;
 	unsigned long long rootRetryKeyMismatches = 0;
+	unsigned long long smallWeightOps = 0;
+	unsigned long long bigWeightPromotions = 0;
+	unsigned maxWeightBits = 0;
+	unsigned long long chanceMassMismatches = 0;
+	unsigned long long beliefNodes = 0;
+	unsigned long long informationSets = 0;
+	unsigned long long strategyFusionPrevented = 0;
+	unsigned long long illegalInformationSetSplits = 0;
+	bool probabilityExact = true;
+	bool informationSetSafe = true;
 };
 
 struct ExactDecision {
@@ -276,10 +331,11 @@ class ExactPlanner {
 public:
 	ExactPlanner(const int* deck, const int* handValues, int deckCount, int budgetMilliseconds,
 		const int* opponentDeck = nullptr, int opponentDeckCount = 0,
-		std::shared_ptr<ExactSharedTransposition> sharedTable = nullptr)
+		std::shared_ptr<ExactSharedTransposition> sharedTable = nullptr,
+		std::shared_ptr<const ExactCpuEvaluator> cpuEvaluator = nullptr)
 		: deadline(std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(1, budgetMilliseconds))),
 		transposition(sharedTable ? sharedTable : std::make_shared<ExactSharedTransposition>()),
-		usingSharedTable(sharedTable != nullptr) {
+		usingSharedTable(sharedTable != nullptr), evaluator(std::move(cpuEvaluator)) {
 		for (int i = 0; i < deckCount; ++i) {
 			actorProfileCount[deck[i]]++;
 			handValue[deck[i]] = handValues == nullptr ? 100 : handValues[i];
@@ -302,9 +358,10 @@ public:
 		root.exact.enabled = true;
 		root.exact.actor = (signed char)actor;
 		ExactDecision result;
-		result.score = solve(root);
-		result.metrics = metrics;
+		result.score = solveOwned(std::make_unique<State>(std::move(root)));
 		result.rootActions = rootActionValues;
+		applyEvaluatorSafety(result);
+		result.metrics = metrics;
 		return result;
 	}
 
@@ -332,9 +389,10 @@ public:
 			else if (prior->second == retryKey) metrics.rootRetryKeyMatches++;
 			else metrics.rootRetryKeyMismatches++;
 			result.score = child.exact.pending == ExactPendingType::RevealDeck
-				? revealAndReplay(root, { optionIndex }) : solve(child);
+				? revealAndReplay(root, { optionIndex }) : solveOwned(std::make_unique<State>(std::move(child)));
 			result.score.action = { optionIndex };
 		}
+		applyEvaluatorSafety(result);
 		result.metrics = metrics;
 		result.rootActions.push_back({ { optionIndex }, result.score.lower, result.score.upper, result.score.certified });
 		return result;
@@ -393,6 +451,21 @@ public:
 	bool resourceStopped() const { return metrics.memoryLimitReached; }
 
 private:
+	struct ExactKnowledgeState {
+		// deckKnown[target] means this observer has seen the complete current
+		// multiset of target's deck.  It is deliberately separate from the deck
+		// profile supplied to closed-world validation.
+		std::array<bool, 2> deckKnown{};
+		std::string publicFacts;
+	};
+	struct BeliefWorld {
+		std::unique_ptr<State> state;
+		ExactWeight weight;
+		std::array<ExactKnowledgeState, 2> knowledge;
+	};
+	static void appendKnowledgeFact(ExactKnowledgeState& knowledge, char type, int cardId) {
+		knowledge.publicFacts.push_back(type); appendSemantic(knowledge.publicFacts, cardId);
+	}
 	struct ExactPolicyEntry {
 		ExactScore score;
 		std::vector<std::string> actionTokens;
@@ -407,9 +480,62 @@ private:
 		std::unordered_map<int, ExactScore> completedOutcomes;
 		size_t accountedBytes = 0;
 	};
+	struct BoundedCompositionCursor {
+		std::vector<int> bounds, values, nextTake, left;
+		int depth = 0;
+		bool initialized = false, complete = false;
+
+		void reset(const std::vector<int>& newBounds, int total) {
+			bounds = newBounds; values.assign(bounds.size(), 0);
+			nextTake.assign(bounds.size(), 0); left.assign(bounds.size() + 1, 0);
+			left[0] = total; depth = 0; initialized = true; complete = false;
+		}
+
+		bool next(std::vector<int>& output) {
+			if (!initialized || complete) return false;
+			const int count = (int)bounds.size();
+			while (true) {
+				if (depth == count) {
+					bool valid = left[depth] == 0;
+					if (valid) output = values;
+					if (depth == 0) complete = true; else --depth;
+					if (valid) return true;
+					continue;
+				}
+				int maximum = std::min(bounds[depth], left[depth]);
+				if (nextTake[depth] <= maximum) {
+					int take = nextTake[depth]++;
+					values[depth] = take; left[depth + 1] = left[depth] - take;
+					++depth;
+					if (depth < count) nextTake[depth] = 0;
+					continue;
+				}
+				if (depth == 0) { complete = true; return false; }
+				--depth;
+			}
+		}
+	};
+	struct PartialRevealEntry {
+		BoundedCompositionCursor prizeCursor, handCursor;
+		std::vector<int> prizeCounts, handCounts;
+		ExactFraction completedLower = ExactFraction::integer(0);
+		ExactFraction completedUpper = ExactFraction::integer(0);
+		ExactWeight totalWeight, processedWeight, pendingWeight;
+		bool initialized = false, handActive = false, pendingWorld = false;
+		size_t accountedBytes = 0;
+	};
+	struct PartialBeliefRevealEntry {
+		BoundedCompositionCursor prizeCursor, handCursor;
+		std::vector<int> bounds, handBounds, prizeCounts, handCounts;
+		std::vector<BeliefWorld> worlds;
+		ExactWeight expected, generated;
+		bool initialized = false, handActive = false, completed = false;
+		size_t accountedBytes = 0;
+	};
 	std::unordered_map<int, int> actorProfileCount;
 	std::unordered_map<int, int> opponentProfileCount;
 	std::unordered_map<int, int> handValue;
+	std::shared_ptr<const ExactCpuEvaluator> evaluator;
 	std::chrono::steady_clock::time_point deadline;
 	ExactMetrics metrics;
 	int actor = 0;
@@ -423,6 +549,11 @@ private:
 	std::unordered_map<std::string, std::vector<ExactPolicyEntry>, ExactStringHasher> policy;
 	std::unordered_map<std::string, PartialDecisionEntry, ExactStringHasher> partialDecisions;
 	std::unordered_map<std::string, PartialChanceEntry, ExactStringHasher> partialChances;
+	std::unordered_map<std::string, PartialRevealEntry, ExactStringHasher> partialReveals;
+	std::unordered_map<std::string, PartialBeliefRevealEntry, ExactStringHasher> partialBeliefReveals;
+	std::unordered_map<std::string, ExactScore, ExactStringHasher> beliefTransposition;
+	mutable std::unordered_map<std::string, long long, ExactStringHasher> evaluationCache;
+	size_t beliefTranspositionBytes = 0;
 	static constexpr size_t MaxPolicyEntries = 100'000;
 	static constexpr size_t MaxPolicyBytes = 64ULL * 1024ULL * 1024ULL;
 	static constexpr size_t MaxLocalTranspositionEntries = 250'000;
@@ -462,7 +593,7 @@ private:
 	PartialDecisionEntry* partialDecisionFor(const std::string& key) {
 		auto found = partialDecisions.find(key);
 		if (found != partialDecisions.end()) { metrics.partialDecisionHits++; return &found->second; }
-		if (partialDecisions.size() + partialChances.size() >= MaxPartialEntries
+		if (partialDecisions.size() + partialChances.size() + partialReveals.size() >= MaxPartialEntries
 			|| partialBytes + key.size() + 128 > MaxPartialBytes) return nullptr;
 		size_t bytes = key.size() + 128;
 		partialBytes += bytes;
@@ -474,11 +605,23 @@ private:
 	PartialChanceEntry* partialChanceFor(const std::string& key) {
 		auto found = partialChances.find(key);
 		if (found != partialChances.end()) { metrics.partialChanceHits++; return &found->second; }
-		if (partialDecisions.size() + partialChances.size() >= MaxPartialEntries
+		if (partialDecisions.size() + partialChances.size() + partialReveals.size() >= MaxPartialEntries
 			|| partialBytes + key.size() + 96 > MaxPartialBytes) return nullptr;
 		size_t bytes = key.size() + 96;
 		partialBytes += bytes;
 		auto [inserted, _] = partialChances.emplace(key, PartialChanceEntry{});
+		inserted->second.accountedBytes = bytes;
+		return &inserted->second;
+	}
+
+	PartialRevealEntry* partialRevealFor(const std::string& key, int typeCount) {
+		auto found = partialReveals.find(key);
+		if (found != partialReveals.end()) { metrics.partialRevealHits++; return &found->second; }
+		size_t bytes = key.size() + 256 + (size_t)typeCount * sizeof(int) * 10;
+		if (partialDecisions.size() + partialChances.size() + partialReveals.size() >= MaxPartialEntries
+			|| partialBytes + bytes > MaxPartialBytes) return nullptr;
+		partialBytes += bytes;
+		auto [inserted, _] = partialReveals.emplace(key, PartialRevealEntry{});
 		inserted->second.accountedBytes = bytes;
 		return &inserted->second;
 	}
@@ -567,8 +710,9 @@ private:
 		return token;
 	}
 
-	std::string observationKeyFor(const State& state) const {
-		const int observer = state.selectPlayer;
+	std::string observationKeyFor(const State& state, int requestedObserver = -1,
+		const ExactKnowledgeState* knowledge = nullptr) const {
+		const int observer = requestedObserver >= 0 ? requestedObserver : state.selectPlayer;
 		std::string key;
 		appendSemantic(key, state.turn); appendSemantic(key, state.turnActionCount);
 		appendSemantic(key, (int)state.phase); appendSemantic(key, (int)state.gameResult);
@@ -587,7 +731,8 @@ private:
 			appendCardList(key, state, ps.prize, false, true, true);
 			appendCardList(key, state, ps.hand, false, true, player != observer);
 			appendSemantic(key, ps.deck.size());
-			if (state.selectDeck && player == observer)
+			if ((state.selectDeck && state.selectPlayer == observer && player == observer)
+				|| (knowledge != nullptr && knowledge->deckKnown[player]))
 				appendCardList(key, state, ps.deck, false, true, false);
 			appendSemantic(key, ps.poisonDamageCounter); appendSemantic(key, (int)ps.badStatus);
 			appendSemantic(key, ps.burned ? 1 : 0);
@@ -598,6 +743,9 @@ private:
 		for (const std::string& option : options) { appendSemantic(key, (long long)option.size()); key += option; }
 		if (!state.contextCard.isNull()) { key += "C"; key += cardToken(state, state.contextCard, false); }
 		if (state.onEffect()) { key += "E"; key += cardToken(state, state.getEffectCard().card, false); }
+		if (knowledge != nullptr) {
+			key += "K"; appendSemantic(key, (long long)knowledge->publicFacts.size()); key += knowledge->publicFacts;
+		}
 		return key;
 	}
 
@@ -636,7 +784,8 @@ private:
 				&& ExactCompare(existing.score.upper, entry.score.upper) == 0) return;
 		}
 		policyBytes += bytes; bucket.push_back(std::move(entry));
-		metrics.policyNodes++; metrics.sessionBytes = transposition->bytes() + localTranspositionBytes + policyBytes + partialBytes;
+		metrics.policyNodes++; metrics.sessionBytes = transposition->bytes() + localTranspositionBytes
+			+ policyBytes + partialBytes + beliefTranspositionBytes + evaluationCache.size() * 128ULL;
 	}
 
 	void initializeHidden(State& state) {
@@ -671,6 +820,7 @@ private:
 			int winner = state.winPlayer();
 			return winner == actor ? 100'000'000 : (winner == 2 ? 0 : -100'000'000);
 		}
+		if (evaluator && evaluator->isLoaded()) return evaluator->evaluate(state, actor, &actorProfileCount);
 		int enemy = 1 - actor;
 		const PlayerState& me = state.players[actor];
 		const PlayerState& opp = state.players[enemy];
@@ -695,6 +845,49 @@ private:
 		return value;
 	}
 
+	static int beliefQ8(const ExactWeight& numerator, const ExactWeight& denominator) {
+		ExactWeight scaled = ExactWeight::multiply(numerator, ExactWeight(ExactSparseEvaluatorV2::BeliefScale));
+		auto division = ExactWeight::divideRemainder(scaled, denominator);
+		ExactWeight twiceRemainder = ExactWeight::multiply(division.second, ExactWeight(2));
+		if (twiceRemainder >= denominator) division.first += ExactWeight(1);
+		if (!division.first.fitsUnsignedLongLong()) throw std::overflow_error("belief Q8 overflow");
+		return (int)division.first.unsignedLongLong();
+	}
+
+	long long evaluateBeliefInformationState(const std::vector<BeliefWorld>& worlds,
+		const ExactWeight& total) const {
+		if (worlds.empty() || total.zero()) throw std::runtime_error("empty leaf belief");
+		const State& representative = *worlds.front().state;
+		if (representative.isFinish()) return evaluate(representative);
+		std::unordered_map<int, ExactWeight> deckMass, prizeMass;
+		for (const BeliefWorld& world : worlds) {
+			std::unordered_map<int, int> deckCount, prizeCount;
+			for (CardRef ref : world.state->players[actor].deck) if (!ref.isNull())
+				deckCount[world.state->getCard(ref).cardId]++;
+			for (CardRef ref : world.state->players[actor].prize) if (!ref.isNull())
+				prizeCount[world.state->getCard(ref).cardId]++;
+			for (const auto& item : deckCount) deckMass[item.first] +=
+				ExactWeight::multiply(world.weight, ExactWeight(item.second));
+			for (const auto& item : prizeCount) prizeMass[item.first] +=
+				ExactWeight::multiply(world.weight, ExactWeight(item.second));
+		}
+		std::unordered_map<int, int> deckQ8, prizeQ8;
+		for (const auto& item : deckMass) deckQ8[item.first] = beliefQ8(item.second, total);
+		for (const auto& item : prizeMass) prizeQ8[item.first] = beliefQ8(item.second, total);
+		ExactSparseEvaluatorV2::BeliefInput belief{ &deckQ8, &prizeQ8 };
+		if (evaluator && evaluator->isLoaded())
+			return evaluator->evaluate(representative, actor, &actorProfileCount, &belief);
+		return evaluate(representative);
+	}
+
+	void applyEvaluatorSafety(ExactDecision& decision) {
+		if (evaluator && evaluator->isLoaded() && !evaluator->informationSetSafe()) {
+			metrics.informationSetSafe = false;
+			decision.score.certified = false;
+			for (ExactRootActionValue& action : decision.rootActions) action.certified = false;
+		}
+	}
+
 	ExactScore unknown() const { return {}; }
 
 	template<class Callback>
@@ -708,17 +901,32 @@ private:
 			}
 			if (endIndex >= 0 && !callback(std::vector<int>{ endIndex })) return false;
 		}
+		struct OptionGroup { std::string key; std::vector<int> index; };
+		std::vector<OptionGroup> groups;
+		std::unordered_map<std::string, size_t, ExactStringHasher> groupByKey;
+		for (int i = 0; i < (int)state.options.size(); ++i) {
+			std::string key = actionEquivalenceKey(state, { i });
+			auto [found, inserted] = groupByKey.emplace(key, groups.size());
+			if (inserted) groups.push_back({ std::move(key), {} });
+			groups[found->second].index.push_back(i);
+		}
 		std::vector<int> current;
-		std::function<bool(int, int)> choose = [&](int start, int left) {
+		std::function<bool(int, int)> choose = [&](int group, int left) {
 			if (expired()) return false;
 			if (left == 0) {
-				if (current.size() == 1 && current[0] == endIndex) return true;
-				return callback(current);
+				std::vector<int> action = current; std::sort(action.begin(), action.end());
+				if (action.size() == 1 && action[0] == endIndex) return true;
+				return callback(action);
 			}
-			for (int i = start; i <= (int)state.options.size() - left; ++i) {
-				current.push_back(i);
-				if (!choose(i + 1, left - 1)) return false;
-				current.pop_back();
+			if (group >= (int)groups.size()) return true;
+			int remainingCapacity = 0;
+			for (int i = group; i < (int)groups.size(); ++i) remainingCapacity += (int)groups[i].index.size();
+			if (remainingCapacity < left) return true;
+			int maximum = std::min(left, (int)groups[group].index.size());
+			for (int take = 0; take <= maximum; ++take) {
+				for (int i = 0; i < take; ++i) current.push_back(groups[group].index[i]);
+				if (!choose(group + 1, left - take)) return false;
+				for (int i = 0; i < take; ++i) current.pop_back();
 			}
 			return true;
 		};
@@ -777,10 +985,13 @@ private:
 			std::string token;
 			if (option.type == SelectOptionType::Card) {
 				CardPosition pos = option.getCardPosition();
-				if (pos.area == AreaType::Deck && state.exact.deckExchangeable[pos.playerIndex]) {
+				bool exchangeable = (pos.area == AreaType::Deck && state.exact.deckExchangeable[pos.playerIndex])
+					|| (pos.area == AreaType::Prize && state.exact.prizeExchangeable[pos.playerIndex]);
+				if (exchangeable) {
 					CardRef ref = state.getCardRef(pos);
 					int id = ref.isNull() ? 0 : state.getCard(ref).cardId;
-					token = "D:" + std::to_string(pos.playerIndex) + ":" + std::to_string(id);
+					token = (pos.area == AreaType::Deck ? "D:" : "P:")
+						+ std::to_string(pos.playerIndex) + ":" + std::to_string(id);
 				}
 			}
 			if (token.empty()) {
@@ -804,12 +1015,26 @@ private:
 		throw std::runtime_error("unknown hidden card type");
 	}
 
-	static unsigned long long chooseCount(int n, int k) {
-		if (k < 0 || k > n) return 0;
-		k = std::min(k, n - k);
-		unsigned long long value = 1;
-		for (int i = 1; i <= k; ++i) value = value * (unsigned long long)(n - k + i) / (unsigned long long)i;
-		return value;
+	static ExactWeight chooseCount(int n, int k) {
+		if (n < 0 || n > DECK_SIZE || k < 0 || k > n) return ExactWeight();
+		static const auto table = [] {
+			std::array<std::array<unsigned long long, DECK_SIZE + 1>, DECK_SIZE + 1> value{};
+			for (int row = 0; row <= DECK_SIZE; ++row) {
+				value[row][0] = value[row][row] = 1;
+				for (int column = 1; column < row; ++column)
+					value[row][column] = value[row - 1][column - 1] + value[row - 1][column];
+			}
+			return value;
+		}();
+		return ExactWeight(table[n][k]);
+	}
+
+	void noteWeight(const ExactWeight& value, bool operation = true) {
+		if (operation) {
+			if (value.isLarge()) metrics.bigWeightPromotions++;
+			else metrics.smallWeightOps++;
+		}
+		metrics.maxWeightBits = std::max(metrics.maxWeightBits, value.bitLength());
 	}
 
 	void materializeUnknownZones(State& state, int player, const std::vector<int>& prizeCounts,
@@ -842,67 +1067,447 @@ private:
 		state.exact.clearPending();
 	}
 
+	bool expandRevealBelief(const State& parent, const std::vector<int>& action,
+		const ExactWeight& baseWeight, const std::array<ExactKnowledgeState, 2>& baseKnowledge,
+		std::vector<BeliefWorld>& output) {
+		int player = parent.exact.pendingPlayer >= 0 ? parent.exact.pendingPlayer : actor;
+		if (!parent.exact.profileKnown[player]) return false;
+		int prizeSize = 0; for (CardRef ref : parent.players[player].prize) if (ref.isNull()) prizeSize++;
+		int handSize = 0; for (CardRef ref : parent.players[player].hand) if (ref.isNull()) handSize++;
+		int totalHidden = 0;
+		std::vector<int> bounds(parent.exact.typeCount[player]);
+		for (int i = 0; i < parent.exact.typeCount[player]; ++i) {
+			bounds[i] = parent.exact.cardCount[player][i]; totalHidden += bounds[i];
+		}
+		if (prizeSize < 0 || handSize < 0 || prizeSize + handSize > totalHidden) return false;
+		ExactWeight expected = ExactWeight::multiply(baseWeight,
+			ExactWeight::multiply(chooseCount(totalHidden, prizeSize), chooseCount(totalHidden - prizeSize, handSize)));
+		noteWeight(expected);
+		std::string revealKey = keyFor(parent) + "\x1f" "BR2" "\x1f" + actionEquivalenceKey(parent, action)
+			+ "\x1f" + baseWeight.text();
+		for (int observer = 0; observer < 2; ++observer) {
+			for (bool known : baseKnowledge[observer].deckKnown) revealKey.push_back(known ? '1' : '0');
+			appendSemantic(revealKey, baseKnowledge[observer].publicFacts.size());
+			revealKey += baseKnowledge[observer].publicFacts;
+		}
+		auto [found, inserted] = partialBeliefReveals.try_emplace(revealKey);
+		PartialBeliefRevealEntry& partial = found->second;
+		if (inserted || !partial.initialized) {
+			partial.bounds = bounds; partial.handBounds.resize(bounds.size());
+			partial.prizeCounts.resize(bounds.size()); partial.handCounts.resize(bounds.size());
+			partial.prizeCursor.reset(bounds, prizeSize); partial.expected = expected;
+			partial.initialized = true;
+			partial.accountedBytes = revealKey.size() + sizeof(PartialBeliefRevealEntry) + bounds.size() * sizeof(int) * 4;
+			partialBytes += partial.accountedBytes;
+		} else {
+			metrics.partialRevealHits++;
+			if (partial.bounds != bounds || partial.expected != expected) return false;
+		}
+		while (!partial.completed) {
+			if (expired()) return false;
+			if (!partial.handActive) {
+				if (!partial.prizeCursor.next(partial.prizeCounts)) { partial.completed = true; break; }
+				for (int i = 0; i < (int)bounds.size(); ++i)
+					partial.handBounds[i] = bounds[i] - partial.prizeCounts[i];
+				partial.handCursor.reset(partial.handBounds, handSize); partial.handActive = true;
+			}
+			if (!partial.handCursor.next(partial.handCounts)) { partial.handActive = false; continue; }
+				ExactWeight allocation(1);
+				for (int i = 0; i < (int)bounds.size(); ++i) {
+					allocation = ExactWeight::multiply(allocation, chooseCount(bounds[i], partial.prizeCounts[i]));
+					allocation = ExactWeight::multiply(allocation,
+						chooseCount(bounds[i] - partial.prizeCounts[i], partial.handCounts[i]));
+				}
+				ExactWeight worldWeight = ExactWeight::multiply(baseWeight, allocation);
+				noteWeight(worldWeight);
+				auto child = std::make_unique<State>(parent);
+				try {
+					materializeUnknownZones(*child, player, partial.prizeCounts, partial.handCounts);
+				} catch (...) { return false; }
+				auto knowledge = baseKnowledge;
+				int observer = parent.selectPlayer >= 0 ? parent.selectPlayer : actor;
+				knowledge[observer].deckKnown[player] = true;
+				std::vector<int> observedDeck;
+				for (CardRef ref : child->players[player].deck) if (!ref.isNull())
+					observedDeck.push_back(child->getCard(ref).cardId);
+				std::sort(observedDeck.begin(), observedDeck.end());
+				knowledge[observer].publicFacts.push_back('V');
+				appendSemantic(knowledge[observer].publicFacts, player);
+				for (int id : observedDeck) appendSemantic(knowledge[observer].publicFacts, id);
+				try { if (!advance(*child, action)) return false; } catch (...) { return false; }
+				partial.worlds.push_back({ std::move(child), worldWeight, std::move(knowledge) });
+				partial.generated += worldWeight;
+				partialBytes += sizeof(State) + sizeof(BeliefWorld) + 128;
+				metrics.enumeratedHiddenWorlds++;
+		}
+		if (partial.generated != expected) {
+			metrics.chanceMassMismatches++; metrics.probabilityExact = false; return false;
+		}
+		output.reserve(output.size() + partial.worlds.size());
+		for (const BeliefWorld& world : partial.worlds)
+			output.push_back({ std::make_unique<State>(*world.state), world.weight, world.knowledge });
+		return true;
+	}
+
 	ExactScore revealAndReplay(const State& parent, const std::vector<int>& action) {
+		std::vector<BeliefWorld> worlds;
+		std::array<ExactKnowledgeState, 2> knowledge{};
+		if (!expandRevealBelief(parent, action, ExactWeight(1), knowledge, worlds) || worlds.empty()) return unknown();
+		metrics.beliefWorldsBefore += worlds.size();
+		return solveBelief(std::move(worlds));
+	}
+
+	[[maybe_unused]] ExactScore revealAndReplayLegacy(const State& parent, const std::vector<int>& action) {
 		int player = parent.exact.pendingPlayer >= 0 ? parent.exact.pendingPlayer : actor;
 		if (!parent.exact.profileKnown[player]) return unknown();
-		int prizeSize = parent.players[player].prize.size();
+		int prizeSize = 0; for (CardRef ref : parent.players[player].prize) if (ref.isNull()) prizeSize++;
 		int handSize = 0; for (CardRef ref : parent.players[player].hand) if (ref.isNull()) handSize++;
 		int totalHidden = 0;
 		for (int i = 0; i < parent.exact.typeCount[player]; ++i) totalHidden += parent.exact.cardCount[player][i];
 		if (prizeSize < 0 || prizeSize > totalHidden) return unknown();
-		unsigned long long totalWeight = chooseCount(totalHidden, prizeSize) * chooseCount(totalHidden - prizeSize, handSize);
-		if (totalWeight == 0) return unknown();
-		ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
-		bool certified = true, any = false;
-		unsigned long long processedWeight = 0;
-		std::vector<int> prizeCounts(parent.exact.typeCount[player], 0);
-		std::vector<int> handCounts(parent.exact.typeCount[player], 0);
-		auto evaluateWorld = [&](unsigned long long weight) {
-			auto world = std::make_unique<State>(parent);
-			try {
-				materializeUnknownZones(*world, player, prizeCounts, handCounts);
-				if (!advance(*world, action)) return true;
-			} catch (...) { return false; }
-			ExactScore score = solve(*world);
-			auto l = score.lower.scaled(weight, totalWeight), u = score.upper.scaled(weight, totalWeight);
-			lower = ExactFraction::add(lower, l); upper = ExactFraction::add(upper, u);
-			if (!lower.valid || !upper.valid) { metrics.arithmeticOverflow = true; return false; }
-			processedWeight += weight;
-			certified = certified && score.certified; any = true; return true;
-		};
-		std::function<bool(int, int, unsigned long long)> enumerateHands;
-		enumerateHands = [&](int type, int left, unsigned long long weight) {
-			if (expired()) return false;
-			if (type == parent.exact.typeCount[player]) return left == 0 ? evaluateWorld(weight) : true;
-			int available = parent.exact.cardCount[player][type] - prizeCounts[type];
-			for (int take = 0; take <= std::min(available, left); ++take) {
-				handCounts[type] = take;
-				if (!enumerateHands(type + 1, left - take, weight * chooseCount(available, take))) return false;
+		ExactWeight totalWeight = ExactWeight::multiply(chooseCount(totalHidden, prizeSize),
+			chooseCount(totalHidden - prizeSize, handSize));
+		noteWeight(totalWeight);
+		if (totalWeight.zero()) return unknown();
+		std::string revealKey = keyFor(parent) + "\x1fR\x1f" + actionEquivalenceKey(parent, action);
+		PartialRevealEntry* partial = partialRevealFor(revealKey, parent.exact.typeCount[player]);
+		if (partial == nullptr) return unknown();
+		if (!partial->initialized) {
+			std::vector<int> bounds(parent.exact.typeCount[player]);
+			for (int i = 0; i < (int)bounds.size(); ++i) bounds[i] = parent.exact.cardCount[player][i];
+			partial->prizeCursor.reset(bounds, prizeSize);
+			partial->prizeCounts.assign(bounds.size(), 0);
+			partial->handCounts.assign(bounds.size(), 0);
+			partial->totalWeight = totalWeight; partial->initialized = true;
+		} else if (partial->totalWeight != totalWeight) {
+			return unknown();
+		}
+		auto incomplete = [&](const ExactScore* current = nullptr, ExactWeight currentWeight = {}) {
+			ExactFraction lower = partial->completedLower, upper = partial->completedUpper;
+			ExactWeight covered = partial->processedWeight;
+			if (current != nullptr) {
+				lower = ExactFraction::add(lower, current->lower.scaled(currentWeight, totalWeight));
+				upper = ExactFraction::add(upper, current->upper.scaled(currentWeight, totalWeight));
+				covered = ExactWeight::add(covered, currentWeight); noteWeight(covered);
 			}
-			handCounts[type] = 0; return true;
-		};
-		std::function<bool(int, int, unsigned long long)> enumerate = [&](int type, int left, unsigned long long weight) {
-			if (expired()) return false;
-			if (type == parent.exact.typeCount[player]) {
-				return left == 0 ? enumerateHands(0, handSize, weight) : true;
-			}
-			int available = parent.exact.cardCount[player][type];
-			for (int take = 0; take <= std::min(available, left); ++take) {
-				prizeCounts[type] = take;
-				if (!enumerate(type + 1, left - take, weight * chooseCount(available, take))) return false;
-			}
-			prizeCounts[type] = 0; return true;
-		};
-		bool completeEnumeration = enumerate(0, prizeSize, 1);
-		if (!any) return unknown();
-		if (!completeEnumeration) {
-			unsigned long long remaining = processedWeight >= totalWeight ? 0 : totalWeight - processedWeight;
+			ExactWeight remaining = covered >= totalWeight ? ExactWeight() : ExactWeight::subtract(totalWeight, covered);
 			lower = ExactFraction::add(lower, ExactFraction::integer(-100'000'000).scaled(remaining, totalWeight));
 			upper = ExactFraction::add(upper, ExactFraction::integer(100'000'000).scaled(remaining, totalWeight));
 			if (!lower.valid || !upper.valid) { metrics.arithmeticOverflow = true; return unknown(); }
-			return { lower, upper, {}, false };
+			return ExactScore{ lower, upper, {}, false };
+		};
+		while (true) {
+			if (expired()) { metrics.partialChanceNodes++; return incomplete(); }
+			if (!partial->handActive) {
+				if (!partial->prizeCursor.next(partial->prizeCounts)) {
+					if (partial->processedWeight != totalWeight) return unknown();
+					ExactScore result{ partial->completedLower, partial->completedUpper, {},
+						ExactCompare(partial->completedLower, partial->completedUpper) == 0 };
+					partialBytes -= std::min(partialBytes, partial->accountedBytes);
+					partialReveals.erase(revealKey);
+					return result;
+				}
+				std::vector<int> handBounds(parent.exact.typeCount[player]);
+				for (int i = 0; i < (int)handBounds.size(); ++i)
+					handBounds[i] = parent.exact.cardCount[player][i] - partial->prizeCounts[i];
+				partial->handCursor.reset(handBounds, handSize);
+				partial->handActive = true;
+			}
+			if (!partial->pendingWorld) {
+				if (!partial->handCursor.next(partial->handCounts)) {
+					partial->handActive = false; continue;
+				}
+				ExactWeight weight(1);
+				for (int i = 0; i < parent.exact.typeCount[player]; ++i) {
+					int available = parent.exact.cardCount[player][i];
+					weight = ExactWeight::multiply(weight, chooseCount(available, partial->prizeCounts[i]));
+					weight = ExactWeight::multiply(weight,
+						chooseCount(available - partial->prizeCounts[i], partial->handCounts[i]));
+				}
+				noteWeight(weight);
+				partial->pendingWeight = weight; partial->pendingWorld = true;
+			}
+			auto world = std::make_unique<State>(parent);
+			try {
+				materializeUnknownZones(*world, player, partial->prizeCounts, partial->handCounts);
+				if (!advance(*world, action)) return unknown();
+			} catch (...) { return unknown(); }
+			ExactScore score = solveOwned(std::move(world));
+			if (!score.certified) return incomplete(&score, partial->pendingWeight);
+			partial->completedLower = ExactFraction::add(partial->completedLower,
+				score.lower.scaled(partial->pendingWeight, totalWeight));
+			partial->completedUpper = ExactFraction::add(partial->completedUpper,
+				score.upper.scaled(partial->pendingWeight, totalWeight));
+			if (!partial->completedLower.valid || !partial->completedUpper.valid) {
+				metrics.arithmeticOverflow = true; return unknown();
+			}
+			partial->processedWeight += partial->pendingWeight; noteWeight(partial->processedWeight);
+			metrics.enumeratedHiddenWorlds++;
+			partial->pendingWeight = ExactWeight(); partial->pendingWorld = false;
+		}
+	}
+
+	std::string beliefWorldKey(const BeliefWorld& world) const {
+		std::string key = keyFor(*world.state);
+		for (int observer = 0; observer < 2; ++observer) {
+			for (bool known : world.knowledge[observer].deckKnown) key.push_back(known ? '1' : '0');
+			appendSemantic(key, (long long)world.knowledge[observer].publicFacts.size());
+			key += world.knowledge[observer].publicFacts;
+		}
+		return key;
+	}
+
+	void normalizeBelief(std::vector<BeliefWorld>& worlds) {
+		std::unordered_map<std::string, size_t, ExactStringHasher> byWorld;
+		std::vector<BeliefWorld> normalized;
+		normalized.reserve(worlds.size());
+		for (BeliefWorld& world : worlds) {
+			std::string key = beliefWorldKey(world);
+			auto [found, inserted] = byWorld.emplace(std::move(key), normalized.size());
+			if (inserted) normalized.push_back(std::move(world));
+			else {
+				normalized[found->second].weight += world.weight;
+				metrics.beliefWorldsAfter++;
+			}
+		}
+		worlds = std::move(normalized);
+		ExactWeight common;
+		for (const BeliefWorld& world : worlds)
+			common = common.zero() ? world.weight : ExactWeight::gcd(common, world.weight);
+		if (!common.zero() && common != ExactWeight(1)) {
+			for (BeliefWorld& world : worlds) {
+				auto divided = ExactWeight::divideRemainder(world.weight, common);
+				if (!divided.second.zero()) throw std::runtime_error("belief GCD normalization failed");
+				world.weight = std::move(divided.first);
+			}
+		}
+	}
+
+	ExactWeight beliefMass(const std::vector<BeliefWorld>& worlds) const {
+		ExactWeight total; for (const BeliefWorld& world : worlds) total += world.weight; return total;
+	}
+
+	ExactScore aggregateBeliefScores(const std::vector<std::pair<ExactScore, ExactWeight>>& scores,
+		const ExactWeight& total) {
+		if (scores.empty() || total.zero()) return unknown();
+		ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
+		bool certified = true;
+		ExactWeight processed;
+		for (const auto& item : scores) {
+			lower = ExactFraction::add(lower, item.first.lower.scaled(item.second, total));
+			upper = ExactFraction::add(upper, item.first.upper.scaled(item.second, total));
+			processed += item.second; certified = certified && item.first.certified;
+		}
+		if (processed != total) {
+			metrics.chanceMassMismatches++; metrics.probabilityExact = false; return unknown();
 		}
 		return { lower, upper, {}, certified && ExactCompare(lower, upper) == 0 };
+	}
+
+	bool settleBeliefState(State& state) {
+		try {
+			while (!state.isFinish() && !IsExactTurnLeaf(state)
+				&& state.exact.pending == ExactPendingType::None && state.selectType == SelectType::None) {
+				state.step(); metrics.expanded++;
+				if (expired()) return false;
+			}
+			return true;
+		} catch (const std::exception& error) {
+			metrics.exceptions++; metrics.lastException = error.what(); return false;
+		} catch (...) {
+			metrics.exceptions++; metrics.lastException = "belief automatic transition"; return false;
+		}
+	}
+
+	std::string beliefControlKey(const BeliefWorld& world) const {
+		const State& state = *world.state;
+		std::string key;
+		if (state.isFinish()) key = "F";
+		else if (IsExactTurnLeaf(state)) key = "L";
+		else if (state.exact.pending != ExactPendingType::None) {
+			key = "P"; appendSemantic(key, (int)state.exact.pending);
+			appendSemantic(key, state.exact.pendingPlayer); appendSemantic(key, state.exact.pendingCount);
+			if (state.exact.pendingPlayer >= 0) {
+				const PlayerState& ps = state.players[state.exact.pendingPlayer];
+				appendSemantic(key, state.exact.pending == ExactPendingType::Draw ? ps.deck.size() : ps.prize.size());
+			}
+		} else if (state.selectType == SelectType::YesNo && state.selectContext == SelectContext::CoinHead) key = "C";
+		else {
+			key = "D"; appendSemantic(key, state.selectPlayer); appendSemantic(key, (int)state.selectType);
+		}
+		return key;
+	}
+
+	ExactScore solveBeliefInformationSet(std::vector<BeliefWorld> worlds) {
+		if (worlds.empty()) return unknown();
+		State& representative = *worlds.front().state;
+		const int decisionPlayer = representative.selectPlayer;
+		const std::string expectedObservation = observationKeyFor(representative, decisionPlayer,
+			&worlds.front().knowledge[decisionPlayer]);
+		for (const BeliefWorld& world : worlds) {
+			if (world.state->selectPlayer != decisionPlayer
+				|| observationKeyFor(*world.state, decisionPlayer, &world.knowledge[decisionPlayer]) != expectedObservation) {
+				metrics.illegalInformationSetSplits++; metrics.informationSetSafe = false; return unknown();
+			}
+		}
+		metrics.informationSets++;
+		if (worlds.size() > 1) metrics.strategyFusionPrevented += worlds.size() - 1;
+		struct CommonAction { std::vector<int> representative; std::vector<std::string> semantic; };
+		std::vector<CommonAction> actions;
+		if (!forEachLegalAction(representative, [&](const std::vector<int>& action) {
+			actions.push_back({ action, semanticAction(representative, action) }); return true;
+		})) return unknown();
+		if (actions.empty()) return unknown();
+		const bool maximize = decisionPlayer == actor;
+		ExactScore best;
+		bool first = true;
+		for (const CommonAction& common : actions) {
+			if (expired()) return unknown();
+			std::vector<BeliefWorld> children;
+			for (const BeliefWorld& world : worlds) {
+				std::vector<int> mapped;
+				if (!remapAction(*world.state, common.semantic, mapped)) {
+					metrics.illegalInformationSetSplits++; metrics.informationSetSafe = false; return unknown();
+				}
+				auto child = std::make_unique<State>(*world.state);
+				if (!advance(*child, mapped)) return unknown();
+				if (child->exact.pending == ExactPendingType::RevealDeck) {
+					if (!expandRevealBelief(*world.state, mapped, world.weight, world.knowledge, children)) return unknown();
+				} else children.push_back({ std::move(child), world.weight, world.knowledge });
+			}
+			ExactScore score = solveBelief(std::move(children));
+			if (first || (maximize ? ExactCompare(score.lower, best.lower) > 0
+				: ExactCompare(score.upper, best.upper) < 0)) {
+				best = score; best.action = common.representative; first = false;
+			}
+		}
+		return best;
+	}
+
+	ExactScore solveBelief(std::vector<BeliefWorld> worlds) {
+		struct DepthGuard { int& value; DepthGuard(int& v) : value(v) { ++value; } ~DepthGuard() { --value; } } guard(recursionDepth);
+		if (worlds.empty() || recursionDepth > 384 || expired()) return unknown();
+		metrics.beliefNodes++; metrics.expanded++;
+		for (BeliefWorld& world : worlds) if (!settleBeliefState(*world.state)) return unknown();
+		normalizeBelief(worlds);
+		ExactWeight total = beliefMass(worlds); noteWeight(total, false);
+		std::vector<std::string> beliefKeyParts;
+		beliefKeyParts.reserve(worlds.size());
+		for (const BeliefWorld& world : worlds)
+			beliefKeyParts.push_back(beliefWorldKey(world) + "@" + world.weight.text());
+		std::sort(beliefKeyParts.begin(), beliefKeyParts.end());
+		std::string beliefKey = "BELIEF-V2|CANONICAL-V1|RULES-V1|";
+		appendSemantic(beliefKey, actor);
+		appendSemantic(beliefKey, evaluator ? evaluator->schemaVersion() : 0);
+		beliefKey += std::to_string(evaluator ? evaluator->modelHash() : 0); beliefKey.push_back(';');
+		for (const std::string& part : beliefKeyParts) { appendSemantic(beliefKey, part.size()); beliefKey += part; }
+		auto cachedBelief = beliefTransposition.find(beliefKey);
+		if (cachedBelief != beliefTransposition.end()) { metrics.merged++; return cachedBelief->second; }
+		auto finish = [&](ExactScore result) {
+			if (result.certified && beliefTransposition.size() < 250'000
+				&& beliefTranspositionBytes + beliefKey.size() + sizeof(ExactScore) + 64 < 256ULL * 1024ULL * 1024ULL) {
+				auto [_, inserted] = beliefTransposition.emplace(beliefKey, result);
+				if (inserted) beliefTranspositionBytes += beliefKey.size() + sizeof(ExactScore) + 64;
+			}
+			return result;
+		};
+
+		std::unordered_map<std::string, std::vector<BeliefWorld>, ExactStringHasher> controlGroups;
+		for (BeliefWorld& world : worlds) controlGroups[beliefControlKey(world)].push_back(std::move(world));
+		if (controlGroups.size() > 1) {
+			std::vector<std::pair<ExactScore, ExactWeight>> scores;
+			for (auto& item : controlGroups) {
+				ExactWeight mass = beliefMass(item.second);
+				scores.push_back({ solveBelief(std::move(item.second)), mass });
+			}
+			return finish(aggregateBeliefScores(scores, total));
+		}
+		worlds = std::move(controlGroups.begin()->second);
+		State& representative = *worlds.front().state;
+
+		if (representative.isFinish() || IsExactTurnLeaf(representative)) {
+			std::unordered_map<std::string, std::vector<BeliefWorld>, ExactStringHasher> observations;
+			for (BeliefWorld& world : worlds) {
+				observations[observationKeyFor(*world.state, actor, &world.knowledge[actor])].push_back(std::move(world));
+			}
+			std::vector<std::pair<ExactScore, ExactWeight>> scores;
+			for (auto& item : observations) {
+				ExactWeight mass = beliefMass(item.second);
+				std::vector<std::string> beliefTokens;
+				for (const BeliefWorld& world : item.second)
+					beliefTokens.push_back(beliefWorldKey(world) + "@" + world.weight.text());
+				std::sort(beliefTokens.begin(), beliefTokens.end());
+				std::string cacheKey = item.first + "#" + std::to_string(evaluator ? evaluator->modelHash() : 0);
+				for (const std::string& token : beliefTokens) { appendSemantic(cacheKey, token.size()); cacheKey += token; }
+				auto cached = evaluationCache.find(cacheKey);
+				long long value;
+				if (cached != evaluationCache.end()) value = cached->second;
+				else { value = evaluateBeliefInformationState(item.second, mass); evaluationCache.emplace(std::move(cacheKey), value); }
+				scores.push_back({ { ExactFraction::integer(value), ExactFraction::integer(value), {}, true }, mass });
+				metrics.leaves++;
+			}
+			return finish(aggregateBeliefScores(scores, total));
+		}
+
+		if (representative.exact.pending == ExactPendingType::Opaque
+			|| representative.exact.pending == ExactPendingType::RevealDeck) return unknown();
+
+		if (representative.exact.pending == ExactPendingType::Draw
+			|| representative.exact.pending == ExactPendingType::TakePrize) {
+			std::vector<BeliefWorld> children;
+			ExactWeight expected, generated;
+			for (BeliefWorld& world : worlds) {
+				auto types = chanceCardTypes(*world.state);
+				if (types.empty()) return unknown();
+				ExactWeight localTotal; for (const auto& type : types) localTotal += type.second;
+				expected += ExactWeight::multiply(world.weight, localTotal);
+				for (const auto& type : types) {
+					auto child = std::make_unique<State>(*world.state);
+					try {
+					if (world.state->exact.pending == ExactPendingType::Draw) resolveDraw(*child, type.first);
+					else resolvePrize(*child, type.first);
+					} catch (...) { return unknown(); }
+					auto knowledge = world.knowledge;
+					appendKnowledgeFact(knowledge[world.state->exact.pendingPlayer],
+						world.state->exact.pending == ExactPendingType::Draw ? 'D' : 'P', type.first);
+					if (world.state->exact.pending == ExactPendingType::Draw)
+						for (int observer = 0; observer < 2; ++observer)
+							if (observer != world.state->exact.pendingPlayer)
+								knowledge[observer].deckKnown[world.state->exact.pendingPlayer] = false;
+					ExactWeight weight = ExactWeight::multiply(world.weight, type.second);
+					generated += weight;
+					children.push_back({ std::move(child), weight, std::move(knowledge) });
+				}
+			}
+			if (generated != expected) {
+				metrics.chanceMassMismatches++; metrics.probabilityExact = false; return unknown();
+			}
+			return finish(solveBelief(std::move(children)));
+		}
+
+		if (representative.selectType == SelectType::YesNo && representative.selectContext == SelectContext::CoinHead) {
+			std::vector<BeliefWorld> children;
+			for (BeliefWorld& world : worlds) for (int option = 0; option < 2; ++option) {
+				auto child = std::make_unique<State>(*world.state);
+				if (!advance(*child, { option })) return unknown();
+				auto knowledge = world.knowledge;
+				appendKnowledgeFact(knowledge[0], 'C', option); appendKnowledgeFact(knowledge[1], 'C', option);
+				children.push_back({ std::move(child), world.weight, std::move(knowledge) });
+			}
+			return finish(solveBelief(std::move(children)));
+		}
+
+		std::unordered_map<std::string, std::vector<BeliefWorld>, ExactStringHasher> informationSets;
+		for (BeliefWorld& world : worlds) {
+			int observer = world.state->selectPlayer;
+			informationSets[observationKeyFor(*world.state, observer, &world.knowledge[observer])].push_back(std::move(world));
+		}
+		std::vector<std::pair<ExactScore, ExactWeight>> scores;
+		for (auto& item : informationSets) {
+			ExactWeight mass = beliefMass(item.second);
+			scores.push_back({ solveBeliefInformationSet(std::move(item.second)), mass });
+		}
+		return finish(aggregateBeliefScores(scores, total));
 	}
 
 	void resolveDraw(State& state, int cardId) {
@@ -946,18 +1551,18 @@ private:
 		}
 	}
 
-	std::vector<std::pair<int, unsigned long long>> chanceCardTypes(const State& state) const {
-		std::vector<std::pair<int, unsigned long long>> result;
+	std::vector<std::pair<int, ExactWeight>> chanceCardTypes(const State& state) const {
+		std::vector<std::pair<int, ExactWeight>> result;
 		int player = state.exact.pendingPlayer;
-		if (player != actor && state.exact.deckUnknown[player]) return result;
+		if (player != actor && state.exact.deckUnknown[player] && !state.exact.profileKnown[player]) return result;
 		if (state.exact.deckUnknown[player]) {
 			for (int i = 0; i < state.exact.typeCount[player]; ++i) if (state.exact.cardCount[player][i] > 0)
-				result.push_back({ state.exact.cardId[player][i], state.exact.cardCount[player][i] });
+				result.push_back({ state.exact.cardId[player][i], ExactWeight(state.exact.cardCount[player][i]) });
 		} else {
 			std::unordered_map<int, unsigned long long> counts;
 			const auto& list = state.exact.pending == ExactPendingType::Draw ? state.players[player].deck : state.players[player].prize;
 			for (CardRef ref : list) if (!ref.isNull()) counts[state.getCard(ref).cardId]++;
-			for (auto [id, count] : counts) result.push_back({ id, count });
+			for (auto [id, count] : counts) result.push_back({ id, ExactWeight(count) });
 		}
 		return result;
 	}
@@ -966,14 +1571,16 @@ private:
 		auto types = chanceCardTypes(state);
 		if (types.empty()) return unknown();
 		PartialChanceEntry* partial = partialChanceFor(nodeKey);
-		unsigned long long total = 0; for (auto [_, w] : types) total += w;
+		ExactWeight total; for (const auto& item : types) total += item.second;
+		noteWeight(total);
 		ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
 		bool certified = true;
-		unsigned long long processed = 0;
-		for (auto [id, weight] : types) {
+		ExactWeight processed;
+		for (const auto& item : types) {
+			int id = item.first; const ExactWeight& weight = item.second;
 			if (expired()) {
 				metrics.partialChanceNodes++;
-				unsigned long long remaining = total - processed;
+				ExactWeight remaining = ExactWeight::subtract(total, processed);
 				lower = ExactFraction::add(lower, ExactFraction::integer(-100'000'000).scaled(remaining, total));
 				upper = ExactFraction::add(upper, ExactFraction::integer(100'000'000).scaled(remaining, total));
 				return { lower, upper, {}, false };
@@ -984,13 +1591,17 @@ private:
 				return found == partial->completedOutcomes.end() ? nullptr : &found->second;
 			}();
 			if (saved != nullptr) {
-				score = *saved; metrics.resumedChanceMass += weight;
+				score = *saved;
+				if (weight.fitsUnsignedLongLong()
+					&& weight.unsignedLongLong() <= std::numeric_limits<unsigned long long>::max() - metrics.resumedChanceMass)
+					metrics.resumedChanceMass += weight.unsignedLongLong();
+				else metrics.resumedChanceMass = std::numeric_limits<unsigned long long>::max();
 			} else {
 				auto child = std::make_unique<State>(state);
 				try {
 					if (state.exact.pending == ExactPendingType::Draw) resolveDraw(*child, id); else resolvePrize(*child, id);
 				} catch (...) { return unknown(); }
-				score = solve(*child);
+				score = solveOwned(std::move(child));
 				if (partial != nullptr && score.certified) partial->completedOutcomes.emplace(id, score);
 			}
 			auto l = score.lower.scaled(weight, total), u = score.upper.scaled(weight, total);
@@ -999,12 +1610,13 @@ private:
 			if (!lower.valid || !upper.valid) { metrics.arithmeticOverflow = true; return unknown(); }
 			certified = certified && score.certified;
 		}
+		if (processed != total) { metrics.chanceMassMismatches++; metrics.probabilityExact = false; return unknown(); }
 		return { lower, upper, {}, certified && ExactCompare(lower, upper) == 0 };
 	}
 
 	ExactScore coinChance(const State& state, const std::string& nodeKey) {
 		(void)nodeKey;
-		struct CoinOutcome { std::unique_ptr<State> state; unsigned long long weight; };
+		struct CoinOutcome { std::unique_ptr<State> state; ExactWeight weight; };
 		std::vector<CoinOutcome> outcomes;
 		std::unordered_map<std::string, size_t, ExactStringHasher> bySuccessor;
 		for (int option = 0; option < 2; ++option) {
@@ -1013,16 +1625,16 @@ private:
 			if (!advance(*child, { option })) return unknown();
 			std::string key = keyFor(*child);
 			auto [found, inserted] = bySuccessor.emplace(std::move(key), outcomes.size());
-			if (inserted) outcomes.push_back({ std::move(child), 1 });
-			else { outcomes[found->second].weight++; metrics.distributionMerges++; }
+			if (inserted) outcomes.push_back({ std::move(child), ExactWeight(1) });
+			else { outcomes[found->second].weight += ExactWeight(1); metrics.distributionMerges++; }
 		}
 		ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
 		bool certified = true;
 		for (CoinOutcome& outcome : outcomes) {
 			if (expired()) { metrics.partialChanceNodes++; return unknown(); }
-			ExactScore score = solve(*outcome.state);
-			lower = ExactFraction::add(lower, score.lower.scaled(outcome.weight, 2));
-			upper = ExactFraction::add(upper, score.upper.scaled(outcome.weight, 2));
+			ExactScore score = solveOwned(std::move(outcome.state));
+			lower = ExactFraction::add(lower, score.lower.scaled(outcome.weight, ExactWeight(2)));
+			upper = ExactFraction::add(upper, score.upper.scaled(outcome.weight, ExactWeight(2)));
 			if (!lower.valid || !upper.valid) { metrics.arithmeticOverflow = true; return unknown(); }
 			certified = certified && score.certified;
 		}
@@ -1075,12 +1687,12 @@ private:
 					metrics.successorMerges++; metrics.groupedOutcomes++;
 					metrics.largestEquivalenceClass = std::max(metrics.largestEquivalenceClass, successor->second.second);
 				} else {
-					score = solve(*child);
+					score = solveOwned(std::move(child));
 					successorScores.emplace(std::move(successorKey), std::make_pair(score, 1ULL));
 				}
 			} else {
 				score = child->exact.pending == ExactPendingType::RevealDeck
-					? revealAndReplay(state, action) : solve(*child);
+					? revealAndReplay(state, action) : solveOwned(std::move(child));
 			}
 			if (partial != nullptr) {
 				auto found = partial->actionBounds.find(actionKey);
@@ -1126,16 +1738,17 @@ private:
 		return result;
 	}
 
-	ExactScore solve(const State& input) {
+	ExactScore solve(const State& input) { return solveOwned(std::make_unique<State>(input)); }
+
+	ExactScore solveOwned(std::unique_ptr<State> owned) {
 		struct DepthGuard { int& depth; DepthGuard(int& value) : depth(value) { depth++; } ~DepthGuard() { depth--; } } guard(recursionDepth);
 		metrics.maxDepth = std::max(metrics.maxDepth, recursionDepth);
 		if (recursionDepth > 384) {
 			metrics.depthLimitNodes++;
-			metrics.lastDepthSelectType = (int)input.selectType;
-			metrics.lastDepthTurnActionCount = input.turnActionCount;
+			metrics.lastDepthSelectType = (int)owned->selectType;
+			metrics.lastDepthTurnActionCount = owned->turnActionCount;
 			return unknown();
 		}
-		auto owned = std::make_unique<State>(input);
 		State& state = *owned;
 		metrics.expanded++;
 		if (expired()) return unknown();
@@ -1220,7 +1833,8 @@ private:
 			}
 		}
 		metrics.partialTableBytes = partialBytes;
-		metrics.sessionBytes = transposition->bytes() + localTranspositionBytes + policyBytes + partialBytes;
+		metrics.sessionBytes = transposition->bytes() + localTranspositionBytes + policyBytes + partialBytes
+			+ beliefTranspositionBytes + evaluationCache.size() * 128ULL;
 		return result;
 	}
 };
