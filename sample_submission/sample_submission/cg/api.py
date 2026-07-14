@@ -660,6 +660,25 @@ def exact_decide(agent_observation: Observation, deck: list[int], hand_values: l
         raise RuntimeError(f"ExactDecide failed: {result['error']}")
     return result
 
+def exact_load_evaluator_model(path: str) -> dict:
+    """Load a deterministic quantized CPU evaluator used by native leaf search."""
+    global agent_ptr
+    if not hasattr(lib, "ExactLoadEvaluatorModel"):
+        raise RuntimeError("ExactLoadEvaluatorModel is not available in this native library")
+    if "agent_ptr" not in globals():
+        agent_ptr = lib.AgentStart()
+    raw = lib.ExactLoadEvaluatorModel(agent_ptr, str(path).encode("utf-8"))
+    result = json.loads(raw.decode())
+    if not result.get("loaded"):
+        raise RuntimeError(f"Failed to load exact evaluator: {result.get('error', '')}")
+    return result
+
+def exact_unload_evaluator_model() -> None:
+    """Detach the evaluator from future searches; active turn sessions retain it."""
+    global agent_ptr
+    if hasattr(lib, "ExactUnloadEvaluatorModel") and "agent_ptr" in globals():
+        lib.ExactUnloadEvaluatorModel(agent_ptr)
+
 def exact_evaluate_action(agent_observation: Observation, deck: list[int], hand_values: list[int],
                           budget_milliseconds: int, option_index: int) -> dict:
     """Evaluate one root option; intended for deterministic exact-search diagnostics."""

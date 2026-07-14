@@ -19,6 +19,7 @@ class DeckProfile:
     cards: tuple[int, ...]
     evaluator: dict
     sha256: str
+    source_path: Path
 
     def validate(self) -> None:
         if len(self.cards) != 60: raise ValueError(f"deck must contain 60 cards, got {len(self.cards)}")
@@ -30,7 +31,7 @@ def load_profile(path: str | os.PathLike | None = None) -> DeckProfile:
     path = Path(path or os.environ.get("PTCG_DECK_PROFILE", DEFAULT_PROFILE))
     raw = json.loads(path.read_text(encoding="utf-8"))
     cards = tuple(card_id for item in raw["cards"] for card_id in [int(item["id"])] * int(item["count"]))
-    profile = DeckProfile(raw["name"], cards, raw["evaluator"], raw["canonical_sha256"])
+    profile = DeckProfile(raw["name"], cards, raw["evaluator"], raw["canonical_sha256"], path)
     profile.validate(); return profile
 
 

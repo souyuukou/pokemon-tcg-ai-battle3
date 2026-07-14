@@ -11,8 +11,9 @@ Decision alternatives may be merged only when they induce the same normalized
 distribution over next information state, observation, and rule state. Decision
 multiplicity is discarded; chance multiplicity is accumulated as an integer.
 Draws use products of binomial coefficients and a total of `C(N,k)`. Probabilities
-are `fractions.Fraction`; there is no sampling, floating point, or probability
-cutoff.
+are exact native rationals; there is no sampling, floating point, or probability
+cutoff. The fast path uses 64-bit integers. Overflow promotes only that value to
+a dependency-free big numerator with a prime-factor denominator.
 
 ## Exact reductions
 
@@ -73,6 +74,14 @@ with hypergeometric weights and the triggering action is replayed in each
 resulting information state. A shuffled known deck is a multiset, not a sampled
 permutation.
 
+The reveal enumerator is a persistent bounded-composition cursor. It retains the
+current prize vector, hand vector, completed rational mass, and an unfinished
+world across slices. It therefore visits every distinct card-count allocation
+exactly once instead of restarting at allocation zero after a timeout. Physical
+copies and face-down positions are represented by binomial integer weights.
+Exchangeable option classes are formed before multi-card combinations are
+generated, so meaningless prize-position choices are never constructed.
+
 Two root workers own independent `Game` scratch state and partial cursors. They
 share a 64-shard table of immutable completed entries; SipHash chooses a shard
 and the complete canonical bytes are compared inside the digest bucket. Root
@@ -90,10 +99,41 @@ raw serializer produced different keys when the same root action was replayed.
 Canonical bytes use lossless zero-run encoding before hashing and storage.
 
 Interrupted Decision nodes retain exact action intervals and a round-robin
-cursor. Chance nodes retain certified integer mass. Terminal turn leaves are
+cursor. Chance nodes retain certified integer mass, and reveal nodes retain the
+full allocation cursor. Binomial coefficients through deck size 60 are table
+lookups in the enumeration hot path. Terminal turn leaves are
 evaluated directly and are not inserted into the TT because they are cheap and
 almost always unique. RSS is sampled in native enumeration loops; 2.7 GiB
 stops further search safely and returns the current proven interval.
+
+## Replay-trained CPU evaluator
+
+The deck branch ships `exact-evaluator.bin`, a 48-input, 8-hidden-unit network.
+Visible scalar features and stable hashed card-zone counts are extracted from
+replay observations. `tools/train_replay_evaluator.py` reads each replay once,
+stores a bounded int8 feature cache, trains against actor-relative final rewards,
+and exports an 852-byte quantized model. The current bundled checkpoint was
+trained from 500 replay files / 33,277 active observations; its held-out MSE was
+approximately 0.788 after 30 epochs.
+
+Native inference is an integer 48x8x1 multiply with clipped ReLU and a 1,000-point
+output unit. Terminal wins and losses remain fixed at +/-100,000,000. The model
+is attached to one `ApiData`/turn session, so changing a deck profile cannot
+silently change another session. Training may use PyTorch; submission inference
+has no ML runtime dependency and is byte-for-byte deterministic across Windows
+and Linux.
+
+Train a replacement model with:
+
+```powershell
+python tools/train_replay_evaluator.py data/kaggle_replays `
+  sample_submission/sample_submission/exact-evaluator.bin `
+  --max-files 20000 --max-examples 2000000 --epochs 30
+```
+
+`ExactLoadEvaluatorModel` and `ExactUnloadEvaluatorModel` expose explicit model
+lifetime control. Active turn sessions retain an immutable shared model after it
+is detached from future searches.
 
 Windows x64 `cg.dll` and Linux x86-64 `libcg.so` include `ExactDecide`. The
 Python wrapper feature-detects the symbol so the unchanged ARM64 library uses a
@@ -146,6 +186,13 @@ merges, 10,058 resumed actions, 24,799 resumed chance mass, no deadline
 overrun, and 631 MB peak RSS. It remained correctly uncertified because the non-End root
 intervals were still open; this is a measured outstanding acceptance failure,
 not treated as a proof or a successful full-turn certification.
+
+After the persistent reveal cursor, pre-generation option quotient, learned
+integer evaluator, and big-rational promotion were added, a 30-second turn-two
+diagnostic processed about 407k nodes and 821 complete hidden allocations at
+about 590 MB RSS, with `opaqueNodes=0`, `arithmeticOverflow=false`, and zero
+deadline overrun. This short diagnostic verifies progress and safety; it is not
+a replacement for the 570-second certification acceptance run.
 
 ## Git deck workflow
 

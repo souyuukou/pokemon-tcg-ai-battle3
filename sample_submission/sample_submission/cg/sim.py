@@ -107,6 +107,12 @@ if hasattr(lib, "ExactTurnProgress"):
     lib.ExactTurnProgress.restype = ctypes.c_char_p
     lib.ExactTurnProgress.argtypes = [ctypes.c_void_p, ctypes.c_int64]
 
+if hasattr(lib, "ExactLoadEvaluatorModel"):
+    lib.ExactLoadEvaluatorModel.restype = ctypes.c_char_p
+    lib.ExactLoadEvaluatorModel.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
+if hasattr(lib, "ExactUnloadEvaluatorModel"):
+    lib.ExactUnloadEvaluatorModel.argtypes = [ctypes.c_void_p]
+
 if hasattr(lib, "ExactTurnRelease"):
     lib.ExactTurnRelease.argtypes = [ctypes.c_void_p, ctypes.c_int64]
 

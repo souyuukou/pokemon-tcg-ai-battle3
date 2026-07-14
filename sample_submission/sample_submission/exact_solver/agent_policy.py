@@ -6,7 +6,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from .canonical import canonical_bytes
-from .profile import load_profile
+from .profile import PACKAGE_PROFILE, load_profile
 from .resources import MatchBudget
 
 
@@ -23,6 +23,7 @@ class PolicyContext:
     last_turn: int | None = None
     session_id: int | None = None
     last_decision: dict | None = None
+    evaluator_model: str | None = None
 
     def reset(self) -> None:
         if self.session_id is not None:
@@ -35,6 +36,7 @@ class PolicyContext:
         self.last_turn = None
         self.session_id = None
         self.last_decision = None
+        self.evaluator_model = None
 
 
 _default_context = PolicyContext(_budget)
@@ -86,11 +88,21 @@ def choose_action(obs, *, context: PolicyContext | None = None,
             raise RuntimeError("exact turn search starts after setup")
         if not ctx.budget.can_expand():
             raise RuntimeError("exact search resource reserve reached")
-        from cg.api import exact_decide, exact_turn_begin, exact_turn_advance, exact_turn_release
+        from cg.api import (exact_decide, exact_load_evaluator_model, exact_turn_begin,
+                            exact_turn_advance, exact_turn_release, exact_unload_evaluator_model)
         profile = load_profile()
         values = profile.evaluator.get("hand_values", {})
         hand_values = [int(values.get(str(card_id), values.get("default", 100))) for card_id in profile.cards]
         is_new_turn = obs.current is not None and obs.current.turn != ctx.last_turn
+        model_name = profile.evaluator.get("model")
+        def load_model():
+            if not model_name:
+                return
+            model_path = profile.source_path.parent / str(model_name)
+            if not model_path.exists():
+                model_path = PACKAGE_PROFILE.parent / str(model_name)
+            exact_load_evaluator_model(str(model_path.resolve()))
+            ctx.evaluator_model = str(model_name)
         usable_ms = max(1, int((ctx.budget.remaining - ctx.budget.limits.reserve_seconds) * 1000))
         turn_cap = int(os.environ.get("PTCG_EXACT_TURN_MS", "180000"))
         selection_cap = int(os.environ.get("PTCG_EXACT_SELECTION_MS", "10000"))
@@ -100,18 +112,30 @@ def choose_action(obs, *, context: PolicyContext | None = None,
                 exact_turn_release(ctx.session_id)
                 ctx.session_id = None
             try:
-                native = exact_turn_begin(obs, list(profile.cards), hand_values,
-                                          requested_ms, opponent_deck=opponent_deck)
+                load_model()
+                try:
+                    native = exact_turn_begin(obs, list(profile.cards), hand_values,
+                                              requested_ms, opponent_deck=opponent_deck)
+                finally:
+                    exact_unload_evaluator_model()
                 ctx.session_id = int(native["sessionId"])
                 reason = "native-exact-turn-begin"
             except RuntimeError:
-                native = exact_decide(obs, list(profile.cards), hand_values, requested_ms)
+                load_model()
+                try:
+                    native = exact_decide(obs, list(profile.cards), hand_values, requested_ms)
+                finally:
+                    exact_unload_evaluator_model()
                 reason = "native-exact-turn-search"
         elif ctx.session_id is not None:
             native = exact_turn_advance(ctx.session_id, obs, requested_ms)
             reason = "exact-policy-reroot" if native.get("policyHits", 0) else "exact-policy-resume"
         else:
-            native = exact_decide(obs, list(profile.cards), hand_values, requested_ms)
+            load_model()
+            try:
+                native = exact_decide(obs, list(profile.cards), hand_values, requested_ms)
+            finally:
+                exact_unload_evaluator_model()
             reason = "native-exact-turn-search"
         action = [int(index) for index in native["selected"]]
         if select.minCount <= len(action) <= select.maxCount and len(set(action)) == len(action) \

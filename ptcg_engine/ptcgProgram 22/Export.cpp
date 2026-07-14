@@ -22,6 +22,25 @@
 static JsonBuilder AllCardJson;
 static JsonBuilder AllAttackJson;
 
+extern "C" GAME_API const char8_t* ExactLoadEvaluatorModel(ApiData* data, const char* path) {
+  JsonBuilder& j = data->jsonBuilder;
+  j.clear(); j.append('{');
+  std::string error;
+  bool loaded = false;
+  auto evaluator = std::make_shared<ExactCpuEvaluator>();
+  loaded = path != nullptr && evaluator->load(path, error);
+  if (loaded) data->exactEvaluator = std::move(evaluator);
+  j.appendKeyValue("loaded", loaded);
+  j.appendCommaKey("error");
+  j.appendDoubleQuote(std::u8string((const char8_t*)error.c_str(), error.size()));
+  j.append('}');
+  return j.buf.c_str();
+}
+
+extern "C" GAME_API void ExactUnloadEvaluatorModel(ApiData* data) {
+  if (data != nullptr) data->exactEvaluator.reset();
+}
+
 static const char8_t* JsonResult(ApiData* data, const SearchInfo& si) {
   SearchReturnJson(data->jsonBuilder, si);
   return data->jsonBuilder.buf.c_str();
@@ -51,16 +70,23 @@ static void AppendUnsignedLongLong(JsonBuilder& j, unsigned long long value) {
   for (char c : text) j.append(c);
 }
 
+static void AppendExactNumerator(JsonBuilder& j, const ExactFraction& value) {
+  for (char c : value.numeratorText()) j.append(c);
+}
+static void AppendExactDenominator(JsonBuilder& j, const ExactFraction& value) {
+  for (char c : value.denominatorText()) j.append(c);
+}
+
 static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& decision, long long sessionId = -1) {
   JsonBuilder& j = data->jsonBuilder;
   j.clear(); j.append('{');
   j.appendKey("selected"); j.append('[');
   for (int i : range(decision.score.action)) { j.comma(i); j.append(decision.score.action[i]); }
   j.append(']');
-  j.appendCommaKey("lowerNumerator"); AppendLongLong(j, decision.score.lower.numerator);
-  j.appendCommaKey("lowerDenominator"); AppendUnsignedLongLong(j, decision.score.lower.denominator);
-  j.appendCommaKey("upperNumerator"); AppendLongLong(j, decision.score.upper.numerator);
-  j.appendCommaKey("upperDenominator"); AppendUnsignedLongLong(j, decision.score.upper.denominator);
+  j.appendCommaKey("lowerNumerator"); AppendExactNumerator(j, decision.score.lower);
+  j.appendCommaKey("lowerDenominator"); AppendExactDenominator(j, decision.score.lower);
+  j.appendCommaKey("upperNumerator"); AppendExactNumerator(j, decision.score.upper);
+  j.appendCommaKey("upperDenominator"); AppendExactDenominator(j, decision.score.upper);
   j.appendCommaKeyValue("certified", decision.score.certified);
   j.appendCommaKey("expandedNodes"); AppendUnsignedLongLong(j, decision.metrics.expanded);
   j.appendCommaKey("mergedNodes"); AppendUnsignedLongLong(j, decision.metrics.merged);
@@ -110,6 +136,8 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
 	 j.appendCommaKey("largestEquivalenceClass"); AppendUnsignedLongLong(j, decision.metrics.largestEquivalenceClass);
 	 j.appendCommaKey("resumedActionCount"); AppendUnsignedLongLong(j, decision.metrics.resumedActionCount);
 	 j.appendCommaKey("resumedChanceMass"); AppendUnsignedLongLong(j, decision.metrics.resumedChanceMass);
+	 j.appendCommaKey("partialRevealHits"); AppendUnsignedLongLong(j, decision.metrics.partialRevealHits);
+	 j.appendCommaKey("enumeratedHiddenWorlds"); AppendUnsignedLongLong(j, decision.metrics.enumeratedHiddenWorlds);
 	 j.appendCommaKeyValue("currentRootAction", decision.metrics.currentRootAction);
 	 j.appendCommaKey("peakRssBytes"); AppendUnsignedLongLong(j, decision.metrics.peakRssBytes);
 	 j.appendCommaKeyValue("memoryLimitReached", decision.metrics.memoryLimitReached);
@@ -124,10 +152,10 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
 	   j.appendKey("selected"); j.append('[');
 	   for (int ai : range(decision.rootActions[ri].action)) { j.comma(ai); j.append(decision.rootActions[ri].action[ai]); }
 	   j.append(']');
-	   j.appendCommaKey("lowerNumerator"); AppendLongLong(j, decision.rootActions[ri].lower.numerator);
-	   j.appendCommaKey("lowerDenominator"); AppendUnsignedLongLong(j, decision.rootActions[ri].lower.denominator);
-	   j.appendCommaKey("upperNumerator"); AppendLongLong(j, decision.rootActions[ri].upper.numerator);
-	   j.appendCommaKey("upperDenominator"); AppendUnsignedLongLong(j, decision.rootActions[ri].upper.denominator);
+	   j.appendCommaKey("lowerNumerator"); AppendExactNumerator(j, decision.rootActions[ri].lower);
+	   j.appendCommaKey("lowerDenominator"); AppendExactDenominator(j, decision.rootActions[ri].lower);
+	   j.appendCommaKey("upperNumerator"); AppendExactNumerator(j, decision.rootActions[ri].upper);
+	   j.appendCommaKey("upperDenominator"); AppendExactDenominator(j, decision.rootActions[ri].upper);
 	   j.appendCommaKeyValue("certified", decision.rootActions[ri].certified); j.append('}');
 	 }
 	 j.append(']');
@@ -163,6 +191,8 @@ static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
 	into.largestEquivalenceClass = std::max(into.largestEquivalenceClass, from.largestEquivalenceClass);
 	into.resumedActionCount += from.resumedActionCount;
 	into.resumedChanceMass += from.resumedChanceMass;
+	into.partialRevealHits += from.partialRevealHits;
+	into.enumeratedHiddenWorlds += from.enumeratedHiddenWorlds;
 	if (from.currentRootAction >= 0) into.currentRootAction = from.currentRootAction;
 	into.peakRssBytes = std::max(into.peakRssBytes, from.peakRssBytes);
 	into.memoryLimitReached = into.memoryLimitReached || from.memoryLimitReached;
@@ -197,7 +227,8 @@ struct ExactTurnSession {
 	std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
 
   ExactDecision begin(const State& source, const int* deck, const int* handValues, int deckCount,
-      const int* opponentDeck, int opponentDeckCount, int budgetMilliseconds) {
+      const int* opponentDeck, int opponentDeckCount, int budgetMilliseconds,
+      std::shared_ptr<const ExactCpuEvaluator> evaluator = nullptr) {
     turn = source.turn; actor = source.selectPlayer;
 		started = std::chrono::steady_clock::now();
     ExactDecision decision;
@@ -211,7 +242,7 @@ struct ExactTurnSession {
 			Game probeGame = *source.game;
 			State probeState = source; probeState.game = &probeGame;
 			ExactPlanner probe(deck, handValues, deckCount, 1,
-				opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount);
+				opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount, nullptr, evaluator);
 			std::string key = probe.canonicalRootSuccessor(probeState, option);
 			auto [found, inserted] = successorRepresentative.emplace(std::move(key), option);
 			representative[option] = inserted ? option : found->second;
@@ -226,7 +257,7 @@ struct ExactTurnSession {
         auto output = std::make_unique<Worker>();
         output->game = *source.game;
         output->planner = std::make_unique<ExactPlanner>(deck, handValues, deckCount, budgetMilliseconds,
-          opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount, sharedTable);
+          opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount, sharedTable, evaluator);
 		output->actions.resize(source.options.size());
 		std::vector<int> assigned;
 		for (int position = parity; position < (int)orderedOptions.size(); position += 2)
@@ -314,7 +345,7 @@ struct ExactTurnSession {
     } else {
       game = std::make_unique<Game>(*source.game);
       planner = std::make_unique<ExactPlanner>(deck, handValues, deckCount, budgetMilliseconds,
-        opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount);
+        opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount, nullptr, evaluator);
       State local = source; local.game = game.get();
       decision = planner->decide(local);
     }
@@ -512,7 +543,8 @@ extern "C" {
         auto worker = [&](int parity) {
           WorkerResult output;
           Game game = data->game;
-          ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds);
+          ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds,
+            nullptr, 0, nullptr, data->exactEvaluator);
           for (int option = parity; option < (int)root.options.size(); option += 2) {
             State local = root; local.game = &game;
             ExactDecision item = planner.evaluateRootAction(local, option);
@@ -536,29 +568,7 @@ extern "C" {
           if (ExactCompare(item.upper, maxUpper) > 0) maxUpper = item.upper;
           allCertified = allCertified && item.certified;
           }
-          decision.metrics.expanded += wr.metrics.expanded;
-          decision.metrics.merged += wr.metrics.merged;
-          decision.metrics.leaves += wr.metrics.leaves;
-          decision.metrics.opaque += wr.metrics.opaque;
-          decision.metrics.exceptions += wr.metrics.exceptions;
-          decision.metrics.unknownOpponentList += wr.metrics.unknownOpponentList;
-          decision.metrics.unsupportedConcreteReference += wr.metrics.unsupportedConcreteReference;
-          decision.metrics.interruptedTransition += wr.metrics.interruptedTransition;
-          decision.metrics.rawOutcomes += wr.metrics.rawOutcomes;
-          decision.metrics.groupedOutcomes += wr.metrics.groupedOutcomes;
-          decision.metrics.depthLimitNodes += wr.metrics.depthLimitNodes;
-          decision.metrics.maxDepth = std::max(decision.metrics.maxDepth, wr.metrics.maxDepth);
-          if (wr.metrics.lastDepthSelectType != 0) decision.metrics.lastDepthSelectType = wr.metrics.lastDepthSelectType;
-          if (wr.metrics.lastDepthTurnActionCount != 0) decision.metrics.lastDepthTurnActionCount = wr.metrics.lastDepthTurnActionCount;
-          decision.metrics.timedOut = decision.metrics.timedOut || wr.metrics.timedOut;
-          decision.metrics.arithmeticOverflow = decision.metrics.arithmeticOverflow || wr.metrics.arithmeticOverflow;
-          if (!wr.metrics.lastException.empty()) decision.metrics.lastException = wr.metrics.lastException;
-          if (wr.metrics.lastPendingDetail != 0) decision.metrics.lastPendingDetail = wr.metrics.lastPendingDetail;
-          if (wr.metrics.lastPendingPlayer >= 0) decision.metrics.lastPendingPlayer = wr.metrics.lastPendingPlayer;
-          if (wr.metrics.lastPendingEffectCardId != 0) decision.metrics.lastPendingEffectCardId = wr.metrics.lastPendingEffectCardId;
-          if (wr.metrics.lastPendingEffectPlayer >= 0) decision.metrics.lastPendingEffectPlayer = wr.metrics.lastPendingEffectPlayer;
-          if (wr.metrics.lastPendingNullCount != 0) decision.metrics.lastPendingNullCount = wr.metrics.lastPendingNullCount;
-          decision.metrics.lastPendingDeckUnknown = decision.metrics.lastPendingDeckUnknown || wr.metrics.lastPendingDeckUnknown;
+          MergeExactMetrics(decision.metrics, wr.metrics);
         }
         if (first) {
           decision.score = {};
@@ -567,7 +577,8 @@ extern "C" {
           decision.score.certified = allCertified && ExactCompare(decision.score.lower, decision.score.upper) == 0;
         }
       } else {
-        ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds);
+        ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds,
+          nullptr, 0, nullptr, data->exactEvaluator);
         decision = planner.decide(data->state);
       }
       return ExactDecisionJson(data, decision);
@@ -586,7 +597,8 @@ extern "C" {
     }
     try {
       SetBattleData(data, serialized, count);
-      ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds);
+      ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds,
+        nullptr, 0, nullptr, data->exactEvaluator);
       ExactDecision decision = planner.evaluateRootAction(data->state, optionIndex);
       return ExactDecisionJson(data, decision);
     } catch (...) {
@@ -606,7 +618,8 @@ extern "C" {
     try {
       SetBattleData(data, serialized, count);
       ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds,
-          opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount);
+          opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount,
+          nullptr, data->exactEvaluator);
       return ExactDecisionJson(data, planner.decide(data->state));
     } catch (...) {
       data->jsonBuilder.clear(); data->jsonBuilder.appendStr("{\"error\":99}");
@@ -626,7 +639,7 @@ extern "C" {
       SetBattleData(data, serialized, count);
       auto session = std::make_unique<ExactTurnSession>();
       ExactDecision decision = session->begin(data->state, deck, handValues, deckCount,
-        opponentDeck, opponentDeckCount, budgetMilliseconds);
+        opponentDeck, opponentDeckCount, budgetMilliseconds, data->exactEvaluator);
       long long id = NextExactSessionId.fetch_add(1);
       {
         std::lock_guard<std::mutex> lock(ExactSessionMutex);
