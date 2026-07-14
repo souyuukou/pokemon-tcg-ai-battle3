@@ -1,5 +1,9 @@
 # Exact turn search
 
+The exhaustive audit and deck-gating rules for hidden opponent information and
+opponent decisions during the root turn are recorded in
+[`current-turn-opponent-interactions.md`](current-turn-opponent-interactions.md).
+
 ## Semantics
 
 The root is an information state, not a guessed complete game state. A leaf is
