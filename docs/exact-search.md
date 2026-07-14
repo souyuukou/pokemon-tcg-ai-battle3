@@ -97,21 +97,23 @@ stops further search safely and returns the current proven interval.
 
 ## Replay-trained CPU evaluator
 
-V2 is a deck-independent sparse NNUE with 40 dense inputs, 30 collision-free
-card/relationship planes, and 32 int32 accumulators. The model contains an
-explicit sorted vocabulary for every registered card and attack ID; only a
-future unknown ID maps to `UNK`. Card identities are separated by owner and
-zone. Attachments are separated by Active/Bench target, attacks include their
-exact native energy shortage, and Pokémon HP/persistent restrictions are linked
-to the Pokémon card ID. Own hidden deck/prize expectations are converted from
-exact belief mass to Q8 only at the evaluator boundary. Opponent materialized
-hand, deck, and prize identities never enter the feature stream.
+V3 separates the lossless `PlayerInformationStateV3` used by search from the
+Q8 belief projection used only by the evaluator. The evaluator record contains
+global/public state, own hand and knowledge, exact known deck order, and one
+structured record per Pokémon. Energy, Tools, evolution cards, persistent
+effects, attacks, HP and status remain attached to that entity. Bench records
+use a shared 24-unit integer encoder and symmetric pooling; a 64-unit global
+layer combines the four owner/location pools with zones and belief features.
 
-Weights are int16, hidden biases/accumulators are int32, and the output path is
-int64 with clipped ReLU. Evaluation has no floating-point operation or per-leaf
-heap allocation. Terminal wins and losses bypass the model and remain fixed at
-`+/-100,000,000`; nonterminal output is clamped to `+/-90,000,000`. The C++
-extractor is also the only feature extractor used for training data.
+The explicit token vocabulary contains every registered card, attack, effect
+and generated combo token. Belief inputs include expected Deck/Prize counts and
+the probability of at least one copy, plus exact evolution and attack-energy
+supply events, all rounded to Q8 only at the model boundary. Materialized
+opponent hand, Deck, and Prize identities are forbidden. Weights are int16,
+accumulators are checked integer arithmetic, and the output path is int64 with
+clipped ReLU. Inference has no floating point, global lock, or per-leaf heap
+allocation. Terminal scores remain `+/-100,000,000`; nonterminal output is
+clamped to `+/-90,000,000`.
 
 `ExactReplayTraceBegin` makes the normal engine pause after turn-end effects and
 Pokémon Checkup but before the next `TurnStart`. `BattleStartOrdered` loads the
@@ -126,18 +128,19 @@ Train a replacement model with:
 
 ```powershell
 python tools/extract_turn_end_dataset.py data/kaggle_replays data/turn-leaves.jsonl
-python tools/train_turn_end_evaluator.py data/turn-leaves.jsonl exact-evaluator-v2.bin `
+python tools/train_turn_end_evaluator.py data/turn-leaves.jsonl exact-evaluator-v3.bin `
   --manifest data/turn-leaves.jsonl.manifest.json --epochs 30 --qat-epochs 8
 ```
 
 Replays are split as complete matches by `(date, replayId)`: oldest 80% train,
 next 10% validation, latest 10% test. The adoption report checks the zero
 baseline, sign accuracy, quantization degradation, native/reference bit
-identity, and an optional paired replay-level bootstrap against V1 predictions.
+identity, and an optional paired replay-level bootstrap against saved V2
+baseline predictions.
 `--require-gates` refuses to publish a model unless every supplied gate passes.
 
-V1 loading remains available for old deck branches, but it is reported as
-`informationSetSafe=false` and can never produce `certified=true`. For V2,
+V1 and V2 evaluator formats and their model-specific public APIs are removed.
+`ExactDecideV2` remains because it is a search API, not a model schema. V3
 certification means only that the exact expectation of the fixed quantized
 evaluator was computed over all chance outcomes and legal information-set
 policies; it is exposed as

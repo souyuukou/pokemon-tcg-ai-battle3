@@ -679,23 +679,36 @@ def exact_unload_evaluator_model() -> None:
     if hasattr(lib, "ExactUnloadEvaluatorModel") and "agent_ptr" in globals():
         lib.ExactUnloadEvaluatorModel(agent_ptr)
 
-def exact_evaluate_features_v2(dense: list[int], sparse: list[list[int]]) -> int:
-    """Evaluate a native V2 feature record for bit-exact training validation."""
+def exact_evaluate_features_v3(global_dense: list[int], global_sparse: list[list[int]],
+                               entities: list[dict]) -> int:
+    """Evaluate a structured native V3 record for bit-exact validation."""
     global agent_ptr
-    if not hasattr(lib, "ExactEvaluateFeaturesV2"):
-        raise RuntimeError("ExactEvaluateFeaturesV2 is not available")
+    if not hasattr(lib, "ExactEvaluateFeaturesV3"):
+        raise RuntimeError("ExactEvaluateFeaturesV3 is not available")
     if "agent_ptr" not in globals():
         agent_ptr = lib.AgentStart()
-    if len(dense) != 40 or any(len(item) != 3 for item in sparse):
-        raise ValueError("invalid V2 feature dimensions")
-    dense_arg = (ctypes.c_int16 * len(dense))(*dense)
-    flat = [int(value) for item in sparse for value in item]
-    sparse_arg = (ctypes.c_int * len(flat))(*flat)
+    if len(global_dense) != 16 or any(len(item) != 3 for item in global_sparse):
+        raise ValueError("invalid V3 global features")
+    if any(len(entity.get("dense", [])) != 16 or not 0 <= int(entity.get("pool", -1)) < 4
+           or any(len(item) != 3 for item in entity.get("sparse", [])) for entity in entities):
+        raise ValueError("invalid V3 entity features")
+    dense_arg = (ctypes.c_int * len(global_dense))(*global_dense)
+    global_flat = [int(value) for item in global_sparse for value in item]
+    global_arg = (ctypes.c_int * len(global_flat))(*global_flat)
+    entity_dense_flat = [int(value) for entity in entities for value in entity["dense"]]
+    entity_dense_arg = (ctypes.c_int * len(entity_dense_flat))(*entity_dense_flat)
+    pools_arg = (ctypes.c_int * len(entities))(*(int(entity["pool"]) for entity in entities))
+    entity_sparse = [[entity_index, *item] for entity_index, entity in enumerate(entities)
+                     for item in entity.get("sparse", [])]
+    entity_sparse_flat = [int(value) for item in entity_sparse for value in item]
+    entity_sparse_arg = (ctypes.c_int * len(entity_sparse_flat))(*entity_sparse_flat)
     error = ctypes.c_int()
-    value = lib.ExactEvaluateFeaturesV2(agent_ptr, dense_arg, len(dense),
-                                        sparse_arg, len(sparse), ctypes.byref(error))
+    value = lib.ExactEvaluateFeaturesV3(
+        agent_ptr, dense_arg, len(global_dense), global_arg, len(global_sparse),
+        entity_dense_arg, pools_arg, len(entities), entity_sparse_arg, len(entity_sparse),
+        ctypes.byref(error))
     if error.value:
-        raise RuntimeError(f"native V2 evaluation failed: {error.value}")
+        raise RuntimeError(f"native V3 evaluation failed: {error.value}")
     return int(value)
 
 def exact_evaluate_action(agent_observation: Observation, deck: list[int], hand_values: list[int],

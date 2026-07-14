@@ -14,6 +14,24 @@ _budget = MatchBudget()
 _last_turn = None
 last_decision = None
 _policy_cache = {}
+_evaluator_loaded = False
+
+
+def _ensure_v3_evaluator() -> None:
+    global _evaluator_loaded
+    if _evaluator_loaded:
+        return
+    from pathlib import Path
+    from cg.api import exact_load_evaluator_model
+    candidates = [Path(__file__).resolve().parents[1] / "exact-evaluator-v3.bin",
+                  Path("/kaggle_simulations/agent/exact-evaluator-v3.bin")]
+    path = next((candidate for candidate in candidates if candidate.exists()), None)
+    if path is None:
+        raise RuntimeError("V3 evaluator model is missing")
+    info = exact_load_evaluator_model(str(path))
+    if int(info.get("schemaVersion", 0)) != 3 or not info.get("informationSetSafe"):
+        raise RuntimeError("V3 evaluator model was not accepted")
+    _evaluator_loaded = True
 
 
 @dataclass
@@ -87,6 +105,7 @@ def choose_action(obs, *, context: PolicyContext | None = None,
         if not ctx.budget.can_expand():
             raise RuntimeError("exact search resource reserve reached")
         from cg.api import exact_decide, exact_turn_begin, exact_turn_advance, exact_turn_release
+        _ensure_v3_evaluator()
         profile = load_profile()
         values = profile.evaluator.get("hand_values", {})
         hand_values = [int(values.get(str(card_id), values.get("default", 100))) for card_id in profile.cards]

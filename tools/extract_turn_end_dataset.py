@@ -144,7 +144,7 @@ def main() -> None:
                     raise
     temporary.replace(args.output)
     manifest = {
-        "schemaVersion": 2,
+        "schemaVersion": 3,
         "source": str(args.replays),
         "filesSeen": len(paths),
         "acceptedReplays": accepted,

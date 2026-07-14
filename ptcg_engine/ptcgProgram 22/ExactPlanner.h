@@ -317,6 +317,11 @@ struct ExactMetrics {
 	unsigned long long informationSets = 0;
 	unsigned long long strategyFusionPrevented = 0;
 	unsigned long long illegalInformationSetSplits = 0;
+	unsigned long long attackPreviewExactCount = 0;
+	unsigned long long attackPreviewUnavailableCount = 0;
+	unsigned long long entityFeatureCount = 0;
+	unsigned long long comboFeatureCount = 0;
+	bool hiddenInformationLeakDetected = false;
 	bool probabilityExact = true;
 	bool informationSetSafe = true;
 };
@@ -325,6 +330,24 @@ struct ExactDecision {
 	ExactScore score;
 	ExactMetrics metrics;
 	std::vector<ExactRootActionValue> rootActions;
+};
+
+// The lossless search/TT identity.  EvaluatorRecordV3 is deliberately not
+// used here because its Q8 belief projection may merge distinct beliefs.
+struct PlayerInformationStateV3 {
+	static constexpr int SchemaVersion = 3;
+	int observer = 0;
+	std::uint64_t environmentPriorId = 0;
+	int evaluatorSchema = 0;
+	std::uint64_t evaluatorModel = 0;
+	std::vector<std::string> normalizedWorlds;
+	std::string canonicalKey() const {
+		std::string key = "BELIEF-V3|INFORMATION-V3|CANONICAL-V1|RULES-V1|";
+		auto append = [&](long long value) { key += std::to_string(value); key.push_back(';'); };
+		append(observer); append((long long)environmentPriorId); append(evaluatorSchema); append((long long)evaluatorModel);
+		for (const std::string& world : normalizedWorlds) { append((long long)world.size()); key += world; }
+		return key;
+	}
 };
 
 class ExactPlanner {
@@ -341,6 +364,13 @@ public:
 			handValue[deck[i]] = handValues == nullptr ? 100 : handValues[i];
 		}
 		for (int i = 0; opponentDeck != nullptr && i < opponentDeckCount; ++i) opponentProfileCount[opponentDeck[i]]++;
+		std::vector<int> priorCards;
+		for (int i = 0; opponentDeck != nullptr && i < opponentDeckCount; ++i) priorCards.push_back(opponentDeck[i]);
+		std::sort(priorCards.begin(), priorCards.end());
+		environmentPriorId = 1469598103934665603ULL;
+		for (int id : priorCards) for (int shift = 0; shift < 32; shift += 8) {
+			environmentPriorId ^= (unsigned char)((unsigned)id >> shift); environmentPriorId *= 1099511628211ULL;
+		}
 	}
 
 	void setBudgetMilliseconds(int budgetMilliseconds) {
@@ -457,6 +487,12 @@ private:
 		// profile supplied to closed-world validation.
 		std::array<bool, 2> deckKnown{};
 		std::string publicFacts;
+		std::array<std::vector<int>, 2> knownTop;
+		std::array<std::vector<int>, 2> knownBottom;
+		std::array<std::map<int, int>, 2> knownDeckCounts;
+		std::array<std::map<int, int>, 2> knownPrizeCounts;
+		std::array<std::map<int, std::pair<int, int>>, 2> countBounds;
+		std::uint64_t observationSequence = 0;
 	};
 	struct BeliefWorld {
 		std::unique_ptr<State> state;
@@ -465,6 +501,36 @@ private:
 	};
 	static void appendKnowledgeFact(ExactKnowledgeState& knowledge, char type, int cardId) {
 		knowledge.publicFacts.push_back(type); appendSemantic(knowledge.publicFacts, cardId);
+		knowledge.observationSequence++;
+	}
+	static void appendKnowledgeKey(std::string& key, const ExactKnowledgeState& knowledge) {
+		for (bool known : knowledge.deckKnown) key.push_back(known ? '1' : '0');
+		appendSemantic(key, knowledge.observationSequence);
+		appendSemantic(key, (long long)knowledge.publicFacts.size()); key += knowledge.publicFacts;
+		auto appendSequence = [&](const auto& lists) {
+			for (const auto& list : lists) { appendSemantic(key, (long long)list.size()); for (int id : list) appendSemantic(key, id); }
+		};
+		auto appendMapArray = [&](const auto& maps) {
+			for (const auto& values : maps) { appendSemantic(key, (long long)values.size());
+				for (const auto& item : values) { appendSemantic(key, item.first);
+					if constexpr (std::is_same_v<std::decay_t<decltype(item.second)>, std::pair<int, int>>) {
+						appendSemantic(key, item.second.first); appendSemantic(key, item.second.second);
+					} else appendSemantic(key, item.second);
+				}
+			}
+		};
+		appendSequence(knowledge.knownTop); appendSequence(knowledge.knownBottom);
+		appendMapArray(knowledge.knownDeckCounts); appendMapArray(knowledge.knownPrizeCounts);
+		appendMapArray(knowledge.countBounds);
+	}
+	std::array<ExactKnowledgeState, 2> initialKnowledge() const {
+		std::array<ExactKnowledgeState, 2> result{};
+		for (const auto& item : actorProfileCount)
+			result[actor].countBounds[actor][item.first] = { item.second, item.second };
+		int opponent = 1 - actor;
+		for (const auto& item : opponentProfileCount)
+			result[opponent].countBounds[opponent][item.first] = { item.second, item.second };
+		return result;
 	}
 	struct ExactPolicyEntry {
 		ExactScore score;
@@ -535,6 +601,7 @@ private:
 	std::unordered_map<int, int> actorProfileCount;
 	std::unordered_map<int, int> opponentProfileCount;
 	std::unordered_map<int, int> handValue;
+	std::uint64_t environmentPriorId = 0;
 	std::shared_ptr<const ExactCpuEvaluator> evaluator;
 	std::chrono::steady_clock::time_point deadline;
 	ExactMetrics metrics;
@@ -743,9 +810,7 @@ private:
 		for (const std::string& option : options) { appendSemantic(key, (long long)option.size()); key += option; }
 		if (!state.contextCard.isNull()) { key += "C"; key += cardToken(state, state.contextCard, false); }
 		if (state.onEffect()) { key += "E"; key += cardToken(state, state.getEffectCard().card, false); }
-		if (knowledge != nullptr) {
-			key += "K"; appendSemantic(key, (long long)knowledge->publicFacts.size()); key += knowledge->publicFacts;
-		}
+		if (knowledge != nullptr) { key += "K"; appendKnowledgeKey(key, *knowledge); }
 		return key;
 	}
 
@@ -815,38 +880,27 @@ private:
 		}
 	}
 
-	long long evaluate(const State& state) const {
+	long long evaluate(const State& state) {
 		if (state.isFinish()) {
 			int winner = state.winPlayer();
 			return winner == actor ? 100'000'000 : (winner == 2 ? 0 : -100'000'000);
 		}
-		if (evaluator && evaluator->isLoaded()) return evaluator->evaluate(state, actor, &actorProfileCount);
-		int enemy = 1 - actor;
-		const PlayerState& me = state.players[actor];
-		const PlayerState& opp = state.players[enemy];
-		long long value = 1'000'000LL * (opp.prize.size() - me.prize.size());
-		value += 2'000LL * ((me.active.size() + me.bench.size()) - (opp.active.size() + opp.bench.size()));
-		value += 500LL * (me.energy.size() - opp.energy.size());
-		for (CardRef ref : me.hand) {
-			if (ref.isNull()) continue;
-			int id = state.getCard(ref).cardId;
-			auto it = handValue.find(id); value += (it == handValue.end() ? 100 : it->second);
+		if (evaluator && evaluator->isLoaded()) {
+			auto features = ExactSparseEvaluatorV3::extractFeatures(state, actor, &actorProfileCount);
+			long long result = 0;
+			if (!evaluator->evaluateV3Features(features, result)) {
+				metrics.informationSetSafe = false; return 0;
+			}
+			return result;
 		}
-		value -= 80LL * opp.hand.size();
-		int shortage = std::max(0, 4 - me.deck.size());
-		value -= 2'000LL * shortage * shortage;
-		auto damage = [&](const PlayerState& ps) {
-			long long total = 0;
-			for (CardRef ref : ps.active) if (!ref.isNull()) total += state.getCard(ref).damage;
-			for (CardRef ref : ps.bench) if (!ref.isNull()) total += state.getCard(ref).damage;
-			return total;
-		};
-		value += 100LL * (damage(opp) - damage(me));
-		return value;
+		// A missing model is not silently replaced by the retired V1 heuristic.
+		// Zero is useful for structural tests, but applyEvaluatorSafety prevents it
+		// from being reported as a certified evaluator result.
+		return 0;
 	}
 
 	static int beliefQ8(const ExactWeight& numerator, const ExactWeight& denominator) {
-		ExactWeight scaled = ExactWeight::multiply(numerator, ExactWeight(ExactSparseEvaluatorV2::BeliefScale));
+		ExactWeight scaled = ExactWeight::multiply(numerator, ExactWeight(ExactSparseEvaluatorV3::BeliefScale));
 		auto division = ExactWeight::divideRemainder(scaled, denominator);
 		ExactWeight twiceRemainder = ExactWeight::multiply(division.second, ExactWeight(2));
 		if (twiceRemainder >= denominator) division.first += ExactWeight(1);
@@ -855,13 +909,14 @@ private:
 	}
 
 	long long evaluateBeliefInformationState(const std::vector<BeliefWorld>& worlds,
-		const ExactWeight& total) const {
+		const ExactWeight& total) {
 		if (worlds.empty() || total.zero()) throw std::runtime_error("empty leaf belief");
 		const State& representative = *worlds.front().state;
 		if (representative.isFinish()) return evaluate(representative);
-		std::unordered_map<int, ExactWeight> deckMass, prizeMass;
+		std::unordered_map<int, ExactWeight> deckMass, prizeMass, deckExistsMass, prizeExistsMass, comboMass;
 		for (const BeliefWorld& world : worlds) {
 			std::unordered_map<int, int> deckCount, prizeCount;
+			std::unordered_set<int> worldCombos;
 			for (CardRef ref : world.state->players[actor].deck) if (!ref.isNull())
 				deckCount[world.state->getCard(ref).cardId]++;
 			for (CardRef ref : world.state->players[actor].prize) if (!ref.isNull())
@@ -870,18 +925,90 @@ private:
 				ExactWeight::multiply(world.weight, ExactWeight(item.second));
 			for (const auto& item : prizeCount) prizeMass[item.first] +=
 				ExactWeight::multiply(world.weight, ExactWeight(item.second));
+			for (const auto& item : deckCount) if (item.second > 0) deckExistsMass[item.first] += world.weight;
+			for (const auto& item : prizeCount) if (item.second > 0) prizeExistsMass[item.first] += world.weight;
+			// Evolution correlations are exact events over this concrete world.
+			for (const auto& profile : actorProfileCount) {
+				auto foundMaster = CardTable.find(profile.first);
+				if (foundMaster == CardTable.end() || foundMaster->second.evolutionType == EvolutionType::Basic
+					|| foundMaster->second.evolutionType == EvolutionType::NoEvolutionType
+					|| deckCount[profile.first] <= 0) continue;
+				bool hasPre = false;
+				for (const auto& candidate : actorProfileCount) {
+					auto preMaster = CardTable.find(candidate.first);
+					if (preMaster != CardTable.end() && deckCount[candidate.first] > 0
+						&& (preMaster->second.name == foundMaster->second.evolvesFrom
+							|| preMaster->second.nameEn == foundMaster->second.evolvesFrom)) { hasPre = true; break; }
+				}
+				if (hasPre) worldCombos.insert(ExactSparseEvaluatorV3::ComboTokenBase + profile.first);
+				if (hasPre && foundMaster->second.evolutionType == EvolutionType::Stage2) {
+					bool hasBasic = false;
+					for (const auto& stageCandidate : actorProfileCount) { auto stage = CardTable.find(stageCandidate.first);
+						if (stage == CardTable.end() || deckCount[stageCandidate.first] <= 0
+							|| !(stage->second.name == foundMaster->second.evolvesFrom || stage->second.nameEn == foundMaster->second.evolvesFrom)) continue;
+						for (const auto& basicCandidate : actorProfileCount) { auto basic = CardTable.find(basicCandidate.first);
+							if (basic != CardTable.end() && deckCount[basicCandidate.first] > 0
+								&& (basic->second.name == stage->second.evolvesFrom || basic->second.nameEn == stage->second.evolvesFrom)) {
+								hasBasic = true; break;
+							}
+						}
+						if (hasBasic) break;
+					}
+					if (hasBasic) worldCombos.insert(ExactSparseEvaluatorV3::ComboTokenBase + 250'000 + profile.first);
+				}
+			}
+			// Energy supply event: attaching every compatible energy remaining in
+			// the deck must make the attack payable. Adding energy cannot invalidate
+			// an attack, so this is an exact existence test, not a sample.
+			auto attackSupply = [&](CardRef pokemonRef) {
+				if (pokemonRef.isNull()) return;
+				const State& s = *world.state; const Card& pokemon = s.getCard(pokemonRef);
+				auto& existing = s.game->energyList; s.getEnergies(actor, pokemonRef, existing);
+				SetAttackEnergy(s, pokemon, existing, true);
+				std::unordered_map<int, int> before;
+				for (const AttackEnergy& ae : s.game->attackEnergyList) before[ae.attack->attackId] = ae.insufficientEnergy;
+				auto all = existing;
+				for (CardRef energyRef : s.players[actor].deck) if (!energyRef.isNull()) {
+					const Card& energy = s.getCard(energyRef);
+					if (!IsEnergy(energy.getMaster().cardType)) continue;
+					EnergyInfo info = s.getEnergyInfo(energy, pokemonRef);
+					for (int n = 0; n < info.count; ++n) all.push_back(info.type);
+				}
+				SetAttackEnergy(s, pokemon, all, true);
+				for (const AttackEnergy& ae : s.game->attackEnergyList) if (before[ae.attack->attackId] > 0 && ae.insufficientEnergy <= 0)
+					worldCombos.insert(ExactSparseEvaluatorV3::ComboTokenBase + 500'000 + ae.attack->attackId);
+			};
+			for (CardRef ref : world.state->players[actor].active) attackSupply(ref);
+			for (CardRef ref : world.state->players[actor].bench) attackSupply(ref);
+			for (int token : worldCombos) comboMass[token] += world.weight;
 		}
-		std::unordered_map<int, int> deckQ8, prizeQ8;
+		std::unordered_map<int, int> deckQ8, prizeQ8, deckExistsQ8, prizeExistsQ8, comboQ8;
 		for (const auto& item : deckMass) deckQ8[item.first] = beliefQ8(item.second, total);
 		for (const auto& item : prizeMass) prizeQ8[item.first] = beliefQ8(item.second, total);
-		ExactSparseEvaluatorV2::BeliefInput belief{ &deckQ8, &prizeQ8 };
-		if (evaluator && evaluator->isLoaded())
-			return evaluator->evaluate(representative, actor, &actorProfileCount, &belief);
+		for (const auto& item : deckExistsMass) deckExistsQ8[item.first] = beliefQ8(item.second, total);
+		for (const auto& item : prizeExistsMass) prizeExistsQ8[item.first] = beliefQ8(item.second, total);
+		for (const auto& item : comboMass) comboQ8[item.first] = beliefQ8(item.second, total);
+		ExactSparseEvaluatorV3::BeliefInput belief{ &deckQ8, &prizeQ8, &deckExistsQ8, &prizeExistsQ8, &comboQ8,
+			&worlds.front().knowledge[actor].knownDeckCounts[actor], &worlds.front().knowledge[actor].knownPrizeCounts[actor],
+			&worlds.front().knowledge[actor].knownTop, &worlds.front().knowledge[actor].knownBottom };
+		if (evaluator && evaluator->isLoaded()) {
+			auto features = ExactSparseEvaluatorV3::extractFeatures(representative, actor, &actorProfileCount, &belief);
+			metrics.entityFeatureCount += features.entityCount; metrics.comboFeatureCount += comboQ8.size();
+			for (int ei = 0; ei < features.entityCount; ++ei) for (int si = 0; si < features.entities[ei].sparse.count; ++si)
+				if (features.entities[ei].sparse.values[si].relation == ExactSparseEvaluatorV3::AttackUnavailable)
+					metrics.attackPreviewUnavailableCount++;
+				else if (features.entities[ei].sparse.values[si].relation == ExactSparseEvaluatorV3::AttackExactDamage)
+					metrics.attackPreviewExactCount++;
+			long long value = 0;
+			if (!evaluator->evaluateV3Features(features, value)) { metrics.informationSetSafe = false; return 0; }
+			return value;
+		}
 		return evaluate(representative);
 	}
 
 	void applyEvaluatorSafety(ExactDecision& decision) {
-		if (evaluator && evaluator->isLoaded() && !evaluator->informationSetSafe()) {
+		if (!evaluator || !evaluator->isLoaded() || evaluator->schemaVersion() != ExactSparseEvaluatorV3::SchemaVersion
+			|| !evaluator->informationSetSafe()) {
 			metrics.informationSetSafe = false;
 			decision.score.certified = false;
 			for (ExactRootActionValue& action : decision.rootActions) action.certified = false;
@@ -1085,11 +1212,7 @@ private:
 		noteWeight(expected);
 		std::string revealKey = keyFor(parent) + "\x1f" "BR2" "\x1f" + actionEquivalenceKey(parent, action)
 			+ "\x1f" + baseWeight.text();
-		for (int observer = 0; observer < 2; ++observer) {
-			for (bool known : baseKnowledge[observer].deckKnown) revealKey.push_back(known ? '1' : '0');
-			appendSemantic(revealKey, baseKnowledge[observer].publicFacts.size());
-			revealKey += baseKnowledge[observer].publicFacts;
-		}
+		for (int observer = 0; observer < 2; ++observer) appendKnowledgeKey(revealKey, baseKnowledge[observer]);
 		auto [found, inserted] = partialBeliefReveals.try_emplace(revealKey);
 		PartialBeliefRevealEntry& partial = found->second;
 		if (inserted || !partial.initialized) {
@@ -1133,7 +1256,10 @@ private:
 				std::sort(observedDeck.begin(), observedDeck.end());
 				knowledge[observer].publicFacts.push_back('V');
 				appendSemantic(knowledge[observer].publicFacts, player);
-				for (int id : observedDeck) appendSemantic(knowledge[observer].publicFacts, id);
+				knowledge[observer].knownDeckCounts[player].clear();
+				for (int id : observedDeck) { appendSemantic(knowledge[observer].publicFacts, id);
+					knowledge[observer].knownDeckCounts[player][id]++; }
+				knowledge[observer].observationSequence++;
 				try { if (!advance(*child, action)) return false; } catch (...) { return false; }
 				partial.worlds.push_back({ std::move(child), worldWeight, std::move(knowledge) });
 				partial.generated += worldWeight;
@@ -1151,7 +1277,7 @@ private:
 
 	ExactScore revealAndReplay(const State& parent, const std::vector<int>& action) {
 		std::vector<BeliefWorld> worlds;
-		std::array<ExactKnowledgeState, 2> knowledge{};
+		auto knowledge = initialKnowledge();
 		if (!expandRevealBelief(parent, action, ExactWeight(1), knowledge, worlds) || worlds.empty()) return unknown();
 		metrics.beliefWorldsBefore += worlds.size();
 		return solveBelief(std::move(worlds));
@@ -1250,9 +1376,7 @@ private:
 	std::string beliefWorldKey(const BeliefWorld& world) const {
 		std::string key = keyFor(*world.state);
 		for (int observer = 0; observer < 2; ++observer) {
-			for (bool known : world.knowledge[observer].deckKnown) key.push_back(known ? '1' : '0');
-			appendSemantic(key, (long long)world.knowledge[observer].publicFacts.size());
-			key += world.knowledge[observer].publicFacts;
+			appendKnowledgeKey(key, world.knowledge[observer]);
 		}
 		return key;
 	}
@@ -1347,7 +1471,8 @@ private:
 		for (const BeliefWorld& world : worlds) {
 			if (world.state->selectPlayer != decisionPlayer
 				|| observationKeyFor(*world.state, decisionPlayer, &world.knowledge[decisionPlayer]) != expectedObservation) {
-				metrics.illegalInformationSetSplits++; metrics.informationSetSafe = false; return unknown();
+				metrics.illegalInformationSetSplits++; metrics.informationSetSafe = false;
+				metrics.hiddenInformationLeakDetected = true; return unknown();
 			}
 		}
 		metrics.informationSets++;
@@ -1367,7 +1492,8 @@ private:
 			for (const BeliefWorld& world : worlds) {
 				std::vector<int> mapped;
 				if (!remapAction(*world.state, common.semantic, mapped)) {
-					metrics.illegalInformationSetSplits++; metrics.informationSetSafe = false; return unknown();
+					metrics.illegalInformationSetSplits++; metrics.informationSetSafe = false;
+					metrics.hiddenInformationLeakDetected = true; return unknown();
 				}
 				auto child = std::make_unique<State>(*world.state);
 				if (!advance(*child, mapped)) return unknown();
@@ -1396,11 +1522,12 @@ private:
 		for (const BeliefWorld& world : worlds)
 			beliefKeyParts.push_back(beliefWorldKey(world) + "@" + world.weight.text());
 		std::sort(beliefKeyParts.begin(), beliefKeyParts.end());
-		std::string beliefKey = "BELIEF-V2|CANONICAL-V1|RULES-V1|";
-		appendSemantic(beliefKey, actor);
-		appendSemantic(beliefKey, evaluator ? evaluator->schemaVersion() : 0);
-		beliefKey += std::to_string(evaluator ? evaluator->modelHash() : 0); beliefKey.push_back(';');
-		for (const std::string& part : beliefKeyParts) { appendSemantic(beliefKey, part.size()); beliefKey += part; }
+		PlayerInformationStateV3 informationState;
+		informationState.observer = actor; informationState.environmentPriorId = environmentPriorId;
+		informationState.evaluatorSchema = evaluator ? evaluator->schemaVersion() : 0;
+		informationState.evaluatorModel = evaluator ? evaluator->modelHash() : 0;
+		informationState.normalizedWorlds = std::move(beliefKeyParts);
+		std::string beliefKey = informationState.canonicalKey();
 		auto cachedBelief = beliefTransposition.find(beliefKey);
 		if (cachedBelief != beliefTransposition.end()) { metrics.merged++; return cachedBelief->second; }
 		auto finish = [&](ExactScore result) {
@@ -1468,12 +1595,26 @@ private:
 					else resolvePrize(*child, type.first);
 					} catch (...) { return unknown(); }
 					auto knowledge = world.knowledge;
-					appendKnowledgeFact(knowledge[world.state->exact.pendingPlayer],
+					int pendingPlayer = world.state->exact.pendingPlayer;
+					appendKnowledgeFact(knowledge[pendingPlayer],
 						world.state->exact.pending == ExactPendingType::Draw ? 'D' : 'P', type.first);
-					if (world.state->exact.pending == ExactPendingType::Draw)
-						for (int observer = 0; observer < 2; ++observer)
-							if (observer != world.state->exact.pendingPlayer)
-								knowledge[observer].deckKnown[world.state->exact.pendingPlayer] = false;
+					if (world.state->exact.pending == ExactPendingType::Draw) {
+						if (!knowledge[pendingPlayer].knownTop[pendingPlayer].empty())
+							knowledge[pendingPlayer].knownTop[pendingPlayer].erase(knowledge[pendingPlayer].knownTop[pendingPlayer].begin());
+						auto ownKnown = knowledge[pendingPlayer].knownDeckCounts[pendingPlayer].find(type.first);
+						if (ownKnown != knowledge[pendingPlayer].knownDeckCounts[pendingPlayer].end() && --ownKnown->second <= 0)
+							knowledge[pendingPlayer].knownDeckCounts[pendingPlayer].erase(ownKnown);
+						for (int observer = 0; observer < 2; ++observer) if (observer != pendingPlayer) {
+							knowledge[observer].deckKnown[pendingPlayer] = false;
+							knowledge[observer].knownDeckCounts[pendingPlayer].clear();
+							knowledge[observer].knownTop[pendingPlayer].clear();
+							knowledge[observer].knownBottom[pendingPlayer].clear();
+						}
+					} else {
+						auto known = knowledge[pendingPlayer].knownPrizeCounts[pendingPlayer].find(type.first);
+						if (known != knowledge[pendingPlayer].knownPrizeCounts[pendingPlayer].end() && --known->second <= 0)
+							knowledge[pendingPlayer].knownPrizeCounts[pendingPlayer].erase(known);
+					}
 					ExactWeight weight = ExactWeight::multiply(world.weight, type.second);
 					generated += weight;
 					children.push_back({ std::move(child), weight, std::move(knowledge) });

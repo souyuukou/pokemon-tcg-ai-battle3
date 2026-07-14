@@ -117,10 +117,16 @@ if hasattr(lib, "ExactUnloadEvaluatorModel"):
     lib.ExactUnloadEvaluatorModel.argtypes = [ctypes.c_void_p]
 if hasattr(lib, "ExactArithmeticDiagnostics"):
     lib.ExactArithmeticDiagnostics.restype = ctypes.c_char_p
-if hasattr(lib, "ExactEvaluateFeaturesV2"):
-    lib.ExactEvaluateFeaturesV2.restype = ctypes.c_int64
-    lib.ExactEvaluateFeaturesV2.argtypes = [
-        ctypes.c_void_p, ctypes.POINTER(ctypes.c_int16), ctypes.c_int,
+if hasattr(lib, "ExactEvaluatorTokensV3"):
+    lib.ExactEvaluatorTokensV3.restype = ctypes.c_char_p
+if hasattr(lib, "ExactEvaluatorV3Diagnostics"):
+    lib.ExactEvaluatorV3Diagnostics.restype = ctypes.c_char_p
+if hasattr(lib, "ExactEvaluateFeaturesV3"):
+    lib.ExactEvaluateFeaturesV3.restype = ctypes.c_int64
+    lib.ExactEvaluateFeaturesV3.argtypes = [
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.c_int,
         ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.POINTER(ctypes.c_int)]
 
 if hasattr(lib, "ExactReplayTraceBegin"):

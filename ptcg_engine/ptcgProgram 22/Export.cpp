@@ -33,11 +33,13 @@ extern "C" GAME_API const char8_t* ExactLoadEvaluatorModel(ApiData* data, const 
   int schema = loaded ? evaluator->schemaVersion() : 0;
   bool informationSetSafe = loaded && evaluator->informationSetSafe();
   unsigned long long modelHash = loaded ? evaluator->modelHash() : 0;
+  unsigned long long residentBytes = loaded ? evaluator->residentBytes() : 0;
   if (loaded) data->exactEvaluator = std::move(evaluator);
   j.appendKeyValue("loaded", loaded);
   j.appendCommaKeyValue("schemaVersion", schema);
   j.appendCommaKeyValue("informationSetSafe", informationSetSafe);
   j.appendCommaKey("modelHash"); AppendUnsignedLongLong(j, modelHash);
+  j.appendCommaKey("residentBytes"); AppendUnsignedLongLong(j, residentBytes);
   j.appendCommaKey("error");
   j.appendDoubleQuote(std::u8string((const char8_t*)error.c_str(), error.size()));
   j.append('}');
@@ -62,27 +64,119 @@ extern "C" GAME_API const char8_t* ExactArithmeticDiagnostics() {
   j.appendCommaKeyValue("promoted", product.isLarge()); j.append('}'); return j.buf.c_str();
 }
 
-extern "C" GAME_API long long ExactEvaluateFeaturesV2(ApiData* data,
-  const short* dense, int denseCount, const int* sparseTriplets, int sparseCount, int* error) {
+extern "C" GAME_API const char8_t* ExactEvaluatorTokensV3() {
+  static thread_local JsonBuilder j; std::vector<int> tokens{ 0 };
+  for (const auto& item : CardTable) { tokens.push_back(item.first);
+    tokens.push_back(ExactSparseEvaluatorV3::ComboTokenBase + item.first);
+    if (item.second.evolutionType == EvolutionType::Stage2)
+      tokens.push_back(ExactSparseEvaluatorV3::ComboTokenBase + 250'000 + item.first); }
+  for (const auto& item : AttackTable) { tokens.push_back(ExactSparseEvaluatorV3::AttackTokenBase + item.first);
+    tokens.push_back(ExactSparseEvaluatorV3::ComboTokenBase + 500'000 + item.first); }
+  for (int id = 1; id <= 1'000; ++id) tokens.push_back(ExactSparseEvaluatorV3::EffectTokenBase + id);
+  for (const auto& item : SkillTable) tokens.push_back(ExactSparseEvaluatorV3::EffectTokenBase + 400 + item.first);
+  std::sort(tokens.begin(), tokens.end()); tokens.erase(std::unique(tokens.begin(), tokens.end()), tokens.end());
+  j.clear(); j.append('['); for (int i = 0; i < (int)tokens.size(); ++i) { j.comma(i); j.append(tokens[i]); }
+  j.append(']'); return j.buf.c_str();
+}
+
+extern "C" GAME_API const char8_t* ExactEvaluatorV3Diagnostics() {
+  static thread_local JsonBuilder j;
+  int pokemon0 = 0, pokemon1 = 0, energy = 0, hidden0 = 0, hidden1 = 0;
+  for (const auto& item : CardTable) {
+    if (item.second.isPokemon() && pokemon0 == 0) pokemon0 = item.first;
+    else if (item.second.isPokemon() && item.first != pokemon0 && pokemon1 == 0) pokemon1 = item.first;
+    if (IsEnergy(item.second.cardType) && energy == 0) energy = item.first;
+    if (hidden0 == 0) hidden0 = item.first; else if (item.first != hidden0 && hidden1 == 0) hidden1 = item.first;
+  }
+  bool initialized = pokemon0 && pokemon1 && energy && hidden0 && hidden1;
+  auto bytes = [](const ExactSparseEvaluatorV3::FeatureRecord& f) {
+    std::string out((const char*)f.globalDense.data(), sizeof(f.globalDense));
+    out.append((const char*)&f.globalSparse.count, sizeof(f.globalSparse.count));
+    out.append((const char*)f.globalSparse.values.data(), f.globalSparse.count * sizeof(f.globalSparse.values[0]));
+    out.push_back((char)f.entityCount);
+    for (int i = 0; i < f.entityCount; ++i) { const auto& e = f.entities[i];
+      out.append((const char*)&e.pool, sizeof(e.pool)); out.append((const char*)e.dense.data(), sizeof(e.dense));
+      out.append((const char*)&e.sparse.count, sizeof(e.sparse.count));
+      out.append((const char*)e.sparse.values.data(), e.sparse.count * sizeof(e.sparse.values[0])); }
+    return out;
+  };
+  bool benchOrderInvariant = false, attachmentSensitive = false;
+  bool opponentHiddenInvariant = false, typedEffectSensitive = false;
+  if (initialized) {
+    Game game; GameConfig config{}; game.init(config); State state{}; state.game = &game;
+    state.turn = 2; state.firstPlayer = 0; state.players[0].playerIndex = 0; state.players[1].playerIndex = 1;
+    auto card = [&](int index, int id, int owner, AreaType area) -> CardRef {
+      state.allCard[index].init(id, 100 + index, owner); state.allCard[index].area = area; return CardRef(index);
+    };
+    CardRef active0 = card(1, pokemon0, 0, AreaType::Active);
+    CardRef bench0 = card(2, pokemon0, 0, AreaType::Bench);
+    CardRef bench1 = card(3, pokemon1, 0, AreaType::Bench); state.getCard(bench1).damage = 10;
+    CardRef active1 = card(4, pokemon1, 1, AreaType::Active);
+    CardRef attached = card(5, energy, 0, AreaType::Energy);
+    CardRef hidden = card(6, hidden0, 1, AreaType::Hand);
+    state.players[0].active.push_back(active0); state.players[0].bench.push_back(bench0); state.players[0].bench.push_back(bench1);
+    state.players[0].energy.push_back(attached); state.getCard(attached).attachMoveCounter = state.getCard(bench0).moveCounter;
+    state.players[1].active.push_back(active1); state.players[1].hand.push_back(hidden);
+    auto original = bytes(ExactSparseEvaluatorV3::extractFeatures(state, 0));
+    std::swap(state.players[0].bench[0], state.players[0].bench[1]);
+    benchOrderInvariant = original == bytes(ExactSparseEvaluatorV3::extractFeatures(state, 0));
+    state.getCard(attached).attachMoveCounter = state.getCard(bench1).moveCounter;
+    attachmentSensitive = original != bytes(ExactSparseEvaluatorV3::extractFeatures(state, 0));
+    state.getCard(attached).attachMoveCounter = state.getCard(bench0).moveCounter;
+    state.getCard(hidden).cardId = hidden1;
+    opponentHiddenInvariant = original == bytes(ExactSparseEvaluatorV3::extractFeatures(state, 0));
+    state.getCard(hidden).cardId = hidden0; state.getCard(bench0).cannotAttack = true;
+    typedEffectSensitive = original != bytes(ExactSparseEvaluatorV3::extractFeatures(state, 0));
+  }
+  j.clear(); j.append('{'); j.appendKeyValue("initialized", initialized);
+  j.appendCommaKeyValue("benchOrderInvariant", benchOrderInvariant);
+  j.appendCommaKeyValue("attachmentSensitive", attachmentSensitive);
+  j.appendCommaKeyValue("opponentHiddenInvariant", opponentHiddenInvariant);
+  j.appendCommaKeyValue("typedEffectSensitive", typedEffectSensitive); j.append('}'); return j.buf.c_str();
+}
+
+extern "C" GAME_API long long ExactEvaluateFeaturesV3(ApiData* data,
+  const int* globalDense, int globalDenseCount,
+  const int* globalSparseTriplets, int globalSparseCount,
+  const int* entityDense, const int* entityPools, int entityCount,
+  const int* entitySparseQuads, int entitySparseCount, int* error) {
   if (error != nullptr) *error = 0;
-  if (data == nullptr || !data->exactEvaluator || dense == nullptr
-    || denseCount != ExactSparseEvaluatorV2::DenseCount || sparseCount < 0
-    || (sparseCount != 0 && sparseTriplets == nullptr)) {
+  if (data == nullptr || !data->exactEvaluator || globalDense == nullptr
+    || globalDenseCount != ExactSparseEvaluatorV3::GlobalDenseCount
+    || globalSparseCount < 0 || entityCount < 0 || entityCount > ExactSparseEvaluatorV3::MaxEntities
+    || entitySparseCount < 0 || (globalSparseCount != 0 && globalSparseTriplets == nullptr)
+    || (entityCount != 0 && (entityDense == nullptr || entityPools == nullptr))
+    || (entitySparseCount != 0 && entitySparseQuads == nullptr)) {
     if (error != nullptr) *error = 1; return 0;
   }
-  ExactSparseEvaluatorV2::FeatureRecord features;
-  for (int i = 0; i < denseCount; ++i) features.dense[i] = dense[i];
-  features.sparse.reserve(sparseCount);
-  for (int i = 0; i < sparseCount; ++i) {
-    int relation = sparseTriplets[i * 3], cardId = sparseTriplets[i * 3 + 1], q8 = sparseTriplets[i * 3 + 2];
-    if (relation < 0 || relation >= ExactSparseEvaluatorV2::RelationCount
-      || q8 < std::numeric_limits<short>::min() || q8 > std::numeric_limits<short>::max()) {
+  ExactSparseEvaluatorV3::FeatureRecord features;
+  for (int i = 0; i < globalDenseCount; ++i) features.globalDense[i] = globalDense[i];
+  for (int i = 0; i < globalSparseCount; ++i) {
+    int relation = globalSparseTriplets[i * 3], token = globalSparseTriplets[i * 3 + 1], value = globalSparseTriplets[i * 3 + 2];
+    if (relation < 0 || relation >= ExactSparseEvaluatorV3::GlobalRelationCount
+      || !features.globalSparse.push(token, (short)relation, value)) {
       if (error != nullptr) *error = 2; return 0;
     }
-    features.sparse.push_back({ cardId, (short)relation, (short)q8 });
+  }
+  features.entityCount = (unsigned char)entityCount;
+  for (int entity = 0; entity < entityCount; ++entity) {
+    if (entityPools[entity] < 0 || entityPools[entity] >= ExactSparseEvaluatorV3::PoolCount) {
+      if (error != nullptr) *error = 2; return 0;
+    }
+    features.entities[entity].pool = entityPools[entity];
+    for (int d = 0; d < ExactSparseEvaluatorV3::EntityDenseCount; ++d)
+      features.entities[entity].dense[d] = entityDense[entity * ExactSparseEvaluatorV3::EntityDenseCount + d];
+  }
+  for (int i = 0; i < entitySparseCount; ++i) {
+    int entity = entitySparseQuads[i * 4], relation = entitySparseQuads[i * 4 + 1];
+    int token = entitySparseQuads[i * 4 + 2], value = entitySparseQuads[i * 4 + 3];
+    if (entity < 0 || entity >= entityCount || relation < 0 || relation >= ExactSparseEvaluatorV3::EntityRelationCount
+      || !features.entities[entity].sparse.push(token, (short)relation, value)) {
+      if (error != nullptr) *error = 2; return 0;
+    }
   }
   long long value = 0;
-  if (!data->exactEvaluator->evaluateV2Features(features, value)) {
+  if (!data->exactEvaluator->evaluateV3Features(features, value)) {
     if (error != nullptr) *error = 3; return 0;
   }
   return value;
@@ -109,23 +203,42 @@ extern "C" GAME_API const char8_t* ExactReplayTraceDrain(ApiData* data) {
     int actor = data->exactReplayTurnLeaves[sampleIndex].second;
     std::unordered_map<int, int> profile;
     for (int id : data->game.config.decks[actor].cards) profile[id]++;
-    auto features = ExactSparseEvaluatorV2::extractFeatures(state, actor, &profile);
-    std::string featureBytes((const char*)features.dense.data(), sizeof(features.dense));
-    featureBytes.append((const char*)features.sparse.data(), features.sparse.size() * sizeof(features.sparse[0]));
+    auto features = ExactSparseEvaluatorV3::extractFeatures(state, actor, &profile);
+    std::string featureBytes((const char*)features.globalDense.data(), sizeof(features.globalDense));
+    featureBytes.append((const char*)features.globalSparse.values.data(), features.globalSparse.count * sizeof(features.globalSparse.values[0]));
+    for (int entity = 0; entity < features.entityCount; ++entity) {
+      featureBytes.append((const char*)&features.entities[entity].pool, sizeof(features.entities[entity].pool));
+      featureBytes.append((const char*)features.entities[entity].dense.data(), sizeof(features.entities[entity].dense));
+      featureBytes.append((const char*)features.entities[entity].sparse.values.data(),
+        features.entities[entity].sparse.count * sizeof(features.entities[entity].sparse.values[0]));
+    }
     unsigned long long lo = ExactSipHash24(featureBytes, 0x4b4e4f574c454447ULL, 0x4553544154454b45ULL);
     unsigned long long hi = ExactSipHash24(featureBytes, 0x494e464f524d4154ULL, 0x494f4e5345545632ULL);
     std::ostringstream key; key << std::hex << std::setfill('0') << std::setw(16) << hi << std::setw(16) << lo;
     j.append('{'); j.appendKeyValue("turn", state.turn); j.appendCommaKeyValue("actor", actor);
     std::string keyText = key.str();
     j.appendCommaKey("informationStateKey"); j.appendDoubleQuote(keyText.c_str());
-    j.appendCommaKey("dense"); j.append('[');
-    for (int i = 0; i < (int)features.dense.size(); ++i) { j.comma(i); j.append((int)features.dense[i]); }
-    j.append(']'); j.appendCommaKey("sparse"); j.append('[');
-    for (int i = 0; i < (int)features.sparse.size(); ++i) {
-      j.comma(i); j.append('['); j.append((int)features.sparse[i].relation); j.append(',');
-      j.append(features.sparse[i].cardId); j.append(','); j.append((int)features.sparse[i].q8); j.append(']');
+    j.appendCommaKeyValue("featureSchemaVersion", 3);
+    j.appendCommaKey("globalDense"); j.append('[');
+    for (int i = 0; i < (int)features.globalDense.size(); ++i) { j.comma(i); j.append(features.globalDense[i]); }
+    j.append(']'); j.appendCommaKey("globalSparse"); j.append('[');
+    for (int i = 0; i < features.globalSparse.count; ++i) {
+      const auto& item = features.globalSparse.values[i];
+      j.comma(i); j.append('['); j.append((int)item.relation); j.append(',');
+      j.append(item.token); j.append(','); j.append(item.value); j.append(']');
     }
-    j.append(']'); j.append('}');
+    j.append(']'); j.appendCommaKey("entities"); j.append('[');
+    for (int entity = 0; entity < features.entityCount; ++entity) {
+      const auto& item = features.entities[entity]; j.comma(entity); j.append('{');
+      j.appendKeyValue("pool", item.pool); j.appendCommaKey("dense"); j.append('[');
+      for (int d = 0; d < (int)item.dense.size(); ++d) { j.comma(d); j.append(item.dense[d]); }
+      j.append(']'); j.appendCommaKey("sparse"); j.append('[');
+      for (int s = 0; s < item.sparse.count; ++s) { const auto& token = item.sparse.values[s];
+        j.comma(s); j.append('['); j.append((int)token.relation); j.append(','); j.append(token.token); j.append(','); j.append(token.value); j.append(']'); }
+      j.append(']'); j.append('}');
+    }
+    j.append(']'); j.appendCommaKeyValue("opponentInferenceVersion", 0);
+    j.appendCommaKeyValue("overflow", features.overflow); j.append('}');
   }
   j.append(']'); data->exactReplayTurnLeaves.clear(); return j.buf.c_str();
 }
@@ -181,6 +294,9 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
   j.appendCommaKeyValue("probabilityExact", decision.metrics.probabilityExact);
   j.appendCommaKeyValue("informationSetSafe", decision.metrics.informationSetSafe);
   j.appendCommaKeyValue("evaluatorApproximate", true);
+  j.appendCommaKeyValue("transitionSufficientKey", true);
+  j.appendCommaKeyValue("evaluatorProjectionLossy", true);
+  j.appendCommaKeyValue("beliefScale", ExactSparseEvaluatorV3::BeliefScale);
   j.appendCommaKeyValue("evaluatorSchemaVersion", data->exactEvaluator ? data->exactEvaluator->schemaVersion() : 0);
   j.appendCommaKey("evaluatorModelHash"); AppendUnsignedLongLong(j, data->exactEvaluator ? data->exactEvaluator->modelHash() : 0);
   j.appendCommaKey("expandedNodes"); AppendUnsignedLongLong(j, decision.metrics.expanded);
@@ -249,6 +365,11 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
 	 j.appendCommaKeyValue("maxWeightBits", (int)decision.metrics.maxWeightBits);
 	 j.appendCommaKey("chanceMassMismatches"); AppendUnsignedLongLong(j, decision.metrics.chanceMassMismatches);
 	 j.appendCommaKey("illegalInformationSetSplits"); AppendUnsignedLongLong(j, decision.metrics.illegalInformationSetSplits);
+	 j.appendCommaKey("attackPreviewExactCount"); AppendUnsignedLongLong(j, decision.metrics.attackPreviewExactCount);
+	 j.appendCommaKey("attackPreviewUnavailableCount"); AppendUnsignedLongLong(j, decision.metrics.attackPreviewUnavailableCount);
+	 j.appendCommaKey("entityFeatureCount"); AppendUnsignedLongLong(j, decision.metrics.entityFeatureCount);
+	 j.appendCommaKey("comboFeatureCount"); AppendUnsignedLongLong(j, decision.metrics.comboFeatureCount);
+	 j.appendCommaKeyValue("hiddenInformationLeakDetected", decision.metrics.hiddenInformationLeakDetected);
 	 j.appendCommaKey("rootActions"); j.append('[');
 	 for (int ri : range(decision.rootActions)) {
 	   j.comma(ri); j.append('{');
@@ -310,6 +431,10 @@ static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
 	into.beliefNodes += from.beliefNodes; into.informationSets += from.informationSets;
 	into.strategyFusionPrevented += from.strategyFusionPrevented;
 	into.illegalInformationSetSplits += from.illegalInformationSetSplits;
+	into.attackPreviewExactCount += from.attackPreviewExactCount;
+	into.attackPreviewUnavailableCount += from.attackPreviewUnavailableCount;
+	into.entityFeatureCount += from.entityFeatureCount; into.comboFeatureCount += from.comboFeatureCount;
+	into.hiddenInformationLeakDetected = into.hiddenInformationLeakDetected || from.hiddenInformationLeakDetected;
 	into.probabilityExact = into.probabilityExact && from.probabilityExact;
 	into.informationSetSafe = into.informationSetSafe && from.informationSetSafe;
   if (!from.lastException.empty()) into.lastException = from.lastException;
