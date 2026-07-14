@@ -83,6 +83,25 @@ Windows x64 `cg.dll` and Linux x86-64 `libcg.so` include `ExactDecide`. The
 Python wrapper feature-detects the symbol so the unchanged ARM64 library uses a
 legal deterministic fallback.
 
+`ExactDecideV2` additionally accepts an optional known opponent deck for
+closed-world validation. Production calls omit it; an identity-dependent read
+of an unknown opponent zone therefore still fails closed. Detailed metrics
+separate unknown-opponent reads, unsupported concrete reads, interrupted
+transitions, depth guards, raw choices, and quotient-merged choices.
+
+Count-only and existence-only conditions on a hidden deck use the zone size and
+do not request card identities. Concrete searches suspend the transition,
+enumerate bounded card-count allocations with combination weights, materialize
+the selected world, and replay from the pre-transition checkpoint. Identical
+copies in an exchangeable searched deck share one semantic action.
+
+`BattleStartSeeded` uses an explicitly specified Fisher-Yates shuffle so its
+fixtures are identical under MSVC and libstdc++. With the Majkel1337 profile,
+seed 6 reaches a first-turn Poké Pad position whose only root choices are Poké
+Pad and End. Both Windows and Linux enumerate 1,264,533 evaluated leaves and
+return the exact value 4100 with `certified=true`, `opaqueNodes=0`; observed
+wall time is approximately 118 seconds on the two-core development target.
+
 ## Git deck workflow
 
 `main` contains generic engine/search code. Deck/evaluator changes belong in
