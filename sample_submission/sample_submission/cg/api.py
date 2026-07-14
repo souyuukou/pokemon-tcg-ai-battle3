@@ -679,6 +679,25 @@ def exact_unload_evaluator_model() -> None:
     if hasattr(lib, "ExactUnloadEvaluatorModel") and "agent_ptr" in globals():
         lib.ExactUnloadEvaluatorModel(agent_ptr)
 
+def exact_evaluate_features_v2(dense: list[int], sparse: list[list[int]]) -> int:
+    """Evaluate a native V2 feature record for bit-exact training validation."""
+    global agent_ptr
+    if not hasattr(lib, "ExactEvaluateFeaturesV2"):
+        raise RuntimeError("ExactEvaluateFeaturesV2 is not available")
+    if "agent_ptr" not in globals():
+        agent_ptr = lib.AgentStart()
+    if len(dense) != 40 or any(len(item) != 3 for item in sparse):
+        raise ValueError("invalid V2 feature dimensions")
+    dense_arg = (ctypes.c_int16 * len(dense))(*dense)
+    flat = [int(value) for item in sparse for value in item]
+    sparse_arg = (ctypes.c_int * len(flat))(*flat)
+    error = ctypes.c_int()
+    value = lib.ExactEvaluateFeaturesV2(agent_ptr, dense_arg, len(dense),
+                                        sparse_arg, len(sparse), ctypes.byref(error))
+    if error.value:
+        raise RuntimeError(f"native V2 evaluation failed: {error.value}")
+    return int(value)
+
 def exact_evaluate_action(agent_observation: Observation, deck: list[int], hand_values: list[int],
                           budget_milliseconds: int, option_index: int) -> dict:
     """Evaluate one root option; intended for deterministic exact-search diagnostics."""

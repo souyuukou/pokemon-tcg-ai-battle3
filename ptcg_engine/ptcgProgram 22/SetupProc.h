@@ -242,9 +242,8 @@ inline void SelectedIsFirst(State& state) {
 
 // ゲーム開始時処理
 inline void SetupGame(State& state) {
-	for (int i : range(2)) {
-		ShuffleDeck(state, i, true);
-	}
+	if (!state.game->config.initialDeckAlreadyShuffled)
+		for (int i : range(2)) ShuffleDeck(state, i, true);
 
 	SetYesNoSelect(state, SelectContext::IsFirst, 0);
 	state.pushFunction(SelectedIsFirst);

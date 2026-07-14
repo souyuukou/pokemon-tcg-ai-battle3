@@ -21,6 +21,7 @@
 
 static JsonBuilder AllCardJson;
 static JsonBuilder AllAttackJson;
+static void AppendUnsignedLongLong(JsonBuilder& j, unsigned long long value);
 
 extern "C" GAME_API const char8_t* ExactLoadEvaluatorModel(ApiData* data, const char* path) {
   JsonBuilder& j = data->jsonBuilder;
@@ -29,8 +30,14 @@ extern "C" GAME_API const char8_t* ExactLoadEvaluatorModel(ApiData* data, const 
   bool loaded = false;
   auto evaluator = std::make_shared<ExactCpuEvaluator>();
   loaded = path != nullptr && evaluator->load(path, error);
+  int schema = loaded ? evaluator->schemaVersion() : 0;
+  bool informationSetSafe = loaded && evaluator->informationSetSafe();
+  unsigned long long modelHash = loaded ? evaluator->modelHash() : 0;
   if (loaded) data->exactEvaluator = std::move(evaluator);
   j.appendKeyValue("loaded", loaded);
+  j.appendCommaKeyValue("schemaVersion", schema);
+  j.appendCommaKeyValue("informationSetSafe", informationSetSafe);
+  j.appendCommaKey("modelHash"); AppendUnsignedLongLong(j, modelHash);
   j.appendCommaKey("error");
   j.appendDoubleQuote(std::u8string((const char8_t*)error.c_str(), error.size()));
   j.append('}');
@@ -39,6 +46,88 @@ extern "C" GAME_API const char8_t* ExactLoadEvaluatorModel(ApiData* data, const 
 
 extern "C" GAME_API void ExactUnloadEvaluatorModel(ApiData* data) {
   if (data != nullptr) data->exactEvaluator.reset();
+}
+
+extern "C" GAME_API const char8_t* ExactArithmeticDiagnostics() {
+  static thread_local JsonBuilder j; j.clear();
+  ExactWeight a(50'063'860ULL), b(321'387'366'339'585ULL);
+  ExactWeight product = ExactWeight::multiply(a, b);
+  auto division = ExactWeight::divideRemainder(product, a);
+  ExactWeight common = ExactWeight::gcd(product, a);
+  j.append('{'); j.appendKey("product"); j.appendDoubleQuote(product.text().c_str());
+  j.appendCommaKey("quotient"); j.appendDoubleQuote(division.first.text().c_str());
+  j.appendCommaKey("remainder"); j.appendDoubleQuote(division.second.text().c_str());
+  j.appendCommaKey("gcd"); j.appendDoubleQuote(common.text().c_str());
+  j.appendCommaKeyValue("bits", (int)product.bitLength());
+  j.appendCommaKeyValue("promoted", product.isLarge()); j.append('}'); return j.buf.c_str();
+}
+
+extern "C" GAME_API long long ExactEvaluateFeaturesV2(ApiData* data,
+  const short* dense, int denseCount, const int* sparseTriplets, int sparseCount, int* error) {
+  if (error != nullptr) *error = 0;
+  if (data == nullptr || !data->exactEvaluator || dense == nullptr
+    || denseCount != ExactSparseEvaluatorV2::DenseCount || sparseCount < 0
+    || (sparseCount != 0 && sparseTriplets == nullptr)) {
+    if (error != nullptr) *error = 1; return 0;
+  }
+  ExactSparseEvaluatorV2::FeatureRecord features;
+  for (int i = 0; i < denseCount; ++i) features.dense[i] = dense[i];
+  features.sparse.reserve(sparseCount);
+  for (int i = 0; i < sparseCount; ++i) {
+    int relation = sparseTriplets[i * 3], cardId = sparseTriplets[i * 3 + 1], q8 = sparseTriplets[i * 3 + 2];
+    if (relation < 0 || relation >= ExactSparseEvaluatorV2::RelationCount
+      || q8 < std::numeric_limits<short>::min() || q8 > std::numeric_limits<short>::max()) {
+      if (error != nullptr) *error = 2; return 0;
+    }
+    features.sparse.push_back({ cardId, (short)relation, (short)q8 });
+  }
+  long long value = 0;
+  if (!data->exactEvaluator->evaluateV2Features(features, value)) {
+    if (error != nullptr) *error = 3; return 0;
+  }
+  return value;
+}
+
+extern "C" GAME_API int ExactReplayTraceBegin(ApiData* data) {
+  if (data == nullptr || data->apiDataType != 1) return 30;
+  data->exactReplayTurnLeaves.clear(); data->exactReplayLastTurn = -1;
+  data->exactReplayTraceEnabled = true; data->game.config.pauseAtExactTurnLeaf = true; return 0;
+}
+
+extern "C" GAME_API void ExactReplayTraceEnd(ApiData* data) {
+  if (data == nullptr) return;
+  data->exactReplayTraceEnabled = false; data->game.config.pauseAtExactTurnLeaf = false;
+  data->exactReplayTurnLeaves.clear(); data->exactReplayLastTurn = -1;
+}
+
+extern "C" GAME_API const char8_t* ExactReplayTraceDrain(ApiData* data) {
+  if (data == nullptr || data->apiDataType != 1) return nullptr;
+  JsonBuilder& j = data->jsonBuilder; j.clear(); j.append('[');
+  for (int sampleIndex = 0; sampleIndex < (int)data->exactReplayTurnLeaves.size(); ++sampleIndex) {
+    j.comma(sampleIndex);
+    State& state = data->exactReplayTurnLeaves[sampleIndex].first; state.game = &data->game;
+    int actor = data->exactReplayTurnLeaves[sampleIndex].second;
+    std::unordered_map<int, int> profile;
+    for (int id : data->game.config.decks[actor].cards) profile[id]++;
+    auto features = ExactSparseEvaluatorV2::extractFeatures(state, actor, &profile);
+    std::string featureBytes((const char*)features.dense.data(), sizeof(features.dense));
+    featureBytes.append((const char*)features.sparse.data(), features.sparse.size() * sizeof(features.sparse[0]));
+    unsigned long long lo = ExactSipHash24(featureBytes, 0x4b4e4f574c454447ULL, 0x4553544154454b45ULL);
+    unsigned long long hi = ExactSipHash24(featureBytes, 0x494e464f524d4154ULL, 0x494f4e5345545632ULL);
+    std::ostringstream key; key << std::hex << std::setfill('0') << std::setw(16) << hi << std::setw(16) << lo;
+    j.append('{'); j.appendKeyValue("turn", state.turn); j.appendCommaKeyValue("actor", actor);
+    std::string keyText = key.str();
+    j.appendCommaKey("informationStateKey"); j.appendDoubleQuote(keyText.c_str());
+    j.appendCommaKey("dense"); j.append('[');
+    for (int i = 0; i < (int)features.dense.size(); ++i) { j.comma(i); j.append((int)features.dense[i]); }
+    j.append(']'); j.appendCommaKey("sparse"); j.append('[');
+    for (int i = 0; i < (int)features.sparse.size(); ++i) {
+      j.comma(i); j.append('['); j.append((int)features.sparse[i].relation); j.append(',');
+      j.append(features.sparse[i].cardId); j.append(','); j.append((int)features.sparse[i].q8); j.append(']');
+    }
+    j.append(']'); j.append('}');
+  }
+  j.append(']'); data->exactReplayTurnLeaves.clear(); return j.buf.c_str();
 }
 
 static const char8_t* JsonResult(ApiData* data, const SearchInfo& si) {
@@ -88,6 +177,12 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
   j.appendCommaKey("upperNumerator"); AppendExactNumerator(j, decision.score.upper);
   j.appendCommaKey("upperDenominator"); AppendExactDenominator(j, decision.score.upper);
   j.appendCommaKeyValue("certified", decision.score.certified);
+  j.appendCommaKey("certificationScope"); j.appendDoubleQuote("exact_evaluator_expectation");
+  j.appendCommaKeyValue("probabilityExact", decision.metrics.probabilityExact);
+  j.appendCommaKeyValue("informationSetSafe", decision.metrics.informationSetSafe);
+  j.appendCommaKeyValue("evaluatorApproximate", true);
+  j.appendCommaKeyValue("evaluatorSchemaVersion", data->exactEvaluator ? data->exactEvaluator->schemaVersion() : 0);
+  j.appendCommaKey("evaluatorModelHash"); AppendUnsignedLongLong(j, data->exactEvaluator ? data->exactEvaluator->modelHash() : 0);
   j.appendCommaKey("expandedNodes"); AppendUnsignedLongLong(j, decision.metrics.expanded);
   j.appendCommaKey("mergedNodes"); AppendUnsignedLongLong(j, decision.metrics.merged);
   j.appendCommaKeyValue("timedOut", decision.metrics.timedOut);
@@ -146,6 +241,14 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
 	 j.appendCommaKey("partialTableBytes"); AppendUnsignedLongLong(j, decision.metrics.partialTableBytes);
 	 j.appendCommaKey("rootRetryKeyMatches"); AppendUnsignedLongLong(j, decision.metrics.rootRetryKeyMatches);
 	 j.appendCommaKey("rootRetryKeyMismatches"); AppendUnsignedLongLong(j, decision.metrics.rootRetryKeyMismatches);
+	 j.appendCommaKey("beliefNodes"); AppendUnsignedLongLong(j, decision.metrics.beliefNodes);
+	 j.appendCommaKey("informationSets"); AppendUnsignedLongLong(j, decision.metrics.informationSets);
+	 j.appendCommaKey("strategyFusionPrevented"); AppendUnsignedLongLong(j, decision.metrics.strategyFusionPrevented);
+	 j.appendCommaKey("smallWeightOps"); AppendUnsignedLongLong(j, decision.metrics.smallWeightOps);
+	 j.appendCommaKey("bigWeightPromotions"); AppendUnsignedLongLong(j, decision.metrics.bigWeightPromotions);
+	 j.appendCommaKeyValue("maxWeightBits", (int)decision.metrics.maxWeightBits);
+	 j.appendCommaKey("chanceMassMismatches"); AppendUnsignedLongLong(j, decision.metrics.chanceMassMismatches);
+	 j.appendCommaKey("illegalInformationSetSplits"); AppendUnsignedLongLong(j, decision.metrics.illegalInformationSetSplits);
 	 j.appendCommaKey("rootActions"); j.append('[');
 	 for (int ri : range(decision.rootActions)) {
 	   j.comma(ri); j.append('{');
@@ -201,6 +304,14 @@ static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
 	into.partialTableBytes += from.partialTableBytes;
 	into.rootRetryKeyMatches += from.rootRetryKeyMatches;
 	into.rootRetryKeyMismatches += from.rootRetryKeyMismatches;
+	into.smallWeightOps += from.smallWeightOps; into.bigWeightPromotions += from.bigWeightPromotions;
+	into.maxWeightBits = std::max(into.maxWeightBits, from.maxWeightBits);
+	into.chanceMassMismatches += from.chanceMassMismatches;
+	into.beliefNodes += from.beliefNodes; into.informationSets += from.informationSets;
+	into.strategyFusionPrevented += from.strategyFusionPrevented;
+	into.illegalInformationSetSplits += from.illegalInformationSetSplits;
+	into.probabilityExact = into.probabilityExact && from.probabilityExact;
+	into.informationSetSafe = into.informationSetSafe && from.informationSetSafe;
   if (!from.lastException.empty()) into.lastException = from.lastException;
   if (from.lastPendingDetail != 0) into.lastPendingDetail = from.lastPendingDetail;
   if (from.lastPendingPlayer >= 0) into.lastPendingPlayer = from.lastPendingPlayer;
@@ -404,6 +515,12 @@ static const char8_t* ExactProgressJson(ApiData* data, long long sessionId, cons
 	 j.appendCommaKeyValue("memoryLimitReached", metrics.memoryLimitReached);
   j.appendCommaKey("elapsedMilliseconds"); AppendLongLong(j, session.elapsedMilliseconds());
   j.appendCommaKeyValue("certified", session.lastDecision.score.certified);
+  j.appendCommaKeyValue("probabilityExact", metrics.probabilityExact);
+  j.appendCommaKeyValue("informationSetSafe", metrics.informationSetSafe);
+  j.appendCommaKey("beliefNodes"); AppendUnsignedLongLong(j, metrics.beliefNodes);
+  j.appendCommaKey("informationSets"); AppendUnsignedLongLong(j, metrics.informationSets);
+  j.appendCommaKey("bigWeightPromotions"); AppendUnsignedLongLong(j, metrics.bigWeightPromotions);
+  j.appendCommaKeyValue("maxWeightBits", (int)metrics.maxWeightBits);
   j.append('}');
   return j.buf.c_str();
 }
@@ -424,6 +541,10 @@ extern "C" {
 
   GAME_API StartData BattleStartSeeded(int* cards, unsigned int seed) {
     return ApiBattleStartSeeded(cards, seed, true);
+  }
+
+  GAME_API StartData BattleStartOrdered(int* cards, unsigned int seed) {
+    return ApiBattleStartOrdered(cards, seed);
   }
 
   GAME_API ApiData* AgentStart() {

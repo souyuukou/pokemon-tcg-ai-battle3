@@ -7,6 +7,9 @@
 #include <limits>
 #include <mutex>
 #include <string>
+#include <unordered_map>
+
+#include "ExactSparseEvaluatorV2.h"
 
 // A deliberately tiny, deterministic evaluator for the exact-search hot path.
 // Training uses floating point, but the exported model and inference are fully
@@ -22,6 +25,12 @@ public:
 	bool load(const std::string& path, std::string& error) {
 		std::ifstream stream(path, std::ios::binary);
 		if (!stream) { error = "cannot open evaluator model"; return false; }
+		char magic[8]{}; stream.read(magic, sizeof(magic)); stream.close();
+		if (std::string(magic, magic + 7) == "PTCGEV2") {
+			if (!sparseV2.load(path, error)) return false;
+			loaded = true; schema = 2; modelPath = path; modelHashValue = sparseV2.modelHash(); return true;
+		}
+		stream.open(path, std::ios::binary);
 		Header header{};
 		stream.read(reinterpret_cast<char*>(&header), sizeof(header));
 		const Header expected{};
@@ -37,13 +46,26 @@ public:
 		if (!stream || stream.peek() != std::char_traits<char>::eof()) {
 			error = "invalid evaluator model length"; return false;
 		}
-		loaded = true; modelPath = path; return true;
+		loaded = true; schema = 1; modelPath = path;
+		modelHashValue = 1469598103934665603ULL;
+		for (unsigned char c : path) { modelHashValue ^= c; modelHashValue *= 1099511628211ULL; }
+		return true;
 	}
 
 	bool isLoaded() const { return loaded; }
 	const std::string& path() const { return modelPath; }
+	int schemaVersion() const { return schema; }
+	bool informationSetSafe() const { return schema >= 2; }
+	std::uint64_t modelHash() const { return modelHashValue; }
+	bool evaluateV2Features(const ExactSparseEvaluatorV2::FeatureRecord& features, long long& value) const {
+		if (schema != 2) return false;
+		value = sparseV2.evaluate(features); return true;
+	}
 
-	long long evaluate(const State& state, int actor) const {
+	long long evaluate(const State& state, int actor,
+		const std::unordered_map<int, int>* actorProfile = nullptr,
+		const ExactSparseEvaluatorV2::BeliefInput* belief = nullptr) const {
+		if (schema == 2) return sparseV2.evaluate(state, actor, actorProfile, belief);
 		std::array<int, InputCount> x{};
 		extract(state, actor, x);
 		long long output = outputBias;
@@ -84,7 +106,10 @@ private:
 	std::array<std::int16_t, HiddenCount> outputWeight{};
 	std::int64_t outputBias = 0;
 	bool loaded = false;
+	int schema = 0;
+	std::uint64_t modelHashValue = 0;
 	std::string modelPath;
+	ExactSparseEvaluatorV2 sparseV2;
 
 	static int clip(int value) { return std::clamp(value, -127, 127); }
 	static unsigned bucket(int cardId, int zone) {
@@ -137,7 +162,10 @@ private:
 		x[21] = me.badStatus == BadStatusType::Confused ? -8 : 0; x[21] += opp.badStatus == BadStatusType::Confused ? 8 : 0;
 		x[22] = 0; // reserved for a future replay-visible turn-history feature
 		x[23] = 1;
-		addCards(state, me.hand, 1, 1, x); addCards(state, opp.hand, -1, 1, x);
+		// Opponent hand identities may have been materialized by exact hidden-
+		// world enumeration.  They are never observation-visible and therefore
+		// must not enter even the legacy evaluator.
+		addCards(state, me.hand, 1, 1, x);
 		addCards(state, me.active, 1, 2, x); addCards(state, opp.active, -1, 2, x);
 		addCards(state, me.bench, 1, 3, x); addCards(state, opp.bench, -1, 3, x);
 		addCards(state, me.trash, 1, 4, x); addCards(state, opp.trash, -1, 4, x);

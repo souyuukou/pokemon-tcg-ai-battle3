@@ -8,6 +8,7 @@
 
 #include "ToJson.h"
 #include "ApiData.h"
+#include "ExactSearchHooks.h"
 
 struct StartData {
 	ApiData* battlePtr;
@@ -22,7 +23,15 @@ struct SerialData {
 	int selectPlayer;
 };
 
-inline StartData ApiBattleStartSeeded(int* cards, unsigned int seed, bool deterministic) {
+inline void ApiCaptureExactReplayTurnLeaf(ApiData* data) {
+	if (data == nullptr || !data->exactReplayTraceEnabled || data->state.isFinish()
+		|| !IsExactTurnLeaf(data->state) || data->exactReplayLastTurn == data->state.turn) return;
+	data->exactReplayLastTurn = data->state.turn;
+	data->exactReplayTurnLeaves.push_back({ data->state, data->state.activePlayerIndex() });
+}
+
+inline StartData ApiBattleStartSeeded(int* cards, unsigned int seed, bool deterministic,
+	bool initialDeckAlreadyShuffled = false) {
 	ApiData* data = new ApiData();
 	data->apiDataType = 1;
 
@@ -31,6 +40,7 @@ inline StartData ApiBattleStartSeeded(int* cards, unsigned int seed, bool determ
 	config.seed = deterministic ? seed : rd();
 	config.recordLog = true;
 	config.deviceRand = !deterministic;
+	config.initialDeckAlreadyShuffled = initialDeckAlreadyShuffled;
 	for (int i = 0; i < 2; i++) {
 		std::unordered_map<std::u8string, int> nameCount;
 		bool aceSpec = false;
@@ -65,7 +75,8 @@ inline StartData ApiBattleStartSeeded(int* cards, unsigned int seed, bool determ
 				}
 			}
 
-			config.decks[i].cards[j] = cards[i * DECK_SIZE + j];
+			config.decks[i].cards[j] = initialDeckAlreadyShuffled
+				? cards[i * DECK_SIZE + (DECK_SIZE - j - 1)] : cards[i * DECK_SIZE + j];
 		}
 		if (!basic) {
 			delete data;
@@ -82,11 +93,16 @@ inline StartData ApiBattleStartSeeded(int* cards, unsigned int seed, bool determ
 	}
 	data->start();
 	data->next();
+	ApiCaptureExactReplayTurnLeaf(data);
 	return { data, -1, 0 };
 }
 
 inline StartData ApiBattleStart(int* cards) {
 	return ApiBattleStartSeeded(cards, 0, false);
+}
+
+inline StartData ApiBattleStartOrdered(int* cards, unsigned int seed) {
+	return ApiBattleStartSeeded(cards, seed, true, true);
 }
 
 inline ApiData* ApiAgentStart() {
@@ -96,6 +112,8 @@ inline ApiData* ApiAgentStart() {
 	config.seed = std::random_device()();
 	config.recordLog = true;
 	data->game.rng = std::mt19937(config.seed);
+	data->game.energyList.reserve(64); data->game.energyList2.reserve(64);
+	data->game.cardList.reserve(128); data->game.attackEnergyList.reserve(16);
 	data->state.game = &data->game;
 	return data;
 }
@@ -140,9 +158,11 @@ inline int ApiSelect(ApiData* data, int* select, int selectCount) {
 	data->selected = state.selected;
 
 	data->next(); 
-	while (!state.isFinish() && state.selectMax == 0) {
+	ApiCaptureExactReplayTurnLeaf(data);
+	while (!state.isFinish() && (state.selectMax == 0 || IsExactTurnLeaf(state))) {
 		state.selected.clear();
 		data->next();
+		ApiCaptureExactReplayTurnLeaf(data);
 	}
 	data->selectCount++;
 	return 0;

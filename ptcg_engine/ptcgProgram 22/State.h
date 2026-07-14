@@ -1811,7 +1811,7 @@ struct State {
 		if (exact.enabled && exact.pending != ExactPendingType::None) {
 			return true;
 		}
-		if (exact.enabled && phase == GamePhase::PokemonCheckupEnd) {
+		if ((exact.enabled || game->config.pauseAtExactTurnLeaf) && phase == GamePhase::PokemonCheckupEnd) {
 			return true;
 		}
 		while (!isFinish()) {
@@ -1820,7 +1820,7 @@ struct State {
 				if (exact.enabled && exact.pending != ExactPendingType::None) {
 					return true;
 				}
-				if (exact.enabled && phase == GamePhase::PokemonCheckupEnd) {
+				if ((exact.enabled || game->config.pauseAtExactTurnLeaf) && phase == GamePhase::PokemonCheckupEnd) {
 					return true;
 				}
 				continue;

@@ -108,28 +108,52 @@ stops further search safely and returns the current proven interval.
 
 ## Replay-trained CPU evaluator
 
-The deck branch ships `exact-evaluator.bin`, a 48-input, 8-hidden-unit network.
-Visible scalar features and stable hashed card-zone counts are extracted from
-replay observations. `tools/train_replay_evaluator.py` reads each replay once,
-stores a bounded int8 feature cache, trains against actor-relative final rewards,
-and exports an 852-byte quantized model. The current bundled checkpoint was
-trained from 500 replay files / 33,277 active observations; its held-out MSE was
-approximately 0.788 after 30 epochs.
+V2 is a deck-independent sparse NNUE with 40 dense inputs, 30 collision-free
+card/relationship planes, and 32 int32 accumulators. The model contains an
+explicit sorted vocabulary for every registered card and attack ID; only a
+future unknown ID maps to `UNK`. Card identities are separated by owner and
+zone. Attachments are separated by Active/Bench target, attacks include their
+exact native energy shortage, and Pokémon HP/persistent restrictions are linked
+to the Pokémon card ID. Own hidden deck/prize expectations are converted from
+exact belief mass to Q8 only at the evaluator boundary. Opponent materialized
+hand, deck, and prize identities never enter the feature stream.
 
-Native inference is an integer 48x8x1 multiply with clipped ReLU and a 1,000-point
-output unit. Terminal wins and losses remain fixed at +/-100,000,000. The model
-is attached to one `ApiData`/turn session, so changing a deck profile cannot
-silently change another session. Training may use PyTorch; submission inference
-has no ML runtime dependency and is byte-for-byte deterministic across Windows
-and Linux.
+Weights are int16, hidden biases/accumulators are int32, and the output path is
+int64 with clipped ReLU. Evaluation has no floating-point operation or per-leaf
+heap allocation. Terminal wins and losses bypass the model and remain fixed at
+`+/-100,000,000`; nonterminal output is clamped to `+/-90,000,000`. The C++
+extractor is also the only feature extractor used for training data.
+
+`ExactReplayTraceBegin` makes the normal engine pause after turn-end effects and
+Pokémon Checkup but before the next `TurnStart`. `BattleStartOrdered` loads the
+post-shuffle deck order recorded by Kaggle, because its environment seed does
+not reproduce the engine's use of device randomness. The extractor replays the
+complete action stream and rejects the entire match on a version mismatch,
+illegal action, random divergence, truncation, or nonterminal ending. It never
+keeps a valid prefix from a rejected match. Samples are actor-relative turn
+leaves with final reward `{-1,0,1}` and per-match total loss weight one.
 
 Train a replacement model with:
 
 ```powershell
-python tools/train_replay_evaluator.py data/kaggle_replays `
-  sample_submission/sample_submission/exact-evaluator.bin `
-  --max-files 20000 --max-examples 2000000 --epochs 30
+python tools/extract_turn_end_dataset.py data/kaggle_replays data/turn-leaves.jsonl
+python tools/train_turn_end_evaluator.py data/turn-leaves.jsonl exact-evaluator-v2.bin `
+  --manifest data/turn-leaves.jsonl.manifest.json --epochs 30 --qat-epochs 8
 ```
+
+Replays are split as complete matches by `(date, replayId)`: oldest 80% train,
+next 10% validation, latest 10% test. The adoption report checks the zero
+baseline, sign accuracy, quantization degradation, native/reference bit
+identity, and an optional paired replay-level bootstrap against V1 predictions.
+`--require-gates` refuses to publish a model unless every supplied gate passes.
+
+V1 loading remains available for old deck branches, but it is reported as
+`informationSetSafe=false` and can never produce `certified=true`. For V2,
+certification means only that the exact expectation of the fixed quantized
+evaluator was computed over all chance outcomes and legal information-set
+policies; it is exposed as
+`certificationScope="exact_evaluator_expectation"` and does not claim the learned
+evaluator is a perfect estimate of eventual match outcome.
 
 `ExactLoadEvaluatorModel` and `ExactUnloadEvaluatorModel` expose explicit model
 lifetime control. Active turn sessions retain an immutable shared model after it

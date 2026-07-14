@@ -4,6 +4,8 @@
 #include <array>
 #include <cstdint>
 #include <iomanip>
+#include <limits>
+#include <numeric>
 #include <sstream>
 #include <string>
 #include <stdexcept>
@@ -18,6 +20,21 @@ public:
 		while (value) { digit.push_back((std::uint32_t)(value % Base)); value /= Base; }
 	}
 	bool zero() const { return digit.empty(); }
+	bool fitsUnsignedLongLong() const {
+		if (digit.size() > 3) return false;
+		unsigned long long value = 0;
+		for (size_t i = digit.size(); i-- > 0;) {
+			if (value > (std::numeric_limits<unsigned long long>::max() - digit[i]) / Base) return false;
+			value = value * Base + digit[i];
+		}
+		return true;
+	}
+	unsigned long long unsignedLongLong() const {
+		if (!fitsUnsignedLongLong()) throw std::overflow_error("exact integer does not fit uint64");
+		unsigned long long value = 0;
+		for (size_t i = digit.size(); i-- > 0;) value = value * Base + digit[i];
+		return value;
+	}
 	void trim() { while (!digit.empty() && digit.back() == 0) digit.pop_back(); }
 	static int compare(const ExactBigUnsigned& a, const ExactBigUnsigned& b) {
 		if (a.digit.size() != b.digit.size()) return a.digit.size() < b.digit.size() ? -1 : 1;
@@ -60,11 +77,153 @@ public:
 		}
 		out.trim(); return out;
 	}
+	static ExactBigUnsigned multiplySmall(const ExactBigUnsigned& a, std::uint32_t factor) {
+		if (a.zero() || factor == 0) return {};
+		ExactBigUnsigned out; out.digit.resize(a.digit.size());
+		std::uint64_t carry = 0;
+		for (size_t i = 0; i < a.digit.size(); ++i) {
+			std::uint64_t value = (std::uint64_t)a.digit[i] * factor + carry;
+			out.digit[i] = (std::uint32_t)(value % Base); carry = value / Base;
+		}
+		if (carry) out.digit.push_back((std::uint32_t)carry);
+		return out;
+	}
+	std::uint32_t divideSmall(std::uint32_t divisor) {
+		if (divisor == 0) throw std::invalid_argument("division by zero");
+		std::uint64_t remainder = 0;
+		for (size_t i = digit.size(); i-- > 0;) {
+			std::uint64_t value = remainder * Base + digit[i];
+			digit[i] = (std::uint32_t)(value / divisor); remainder = value % divisor;
+		}
+		trim(); return (std::uint32_t)remainder;
+	}
+	bool even() const { return zero() || (digit.front() & 1U) == 0; }
+	void shiftRightOne() { divideSmall(2); }
+	static std::pair<ExactBigUnsigned, ExactBigUnsigned> divideRemainder(
+		const ExactBigUnsigned& dividend, const ExactBigUnsigned& divisor) {
+		if (divisor.zero()) throw std::invalid_argument("division by zero");
+		if (compare(dividend, divisor) < 0) return { ExactBigUnsigned(), dividend };
+		ExactBigUnsigned quotient, remainder = dividend;
+		ExactBigUnsigned multiple = divisor, power(1);
+		while (compare(multiple, remainder) <= 0) {
+			multiple = multiplySmall(multiple, 2);
+			power = multiplySmall(power, 2);
+		}
+		multiple.shiftRightOne(); power.shiftRightOne();
+		while (!power.zero()) {
+			if (compare(multiple, remainder) <= 0) {
+				remainder = subtract(remainder, multiple);
+				quotient = add(quotient, power);
+			}
+			multiple.shiftRightOne(); power.shiftRightOne();
+		}
+		return { quotient, remainder };
+	}
+	static ExactBigUnsigned divide(const ExactBigUnsigned& dividend, const ExactBigUnsigned& divisor) {
+		return divideRemainder(dividend, divisor).first;
+	}
+	static ExactBigUnsigned remainder(const ExactBigUnsigned& dividend, const ExactBigUnsigned& divisor) {
+		return divideRemainder(dividend, divisor).second;
+	}
+	static ExactBigUnsigned gcd(ExactBigUnsigned a, ExactBigUnsigned b) {
+		if (a.zero()) return b; if (b.zero()) return a;
+		unsigned commonTwos = 0;
+		while (a.even() && b.even()) { a.shiftRightOne(); b.shiftRightOne(); ++commonTwos; }
+		while (a.even()) a.shiftRightOne();
+		do {
+			while (b.even()) b.shiftRightOne();
+			if (compare(a, b) > 0) std::swap(a, b);
+			b = subtract(b, a);
+		} while (!b.zero());
+		while (commonTwos--) a = multiplySmall(a, 2);
+		return a;
+	}
+	unsigned bitLength() const {
+		if (zero()) return 0;
+		ExactBigUnsigned copy = *this; unsigned bits = 0;
+		while (!copy.zero()) { copy.shiftRightOne(); ++bits; }
+		return bits;
+	}
 	std::string text() const {
 		if (zero()) return "0";
 		std::ostringstream out; out << digit.back();
 		for (size_t i = digit.size() - 1; i-- > 0;) out << std::setw(9) << std::setfill('0') << digit[i];
 		return out.str();
+	}
+};
+
+// Integer probability mass with a uint64 hot path.  Unlike ExactFraction,
+// this type is used before division, where combinations of individually small
+// binomial coefficients can already exceed 64 bits.
+class ExactWeight {
+public:
+	ExactWeight(unsigned long long value = 0) : small(value) {}
+	explicit ExactWeight(ExactBigUnsigned value) { assign(std::move(value)); }
+
+	bool zero() const { return !large && small == 0; }
+	bool isLarge() const { return large; }
+	bool fitsUnsignedLongLong() const { return !large; }
+	unsigned long long unsignedLongLong() const {
+		if (large) throw std::overflow_error("exact weight does not fit uint64");
+		return small;
+	}
+	ExactBigUnsigned magnitude() const { return large ? big : ExactBigUnsigned(small); }
+	std::string text() const { return large ? big.text() : std::to_string(small); }
+	unsigned bitLength() const {
+		if (large) return big.bitLength();
+		unsigned bits = 0; for (auto value = small; value; value >>= 1) ++bits; return bits;
+	}
+
+	static int compare(const ExactWeight& a, const ExactWeight& b) {
+		if (!a.large && !b.large) return a.small == b.small ? 0 : (a.small < b.small ? -1 : 1);
+		return ExactBigUnsigned::compare(a.magnitude(), b.magnitude());
+	}
+	static ExactWeight add(const ExactWeight& a, const ExactWeight& b) {
+		if (!a.large && !b.large && b.small <= std::numeric_limits<unsigned long long>::max() - a.small)
+			return ExactWeight(a.small + b.small);
+		return ExactWeight(ExactBigUnsigned::add(a.magnitude(), b.magnitude()));
+	}
+	static ExactWeight subtract(const ExactWeight& a, const ExactWeight& b) {
+		if (compare(a, b) < 0) throw std::underflow_error("negative exact weight");
+		if (!a.large && !b.large) return ExactWeight(a.small - b.small);
+		return ExactWeight(ExactBigUnsigned::subtract(a.magnitude(), b.magnitude()));
+	}
+	static ExactWeight multiply(const ExactWeight& a, const ExactWeight& b) {
+		if (a.zero() || b.zero()) return ExactWeight();
+		if (!a.large && !b.large && b.small <= std::numeric_limits<unsigned long long>::max() / a.small)
+			return ExactWeight(a.small * b.small);
+		return ExactWeight(ExactBigUnsigned::multiply(a.magnitude(), b.magnitude()));
+	}
+	static ExactWeight gcd(const ExactWeight& a, const ExactWeight& b) {
+		if (!a.large && !b.large) return ExactWeight(std::gcd(a.small, b.small));
+		return ExactWeight(ExactBigUnsigned::gcd(a.magnitude(), b.magnitude()));
+	}
+	static std::pair<ExactWeight, ExactWeight> divideRemainder(const ExactWeight& a, const ExactWeight& b) {
+		if (b.zero()) throw std::invalid_argument("division by zero");
+		if (!a.large && !b.large) return { ExactWeight(a.small / b.small), ExactWeight(a.small % b.small) };
+		auto result = ExactBigUnsigned::divideRemainder(a.magnitude(), b.magnitude());
+		return { ExactWeight(std::move(result.first)), ExactWeight(std::move(result.second)) };
+	}
+	static ExactWeight divide(const ExactWeight& a, const ExactWeight& b) {
+		return divideRemainder(a, b).first;
+	}
+	static ExactWeight remainder(const ExactWeight& a, const ExactWeight& b) {
+		return divideRemainder(a, b).second;
+	}
+
+	ExactWeight& operator+=(const ExactWeight& other) { *this = add(*this, other); return *this; }
+	friend bool operator==(const ExactWeight& a, const ExactWeight& b) { return compare(a, b) == 0; }
+	friend bool operator!=(const ExactWeight& a, const ExactWeight& b) { return !(a == b); }
+	friend bool operator<(const ExactWeight& a, const ExactWeight& b) { return compare(a, b) < 0; }
+	friend bool operator>=(const ExactWeight& a, const ExactWeight& b) { return compare(a, b) >= 0; }
+
+private:
+	unsigned long long small = 0;
+	bool large = false;
+	ExactBigUnsigned big;
+	void assign(ExactBigUnsigned value) {
+		if (value.fitsUnsignedLongLong()) { small = value.unsignedLongLong(); large = false; big = {}; }
+		else { small = 0; large = true; big = std::move(value); }
 	}
 };
 
@@ -111,6 +270,18 @@ struct ExactBigRational {
 		// DECK_SIZE. Reaching this branch indicates corrupted arithmetic input.
 		if (value != 1) throw std::runtime_error("unsupported exact denominator prime");
 	}
+	void addDenominator(const ExactBigUnsigned& input) {
+		ExactBigUnsigned value = input;
+		for (size_t i = 0; i < Primes.size(); ++i) {
+			while (!value.zero()) {
+				ExactBigUnsigned quotient = value;
+				if (quotient.divideSmall(Primes[i]) != 0) break;
+				value = std::move(quotient); denominator[i]++;
+			}
+		}
+		if (!value.zero() && !(value.digit.size() == 1 && value.digit[0] == 1))
+			throw std::runtime_error("unsupported exact denominator prime");
+	}
 	static ExactBigUnsigned factorProduct(const std::array<std::uint16_t, Primes.size()>& exponent) {
 		ExactBigUnsigned out(1);
 		for (size_t i = 0; i < Primes.size(); ++i) {
@@ -126,6 +297,10 @@ struct ExactBigRational {
 	}
 	void scale(unsigned long long weight, unsigned long long total) {
 		numerator.multiply(ExactBigUnsigned(weight)); addDenominator(total);
+	}
+	void scale(const ExactWeight& weight, const ExactWeight& total) {
+		if (total.zero()) throw std::runtime_error("zero exact probability mass");
+		numerator.multiply(weight.magnitude()); addDenominator(total.magnitude());
 	}
 	static ExactBigRational add(const ExactBigRational& a, const ExactBigRational& b) {
 		ExactBigRational out; out.denominator.fill(0);
