@@ -854,6 +854,7 @@ private:
 		if (totalWeight == 0) return unknown();
 		ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
 		bool certified = true, any = false;
+		unsigned long long processedWeight = 0;
 		std::vector<int> prizeCounts(parent.exact.typeCount[player], 0);
 		std::vector<int> handCounts(parent.exact.typeCount[player], 0);
 		auto evaluateWorld = [&](unsigned long long weight) {
@@ -866,6 +867,7 @@ private:
 			auto l = score.lower.scaled(weight, totalWeight), u = score.upper.scaled(weight, totalWeight);
 			lower = ExactFraction::add(lower, l); upper = ExactFraction::add(upper, u);
 			if (!lower.valid || !upper.valid) { metrics.arithmeticOverflow = true; return false; }
+			processedWeight += weight;
 			certified = certified && score.certified; any = true; return true;
 		};
 		std::function<bool(int, int, unsigned long long)> enumerateHands;
@@ -891,7 +893,15 @@ private:
 			}
 			prizeCounts[type] = 0; return true;
 		};
-		if (!enumerate(0, prizeSize, 1) || !any) return unknown();
+		bool completeEnumeration = enumerate(0, prizeSize, 1);
+		if (!any) return unknown();
+		if (!completeEnumeration) {
+			unsigned long long remaining = processedWeight >= totalWeight ? 0 : totalWeight - processedWeight;
+			lower = ExactFraction::add(lower, ExactFraction::integer(-100'000'000).scaled(remaining, totalWeight));
+			upper = ExactFraction::add(upper, ExactFraction::integer(100'000'000).scaled(remaining, totalWeight));
+			if (!lower.valid || !upper.valid) { metrics.arithmeticOverflow = true; return unknown(); }
+			return { lower, upper, {}, false };
+		}
 		return { lower, upper, {}, certified && ExactCompare(lower, upper) == 0 };
 	}
 
@@ -959,8 +969,15 @@ private:
 		unsigned long long total = 0; for (auto [_, w] : types) total += w;
 		ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
 		bool certified = true;
+		unsigned long long processed = 0;
 		for (auto [id, weight] : types) {
-			if (expired()) { metrics.partialChanceNodes++; return unknown(); }
+			if (expired()) {
+				metrics.partialChanceNodes++;
+				unsigned long long remaining = total - processed;
+				lower = ExactFraction::add(lower, ExactFraction::integer(-100'000'000).scaled(remaining, total));
+				upper = ExactFraction::add(upper, ExactFraction::integer(100'000'000).scaled(remaining, total));
+				return { lower, upper, {}, false };
+			}
 			ExactScore score;
 			auto saved = partial == nullptr ? nullptr : [&]() -> ExactScore* {
 				auto found = partial->completedOutcomes.find(id);
@@ -978,6 +995,7 @@ private:
 			}
 			auto l = score.lower.scaled(weight, total), u = score.upper.scaled(weight, total);
 			lower = ExactFraction::add(lower, l); upper = ExactFraction::add(upper, u);
+			processed += weight;
 			if (!lower.valid || !upper.valid) { metrics.arithmeticOverflow = true; return unknown(); }
 			certified = certified && score.certified;
 		}
