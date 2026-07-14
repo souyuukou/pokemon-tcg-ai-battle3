@@ -33,6 +33,10 @@ lib.GameInitialize()
 lib.BattleStart.restype = StartData
 lib.BattleStart.argtypes = [ctypes.POINTER(ctypes.c_int)]
 
+if hasattr(lib, "BattleStartSeeded"):
+    lib.BattleStartSeeded.restype = StartData
+    lib.BattleStartSeeded.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint]
+
 lib.AgentStart.restype = ctypes.c_void_p
 
 lib.BattleFinish.argtypes = [ctypes.c_void_p]
@@ -72,6 +76,20 @@ if hasattr(lib, "ExactDecide"):
         ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
         ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
         ctypes.c_int, ctypes.c_int]
+
+if hasattr(lib, "ExactEvaluateAction"):
+    lib.ExactEvaluateAction.restype = ctypes.c_char_p
+    lib.ExactEvaluateAction.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+        ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
+if hasattr(lib, "ExactDecideV2"):
+    lib.ExactDecideV2.restype = ctypes.c_char_p
+    lib.ExactDecideV2.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
 
 lib.AllCard.restype = ctypes.c_char_p
 

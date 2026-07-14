@@ -22,15 +22,15 @@ struct SerialData {
 	int selectPlayer;
 };
 
-inline StartData ApiBattleStart(int* cards) {
+inline StartData ApiBattleStartSeeded(int* cards, unsigned int seed, bool deterministic) {
 	ApiData* data = new ApiData();
 	data->apiDataType = 1;
 
 	std::random_device rd;
 	GameConfig config = {};
-	config.seed = rd();
+	config.seed = deterministic ? seed : rd();
 	config.recordLog = true;
-	config.deviceRand = true;
+	config.deviceRand = !deterministic;
 	for (int i = 0; i < 2; i++) {
 		std::unordered_map<std::u8string, int> nameCount;
 		bool aceSpec = false;
@@ -74,11 +74,19 @@ inline StartData ApiBattleStart(int* cards) {
 	}
 
 	data->init(config);
-	std::seed_seq seq{ rd(), rd(), rd(), rd() };
-	data->game.rng = std::mt19937(seq);
+	if (deterministic) {
+		data->game.rng = std::mt19937(seed);
+	} else {
+		std::seed_seq seq{ rd(), rd(), rd(), rd() };
+		data->game.rng = std::mt19937(seq);
+	}
 	data->start();
 	data->next();
 	return { data, -1, 0 };
+}
+
+inline StartData ApiBattleStart(int* cards) {
+	return ApiBattleStartSeeded(cards, 0, false);
 }
 
 inline ApiData* ApiAgentStart() {

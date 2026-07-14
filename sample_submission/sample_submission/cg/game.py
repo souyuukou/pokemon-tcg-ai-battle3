@@ -40,6 +40,21 @@ def battle_start(deck0: list[int], deck1: list[int]) -> tuple[dict, StartData]:
         return (_get_battle_data(), start_data)
 
 
+def battle_start_seeded(deck0: list[int], deck1: list[int], seed: int) -> tuple[dict, StartData]:
+    """Start a deterministic battle for exact-search regression tests."""
+    if len(deck0) != 60 or len(deck1) != 60:
+        raise ValueError("The deck must contain 60 cards.")
+    if not hasattr(lib, "BattleStartSeeded"):
+        raise RuntimeError("BattleStartSeeded is not available in this native library")
+    cards = deck0 + deck1
+    arg = (ctypes.c_int * len(cards))(*cards)
+    start_data = lib.BattleStartSeeded(arg, ctypes.c_uint(seed))
+    Battle.battle_ptr = start_data.battlePtr
+    if not Battle.battle_ptr:
+        return (None, start_data)
+    return (_get_battle_data(), start_data)
+
+
 def battle_finish():
     """End the battle and free the memory used during it."""
     lib.BattleFinish(Battle.battle_ptr)

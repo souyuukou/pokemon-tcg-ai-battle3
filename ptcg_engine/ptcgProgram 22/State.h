@@ -45,6 +45,20 @@ enum class ExactPendingType : unsigned char {
 	Opaque,
 };
 
+enum class ExactQueryIntent : unsigned char {
+	ConcreteCards = 0,
+	CountOnly,
+	ExistsOnly,
+};
+
+enum class ExactBlockReason : unsigned char {
+	None = 0,
+	UnknownOpponentList,
+	UnsupportedConcreteReference,
+	InterruptedTransition,
+	Exception,
+};
+
 // Compact actor-relative hidden state. Until the deck is legally observed,
 // deck and face-down prizes are one exchangeable pool plus the two zone sizes.
 struct ExactHiddenState {
@@ -57,25 +71,38 @@ struct ExactHiddenState {
 	signed char pendingPlayer = -1;
 	unsigned char pendingCount = 0;
 	short pendingDetail = 0;
-	unsigned char typeCount = 0;
-	std::array<int, DECK_SIZE> cardId = {};
-	std::array<unsigned char, DECK_SIZE> cardCount = {};
+	ExactQueryIntent pendingIntent = ExactQueryIntent::ConcreteCards;
+	ExactBlockReason blockReason = ExactBlockReason::None;
+	int pendingEffectCardId = 0;
+	signed char pendingEffectPlayer = -1;
+	int pendingSkillId = 0;
+	unsigned char pendingNullCount = 0;
+	std::array<unsigned char, 2> typeCount = {};
+	std::array<std::array<int, DECK_SIZE>, 2> cardId = {};
+	std::array<std::array<unsigned char, DECK_SIZE>, 2> cardCount = {};
+	std::array<bool, 2> profileKnown = {};
 
 	void clearPending() {
 		pending = ExactPendingType::None;
 		pendingPlayer = -1;
 		pendingCount = 0;
 		pendingDetail = 0;
+		pendingIntent = ExactQueryIntent::ConcreteCards;
+		blockReason = ExactBlockReason::None;
+		pendingEffectCardId = 0;
+		pendingEffectPlayer = -1;
+		pendingSkillId = 0;
+		pendingNullCount = 0;
 	}
 
-	void addHiddenCard(int id) {
-		for (int i = 0; i < typeCount; ++i) {
-			if (cardId[i] == id) { cardCount[i]++; return; }
+	void addHiddenCard(int player, int id) {
+		for (int i = 0; i < typeCount[player]; ++i) {
+			if (cardId[player][i] == id) { cardCount[player][i]++; return; }
 		}
-		if (typeCount >= DECK_SIZE) Exception("exact hidden type overflow");
-		cardId[typeCount] = id;
-		cardCount[typeCount] = 1;
-		typeCount++;
+		if (typeCount[player] >= DECK_SIZE) Exception("exact hidden type overflow");
+		int index = typeCount[player]++;
+		cardId[player][index] = id;
+		cardCount[player][index] = 1;
 	}
 };
 

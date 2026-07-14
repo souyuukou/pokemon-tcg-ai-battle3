@@ -70,6 +70,21 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
   j.appendCommaKey("lastException");
   j.appendDoubleQuote(std::u8string((const char8_t*)decision.metrics.lastException.c_str(), decision.metrics.lastException.size()));
   j.appendCommaKeyValue("lastPendingDetail", decision.metrics.lastPendingDetail);
+  j.appendCommaKeyValue("lastPendingPlayer", decision.metrics.lastPendingPlayer);
+  j.appendCommaKeyValue("lastPendingEffectCardId", decision.metrics.lastPendingEffectCardId);
+  j.appendCommaKeyValue("lastPendingEffectPlayer", decision.metrics.lastPendingEffectPlayer);
+  j.appendCommaKeyValue("lastPendingNullCount", decision.metrics.lastPendingNullCount);
+  j.appendCommaKeyValue("lastPendingDeckUnknown", decision.metrics.lastPendingDeckUnknown);
+  j.appendCommaKey("unknownOpponentListNodes"); AppendUnsignedLongLong(j, decision.metrics.unknownOpponentList);
+  j.appendCommaKey("unsupportedConcreteReferenceNodes"); AppendUnsignedLongLong(j, decision.metrics.unsupportedConcreteReference);
+  j.appendCommaKey("interruptedTransitionNodes"); AppendUnsignedLongLong(j, decision.metrics.interruptedTransition);
+  j.appendCommaKey("rawOutcomes"); AppendUnsignedLongLong(j, decision.metrics.rawOutcomes);
+  j.appendCommaKey("groupedOutcomes"); AppendUnsignedLongLong(j, decision.metrics.groupedOutcomes);
+  j.appendCommaKey("depthLimitNodes"); AppendUnsignedLongLong(j, decision.metrics.depthLimitNodes);
+  j.appendCommaKeyValue("maxDepth", decision.metrics.maxDepth);
+  j.appendCommaKeyValue("lastDepthSelectType", decision.metrics.lastDepthSelectType);
+  j.appendCommaKeyValue("lastDepthTurnActionCount", decision.metrics.lastDepthTurnActionCount);
+  j.appendCommaKeyValue("rootWorkers", decision.metrics.rootWorkers);
   j.append('}');
   return j.buf.c_str();
 }
@@ -82,6 +97,10 @@ extern "C" {
 
   GAME_API StartData BattleStart(int* cards) {
     return ApiBattleStart(cards);
+  }
+
+  GAME_API StartData BattleStartSeeded(int* cards, unsigned int seed) {
+    return ApiBattleStartSeeded(cards, seed, true);
   }
 
   GAME_API ApiData* AgentStart() {
@@ -209,6 +228,7 @@ extern "C" {
         auto future0 = std::async(std::launch::async, worker, 0);
         auto future1 = std::async(std::launch::async, worker, 1);
         WorkerResult results[2] = { future0.get(), future1.get() };
+        decision.metrics.rootWorkers = 2;
         bool first = true, allCertified = true;
         ExactFraction maxUpper = ExactFraction::integer(-100'000'000);
         for (const WorkerResult& wr : results) {
@@ -225,10 +245,24 @@ extern "C" {
           decision.metrics.leaves += wr.metrics.leaves;
           decision.metrics.opaque += wr.metrics.opaque;
           decision.metrics.exceptions += wr.metrics.exceptions;
+          decision.metrics.unknownOpponentList += wr.metrics.unknownOpponentList;
+          decision.metrics.unsupportedConcreteReference += wr.metrics.unsupportedConcreteReference;
+          decision.metrics.interruptedTransition += wr.metrics.interruptedTransition;
+          decision.metrics.rawOutcomes += wr.metrics.rawOutcomes;
+          decision.metrics.groupedOutcomes += wr.metrics.groupedOutcomes;
+          decision.metrics.depthLimitNodes += wr.metrics.depthLimitNodes;
+          decision.metrics.maxDepth = std::max(decision.metrics.maxDepth, wr.metrics.maxDepth);
+          if (wr.metrics.lastDepthSelectType != 0) decision.metrics.lastDepthSelectType = wr.metrics.lastDepthSelectType;
+          if (wr.metrics.lastDepthTurnActionCount != 0) decision.metrics.lastDepthTurnActionCount = wr.metrics.lastDepthTurnActionCount;
           decision.metrics.timedOut = decision.metrics.timedOut || wr.metrics.timedOut;
           decision.metrics.arithmeticOverflow = decision.metrics.arithmeticOverflow || wr.metrics.arithmeticOverflow;
           if (!wr.metrics.lastException.empty()) decision.metrics.lastException = wr.metrics.lastException;
           if (wr.metrics.lastPendingDetail != 0) decision.metrics.lastPendingDetail = wr.metrics.lastPendingDetail;
+          if (wr.metrics.lastPendingPlayer >= 0) decision.metrics.lastPendingPlayer = wr.metrics.lastPendingPlayer;
+          if (wr.metrics.lastPendingEffectCardId != 0) decision.metrics.lastPendingEffectCardId = wr.metrics.lastPendingEffectCardId;
+          if (wr.metrics.lastPendingEffectPlayer >= 0) decision.metrics.lastPendingEffectPlayer = wr.metrics.lastPendingEffectPlayer;
+          if (wr.metrics.lastPendingNullCount != 0) decision.metrics.lastPendingNullCount = wr.metrics.lastPendingNullCount;
+          decision.metrics.lastPendingDeckUnknown = decision.metrics.lastPendingDeckUnknown || wr.metrics.lastPendingDeckUnknown;
         }
         if (first) {
           decision.score = {};
@@ -244,6 +278,42 @@ extern "C" {
     } catch (...) {
       data->jsonBuilder.clear();
       data->jsonBuilder.appendStr("{\"error\":99}");
+      return data->jsonBuilder.buf.c_str();
+    }
+  }
+
+  GAME_API const char8_t* ExactEvaluateAction(ApiData* data, const char* serialized, int count,
+      int* deck, int* handValues, int deckCount, int budgetMilliseconds, int optionIndex) {
+    if (data->apiDataType != 2 || deckCount <= 0 || deckCount > DECK_SIZE) {
+      data->jsonBuilder.clear(); data->jsonBuilder.appendStr("{\"error\":30}");
+      return data->jsonBuilder.buf.c_str();
+    }
+    try {
+      SetBattleData(data, serialized, count);
+      ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds);
+      ExactDecision decision = planner.evaluateRootAction(data->state, optionIndex);
+      return ExactDecisionJson(data, decision);
+    } catch (...) {
+      data->jsonBuilder.clear(); data->jsonBuilder.appendStr("{\"error\":99}");
+      return data->jsonBuilder.buf.c_str();
+    }
+  }
+
+  GAME_API const char8_t* ExactDecideV2(ApiData* data, const char* serialized, int count,
+      int* deck, int* handValues, int deckCount, int* opponentDeck, int opponentDeckCount,
+      int budgetMilliseconds) {
+    if (data->apiDataType != 2 || deckCount <= 0 || deckCount > DECK_SIZE
+        || opponentDeckCount < 0 || opponentDeckCount > DECK_SIZE) {
+      data->jsonBuilder.clear(); data->jsonBuilder.appendStr("{\"error\":30}");
+      return data->jsonBuilder.buf.c_str();
+    }
+    try {
+      SetBattleData(data, serialized, count);
+      ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds,
+          opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount);
+      return ExactDecisionJson(data, planner.decide(data->state));
+    } catch (...) {
+      data->jsonBuilder.clear(); data->jsonBuilder.appendStr("{\"error\":99}");
       return data->jsonBuilder.buf.c_str();
     }
   }
