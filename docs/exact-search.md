@@ -140,10 +140,10 @@ certified policy in under one millisecond each with no resumed search nodes.
 
 The recorded seed-6 turn-one policy path is `[[0], [5], [0], [0]]`, which is
 used to reach the second-turn Hilda/Telepath/Boss regression without rerunning
-the turn-one proof. A 570-second Windows run after canonicalisation processed
-7,984,635 nodes with 107,496 canonical TT merges, 279,015 successor merges,
-8,612 resumed actions, 18,056 resumed chance mass, 3 ms deadline overrun, and
-773 MB peak RSS. It remained correctly uncertified because the non-End root
+the turn-one proof. A focused 570-second Windows run after canonicalisation
+processed 7,855,779 nodes with 131,899 canonical TT hits, 260,133 successor
+merges, 10,058 resumed actions, 24,799 resumed chance mass, no deadline
+overrun, and 631 MB peak RSS. It remained correctly uncertified because the non-End root
 intervals were still open; this is a measured outstanding acceptance failure,
 not treated as a proof or a successful full-turn certification.
 
