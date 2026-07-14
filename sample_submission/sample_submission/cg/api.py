@@ -696,5 +696,46 @@ def exact_decide_v2(agent_observation: Observation, deck: list[int], hand_values
     if result.get("error"): raise RuntimeError(f"ExactDecideV2 failed: {result['error']}")
     return result
 
+def exact_turn_begin(agent_observation: Observation, deck: list[int], hand_values: list[int],
+                     budget_milliseconds: int, opponent_deck: list[int] | None = None) -> dict:
+    """Start a persistent exact turn policy and return its first action."""
+    global agent_ptr
+    if not hasattr(lib, "ExactTurnBegin"):
+        raise RuntimeError("ExactTurnBegin is not available in this native library")
+    if "agent_ptr" not in globals(): agent_ptr = lib.AgentStart()
+    if len(deck) != len(hand_values): raise ValueError("deck and hand_values length mismatch")
+    serialized = agent_observation.search_begin_input
+    if serialized is None: raise ValueError("Not agent observation.")
+    own_arg = (ctypes.c_int * len(deck))(*deck)
+    value_arg = (ctypes.c_int * len(hand_values))(*hand_values)
+    opponent = list(opponent_deck or [])
+    opponent_arg = (ctypes.c_int * len(opponent))(*opponent) if opponent else None
+    raw = lib.ExactTurnBegin(agent_ptr, serialized.encode("ascii"), len(serialized),
+                             own_arg, value_arg, len(deck), opponent_arg, len(opponent),
+                             int(budget_milliseconds))
+    result = json.loads(raw.decode())
+    if result.get("error"): raise RuntimeError(f"ExactTurnBegin failed: {result['error']}")
+    return result
+
+def exact_turn_advance(session_id: int, agent_observation: Observation,
+                       budget_milliseconds: int) -> dict:
+    """Condition and re-root a persistent exact turn policy."""
+    global agent_ptr
+    if not hasattr(lib, "ExactTurnAdvance"):
+        raise RuntimeError("ExactTurnAdvance is not available in this native library")
+    serialized = agent_observation.search_begin_input
+    if serialized is None: raise ValueError("Not agent observation.")
+    raw = lib.ExactTurnAdvance(agent_ptr, int(session_id), serialized.encode("ascii"),
+                               len(serialized), int(budget_milliseconds))
+    result = json.loads(raw.decode())
+    if result.get("error"): raise RuntimeError(f"ExactTurnAdvance failed: {result['error']}")
+    return result
+
+def exact_turn_release(session_id: int) -> None:
+    """Release native memory owned by an exact turn policy."""
+    global agent_ptr
+    if hasattr(lib, "ExactTurnRelease") and "agent_ptr" in globals():
+        lib.ExactTurnRelease(agent_ptr, int(session_id))
+
 #endregion functions
 

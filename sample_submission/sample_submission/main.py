@@ -29,7 +29,7 @@ def agent(obs_dict: dict) -> list[int]:
         # The deck is a list of 60 card IDs.
         # The deck must comply with the Pokémon Trading Card Game rules.
         from exact_solver import agent_policy
-        agent_policy._budget.reset()
+        agent_policy._default_context.reset()
         agent_policy._last_turn = None
         agent_policy.last_decision = None
         agent_policy._policy_cache.clear()

@@ -25,10 +25,15 @@ class MatchBudget:
     def __init__(self, limits: ResourceLimits = ResourceLimits()):
         self.limits = limits
         self.started = time.monotonic()
+        self.used_seconds = 0.0
 
     @property
     def remaining(self) -> float:
-        return max(0.0, self.limits.match_seconds - (time.monotonic() - self.started))
+        return max(0.0, self.limits.match_seconds - self.used_seconds)
+
+    def charge(self, elapsed_seconds: float) -> None:
+        """Charge only this player's actual decision time."""
+        self.used_seconds += max(0.0, float(elapsed_seconds))
 
     def deadline(self, requested_seconds: float | None = None) -> float:
         usable = max(0.0, self.remaining - self.limits.reserve_seconds)
@@ -40,6 +45,7 @@ class MatchBudget:
 
     def reset(self) -> None:
         self.started = time.monotonic()
+        self.used_seconds = 0.0
 
 
 def current_rss_bytes() -> int:

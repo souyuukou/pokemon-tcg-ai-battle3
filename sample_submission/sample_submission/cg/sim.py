@@ -91,6 +91,21 @@ if hasattr(lib, "ExactDecideV2"):
         ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.c_int,
         ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
 
+if hasattr(lib, "ExactTurnBegin"):
+    lib.ExactTurnBegin.restype = ctypes.c_char_p
+    lib.ExactTurnBegin.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
+
+if hasattr(lib, "ExactTurnAdvance"):
+    lib.ExactTurnAdvance.restype = ctypes.c_char_p
+    lib.ExactTurnAdvance.argtypes = [
+        ctypes.c_void_p, ctypes.c_int64, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+
+if hasattr(lib, "ExactTurnRelease"):
+    lib.ExactTurnRelease.argtypes = [ctypes.c_void_p, ctypes.c_int64]
+
 lib.AllCard.restype = ctypes.c_char_p
 
 lib.AllAttack.restype = ctypes.c_char_p
