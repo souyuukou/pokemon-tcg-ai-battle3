@@ -112,6 +112,16 @@ A との直接の積集合は **`1197 Xerosic’s Machinations` 3枚だけ**で�
 
 ### 今回必要な対策
 
+2026-07-14時点のbootstrap実装では、固定デッキ同士かつXerosicの相手手札がすべて非公開の
+場合に限り、相手は「カードIDの大きいカードから捨てる」決定的方策を使う。手札の出現確率は
+全枚数ベクトルを整数重みで集約しておりサンプリングしないが、相手の最適選択ではないため
+`provisionalOpponentPolicy=true`、`certified=false`を返す。belief内で再びこの処理が必要に
+なった経路は、State群を膨張させず未認証区間として残す。
+
+closed-worldの単一root actionを監査するため、任意の相手固定デッキを受け取る
+`ExactEvaluateActionV2`も追加した。これはbootstrapのテスト用であり、本番で未知の相手デッキを
+補完するAPIではない。
+
 #### P0: Xerosic を相手手札の情報集合 Min として解く
 
 1. 効果実行後の pending から `player=opponent`, `zone=hand`, `intent=ConcreteCards` を

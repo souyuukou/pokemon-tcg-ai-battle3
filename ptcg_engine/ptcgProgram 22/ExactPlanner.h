@@ -321,6 +321,7 @@ struct ExactMetrics {
 	unsigned long long attackPreviewUnavailableCount = 0;
 	unsigned long long entityFeatureCount = 0;
 	unsigned long long comboFeatureCount = 0;
+	unsigned long long provisionalOpponentPolicyNodes = 0;
 	bool hiddenInformationLeakDetected = false;
 	bool probabilityExact = true;
 	bool informationSetSafe = true;
@@ -419,7 +420,7 @@ public:
 			else if (prior->second == retryKey) metrics.rootRetryKeyMatches++;
 			else metrics.rootRetryKeyMismatches++;
 			result.score = child.exact.pending == ExactPendingType::RevealDeck
-				? revealAndReplay(root, { optionIndex }) : solveOwned(std::make_unique<State>(std::move(child)));
+				? revealAndReplay(root, child.exact, { optionIndex }) : solveOwned(std::make_unique<State>(std::move(child)));
 			result.score.action = { optionIndex };
 		}
 		applyEvaluatorSafety(result);
@@ -1194,11 +1195,328 @@ private:
 		state.exact.clearPending();
 	}
 
-	bool expandRevealBelief(const State& parent, const std::vector<int>& action,
+	bool isMajkelFixedProfile(const std::unordered_map<int, int>& profile) const {
+		static const std::array<std::pair<int, int>, 22> expected = {{
+			{ 5, 2 }, { 13, 1 }, { 19, 4 }, { 66, 2 }, { 140, 1 }, { 305, 3 },
+			{ 343, 1 }, { 741, 4 }, { 742, 4 }, { 743, 4 }, { 1079, 3 }, { 1081, 4 },
+			{ 1086, 4 }, { 1097, 1 }, { 1129, 1 }, { 1152, 4 }, { 1182, 3 }, { 1184, 1 },
+			{ 1197, 3 }, { 1225, 4 }, { 1231, 4 }, { 1266, 2 }
+		}};
+		if (profile.size() != expected.size()) return false;
+		for (const auto& item : expected) {
+			auto found = profile.find(item.first);
+			if (found == profile.end() || found->second != item.second) return false;
+		}
+		return true;
+	}
+
+	static AreaType pendingArea(const ExactHiddenState& request) {
+		int detail = request.pendingDetail;
+		if (request.pendingPlayer >= 0) detail -= 100 * request.pendingPlayer;
+		return (AreaType)detail;
+	}
+
+	void materializeUnknownHand(State& state, int player, const std::vector<int>& handCounts) {
+		std::vector<int> ids;
+		for (int i = 0; i < state.exact.typeCount[player]; ++i)
+			for (int n = 0; n < handCounts[i]; ++n) ids.push_back(state.exact.cardId[player][i]);
+		std::sort(ids.begin(), ids.end());
+		int at = 0;
+		for (int i = 0; i < state.players[player].hand.size(); ++i) {
+			if (!state.players[player].hand[i].isNull()) continue;
+			if (at >= (int)ids.size()) throw std::runtime_error("hand-only materialization mismatch");
+			materialize(state, player, AreaType::Hand, i, ids[at++]);
+		}
+		if (at != (int)ids.size()) throw std::runtime_error("hand-only materialization overflow");
+		state.exact.clearPending();
+	}
+
+	bool selectProvisionalXerosicDiscard(State& state, int player,
+		std::unordered_map<int, int>& discarded) {
+		if (state.selectPlayer != player || state.selectType != SelectType::Card
+			|| state.selectMin != state.selectMax || state.selectMin <= 0) return false;
+		std::vector<std::pair<int, int>> candidates;
+		for (int optionIndex = 0; optionIndex < (int)state.options.size(); ++optionIndex) {
+			const SelectOption& option = state.options[optionIndex];
+			if (option.type != SelectOptionType::Card) continue;
+			CardPosition position = option.getCardPosition();
+			if (position.playerIndex != player || position.area != AreaType::Hand) continue;
+			CardRef ref = state.getCardRef(position);
+			if (ref.isNull()) return false;
+			candidates.push_back({ state.getCard(ref).cardId, optionIndex });
+		}
+		if ((int)candidates.size() < state.selectMin) return false;
+		// Stable bootstrap policy: discard the highest card IDs first.  This is
+		// deliberately simple and is never reported as a minimax certificate.
+		std::sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
+			if (left.first != right.first) return left.first > right.first;
+			return left.second < right.second;
+		});
+		std::vector<int> selected;
+		for (int i = 0; i < state.selectMin; ++i) {
+			selected.push_back(candidates[i].second);
+			discarded[candidates[i].first]++;
+		}
+		std::sort(selected.begin(), selected.end());
+		return advance(state, selected);
+	}
+
+	void anonymizeXerosicHand(State& state, int player, const std::vector<int>& originalBounds,
+		const std::unordered_map<int, int>& discarded) {
+		PlayerState& ps = state.players[player];
+		for (int i = 0; i < ps.hand.size(); ++i) {
+			CardRef ref = ps.hand[i];
+			if (ref.isNull()) continue;
+			state.allCard[ref.cardIndex] = {};
+			ps.hand[i] = CardRef(0);
+		}
+		for (int i = 0; i < state.exact.typeCount[player]; ++i) {
+			int count = originalBounds[i];
+			auto found = discarded.find(state.exact.cardId[player][i]);
+			if (found != discarded.end()) count -= found->second;
+			if (count < 0 || count > 255) throw std::runtime_error("Xerosic hidden pool mismatch");
+			state.exact.cardCount[player][i] = (unsigned char)count;
+		}
+		state.exact.deckUnknown[player] = true;
+		state.exact.prizeExchangeable[player] = true;
+		state.exact.provisionalOpponentPolicy = true;
+		state.exact.clearPending();
+	}
+
+	bool expandProvisionalXerosicBelief(const State& parent, const ExactHiddenState& request,
+		const std::vector<int>& action, const ExactWeight& baseWeight,
+		const std::array<ExactKnowledgeState, 2>& baseKnowledge, std::vector<BeliefWorld>& output) {
+		const int player = request.pendingPlayer;
+		if (request.pendingEffectCardId != 1197 || pendingArea(request) != AreaType::Hand
+			|| !isMajkelFixedProfile(actorProfileCount) || !isMajkelFixedProfile(opponentProfileCount)) return false;
+		int handSize = 0;
+		for (CardRef ref : parent.players[player].hand) {
+			if (!ref.isNull()) return false; // fixed-deck bootstrap supports a fully hidden hand
+			handSize++;
+		}
+		if (handSize <= 3) return false;
+		std::vector<int> bounds(parent.exact.typeCount[player]);
+		int totalHidden = 0;
+		for (int i = 0; i < (int)bounds.size(); ++i) {
+			bounds[i] = parent.exact.cardCount[player][i]; totalHidden += bounds[i];
+		}
+		if (handSize > totalHidden) return false;
+		ExactWeight expected = ExactWeight::multiply(baseWeight, chooseCount(totalHidden, handSize));
+		BoundedCompositionCursor cursor; cursor.reset(bounds, handSize);
+		std::vector<int> handCounts;
+		struct Outcome {
+			std::vector<int> representativeHand;
+			std::vector<int> discarded;
+			ExactWeight weight;
+		};
+		std::vector<int> idOrder(bounds.size());
+		std::iota(idOrder.begin(), idOrder.end(), 0);
+		std::sort(idOrder.begin(), idOrder.end(), [&](int left, int right) {
+			return parent.exact.cardId[player][left] < parent.exact.cardId[player][right];
+		});
+		struct CountKeyHash { size_t operator()(const std::array<unsigned char, DECK_SIZE>& key) const noexcept {
+			size_t value = 1469598103934665603ULL;
+			for (unsigned char count : key) { value ^= count; value *= 1099511628211ULL; }
+			return value;
+		} };
+		std::unordered_map<std::array<unsigned char, DECK_SIZE>, size_t, CountKeyHash> byDiscard;
+		std::vector<Outcome> outcomes;
+		ExactWeight generated;
+		unsigned long long raw = 0;
+		while (cursor.next(handCounts)) {
+			if (expired()) return false;
+			ExactWeight allocation(1);
+			for (int i = 0; i < (int)bounds.size(); ++i)
+				allocation = ExactWeight::multiply(allocation, chooseCount(bounds[i], handCounts[i]));
+			ExactWeight weight = ExactWeight::multiply(baseWeight, allocation);
+			std::array<unsigned char, DECK_SIZE> discardKey{};
+			for (int i = 0; i < (int)handCounts.size(); ++i) discardKey[i] = (unsigned char)handCounts[i];
+			int keep = 3;
+			for (int index : idOrder) {
+				int count = std::min(keep, (int)discardKey[index]);
+				discardKey[index] = (unsigned char)(discardKey[index] - count); keep -= count;
+				if (keep == 0) break;
+			}
+			if (keep != 0) return false;
+			auto found = byDiscard.find(discardKey);
+			if (found == byDiscard.end()) {
+				byDiscard.emplace(discardKey, outcomes.size());
+				std::vector<int> discardCounts(handCounts.size());
+				for (int i = 0; i < (int)discardCounts.size(); ++i) discardCounts[i] = discardKey[i];
+				outcomes.push_back({ handCounts, std::move(discardCounts), weight });
+			} else { outcomes[found->second].weight += weight; metrics.distributionMerges++; }
+			generated += weight; raw++; metrics.enumeratedHiddenWorlds++;
+		}
+		if (generated != expected) {
+			metrics.chanceMassMismatches++; metrics.probabilityExact = false; return false;
+		}
+		std::unordered_map<std::string, size_t, ExactStringHasher> bySuccessor;
+		for (const Outcome& outcome : outcomes) {
+			if (expired()) return false;
+			auto child = std::make_unique<State>(parent);
+			try {
+				materializeUnknownHand(*child, player, outcome.representativeHand);
+				if (!advance(*child, action)) return false;
+				std::unordered_map<int, int> discarded;
+				if (!selectProvisionalXerosicDiscard(*child, player, discarded)) return false;
+				for (int i = 0; i < (int)outcome.discarded.size(); ++i) {
+					int expectedCount = outcome.discarded[i];
+					int actualCount = discarded[parent.exact.cardId[player][i]];
+					if (actualCount != expectedCount) return false;
+				}
+				anonymizeXerosicHand(*child, player, bounds, discarded);
+			} catch (...) { return false; }
+			BeliefWorld candidate{ std::move(child), outcome.weight, baseKnowledge };
+			std::string key = beliefWorldKey(candidate);
+			auto found = bySuccessor.find(key);
+			if (found == bySuccessor.end()) {
+				bySuccessor.emplace(std::move(key), output.size()); output.push_back(std::move(candidate));
+			} else { output[found->second].weight += outcome.weight; metrics.distributionMerges++; }
+		}
+		metrics.rawOutcomes += raw; metrics.groupedOutcomes += outcomes.size();
+		metrics.provisionalOpponentPolicyNodes++;
+		return !output.empty();
+	}
+
+	ExactScore solveProvisionalXerosicStreaming(const State& parent, const ExactHiddenState& request,
+		const std::vector<int>& action) {
+		const int player = request.pendingPlayer;
+		if (request.pendingEffectCardId != 1197 || pendingArea(request) != AreaType::Hand
+			|| !isMajkelFixedProfile(actorProfileCount) || !isMajkelFixedProfile(opponentProfileCount)) return unknown();
+		int handSize = 0;
+		for (CardRef ref : parent.players[player].hand) {
+			if (!ref.isNull()) return unknown();
+			handSize++;
+		}
+		std::vector<int> bounds(parent.exact.typeCount[player]);
+		int totalHidden = 0;
+		for (int i = 0; i < (int)bounds.size(); ++i) {
+			bounds[i] = parent.exact.cardCount[player][i]; totalHidden += bounds[i];
+		}
+		if (handSize <= 3 || handSize > totalHidden) return unknown();
+		struct Outcome { std::vector<int> hand, discarded; unsigned long long weight = 0; };
+		std::vector<int> idOrder(bounds.size()); std::iota(idOrder.begin(), idOrder.end(), 0);
+		std::sort(idOrder.begin(), idOrder.end(), [&](int left, int right) {
+			return parent.exact.cardId[player][left] < parent.exact.cardId[player][right];
+		});
+		std::vector<Outcome> outcomes;
+		BoundedCompositionCursor discardCursor; discardCursor.reset(bounds, handSize - 3);
+		std::vector<int> discardCounts;
+		unsigned long long generated = 0;
+		unsigned long long raw = 0;
+		while (discardCursor.next(discardCounts)) {
+			if (expired()) return unknown();
+			int firstDiscard = -1;
+			for (int index : idOrder) if (discardCounts[index] > 0) { firstDiscard = index; break; }
+			if (firstDiscard < 0) return unknown();
+			std::vector<int> keepBounds(bounds.size());
+			const int boundaryId = parent.exact.cardId[player][firstDiscard];
+			for (int i = 0; i < (int)bounds.size(); ++i) {
+				int remaining = bounds[i] - discardCounts[i];
+				keepBounds[i] = parent.exact.cardId[player][i] <= boundaryId ? remaining : 0;
+			}
+			BoundedCompositionCursor keepCursor; keepCursor.reset(keepBounds, 3);
+			std::vector<int> keptCounts, representative;
+			unsigned long long outcomeWeight = 0;
+			while (keepCursor.next(keptCounts)) {
+				unsigned long long weight = 1;
+				for (int i = 0; i < (int)bounds.size(); ++i) {
+					ExactWeight factor = chooseCount(bounds[i], discardCounts[i] + keptCounts[i]);
+					if (!factor.fitsUnsignedLongLong()
+						|| factor.unsignedLongLong() > std::numeric_limits<unsigned long long>::max() / weight)
+						return unknown();
+					weight *= factor.unsignedLongLong();
+				}
+				if (outcomeWeight > std::numeric_limits<unsigned long long>::max() - weight) return unknown();
+				outcomeWeight += weight; raw++; metrics.enumeratedHiddenWorlds++;
+				if (representative.empty()) {
+					representative.resize(bounds.size());
+					for (int i = 0; i < (int)bounds.size(); ++i)
+						representative[i] = discardCounts[i] + keptCounts[i];
+				}
+			}
+			if (outcomeWeight == 0 || representative.empty()) continue;
+			if (generated > std::numeric_limits<unsigned long long>::max() - outcomeWeight) return unknown();
+			generated += outcomeWeight;
+			outcomes.push_back({ std::move(representative), discardCounts, outcomeWeight });
+		}
+		ExactWeight totalWeight = chooseCount(totalHidden, handSize);
+		if (!totalWeight.fitsUnsignedLongLong()) return unknown();
+		unsigned long long total = totalWeight.unsignedLongLong();
+		if (generated != total) {
+			metrics.chanceMassMismatches++; metrics.probabilityExact = false; return unknown();
+		}
+		metrics.rawOutcomes += raw; metrics.groupedOutcomes += outcomes.size();
+		metrics.provisionalOpponentPolicyNodes++;
+		// MSVC's heap keeps the pages touched by the many tiny composition
+		// temporaries in the working set even though only the compact outcomes
+		// remain live.  The fixed-deck bootstrap is allowed up to the match-wide
+		// 3 GiB limit; record the real peak, fail before crossing it, then return
+		// unused pages before recursive search applies the normal 2.7 GiB guard.
+		unsigned long long enumerationRss = ExactResidentBytes();
+		metrics.peakRssBytes = std::max(metrics.peakRssBytes, enumerationRss);
+		if (enumerationRss >= 3ULL * 1024ULL * 1024ULL * 1024ULL) {
+			metrics.memoryLimitReached = true; return unknown();
+		}
+		metrics.memoryLimitReached = false; // the provisional enumerator is governed by the 3 GiB check above
+#ifdef _WIN32
+		SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+#endif
+		resourceCheckCounter = 0; // allow the working-set trim to take effect before the next sample
+		ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
+		unsigned long long processed = 0;
+		for (const Outcome& outcome : outcomes) {
+			// A transient 2.7 GiB bootstrap mark must not prevent evaluation after
+			// the explicit 3 GiB check and working-set trim above.
+			metrics.memoryLimitReached = false;
+			if (expired()) break;
+			auto child = std::make_unique<State>(parent);
+			try {
+				materializeUnknownHand(*child, player, outcome.hand);
+				if (!advance(*child, action)) return unknown();
+				std::unordered_map<int, int> discarded;
+				if (!selectProvisionalXerosicDiscard(*child, player, discarded)) return unknown();
+				for (int i = 0; i < (int)outcome.discarded.size(); ++i)
+					if (discarded[parent.exact.cardId[player][i]] != outcome.discarded[i]) return unknown();
+				anonymizeXerosicHand(*child, player, bounds, discarded);
+			} catch (...) { return unknown(); }
+			ExactScore score = solveOwned(std::move(child));
+			lower = ExactFraction::add(lower, score.lower.scaled(outcome.weight, total));
+			upper = ExactFraction::add(upper, score.upper.scaled(outcome.weight, total));
+			if (processed > std::numeric_limits<unsigned long long>::max() - outcome.weight) return unknown();
+			processed += outcome.weight;
+			if (!lower.valid || !upper.valid) { metrics.arithmeticOverflow = true; return unknown(); }
+#ifdef _WIN32
+			// State is intentionally streamed, but it is large enough that the CRT
+			// heap otherwise retains every freed State page until the call ends.
+			SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
+#endif
+			unsigned long long currentRss = ExactResidentBytes();
+			metrics.peakRssBytes = std::max(metrics.peakRssBytes, currentRss);
+			if (currentRss >= 3ULL * 1024ULL * 1024ULL * 1024ULL) {
+				metrics.memoryLimitReached = true; break;
+			}
+		}
+		unsigned long long remaining = processed >= total ? 0 : total - processed;
+		if (remaining != 0) {
+			lower = ExactFraction::add(lower, ExactFraction::integer(-100'000'000).scaled(remaining, total));
+			upper = ExactFraction::add(upper, ExactFraction::integer(100'000'000).scaled(remaining, total));
+			metrics.partialChanceNodes++;
+		}
+		if (metrics.peakRssBytes < 3ULL * 1024ULL * 1024ULL * 1024ULL)
+			metrics.memoryLimitReached = false;
+		return { lower, upper, {}, false };
+	}
+
+	bool expandRevealBelief(const State& parent, const ExactHiddenState& request,
+		const std::vector<int>& action,
 		const ExactWeight& baseWeight, const std::array<ExactKnowledgeState, 2>& baseKnowledge,
 		std::vector<BeliefWorld>& output) {
-		int player = parent.exact.pendingPlayer >= 0 ? parent.exact.pendingPlayer : actor;
+		int player = request.pendingPlayer;
+		if (player < 0 || player >= 2 || request.pending != ExactPendingType::RevealDeck) return false;
 		if (!parent.exact.profileKnown[player]) return false;
+		if (request.pendingEffectCardId == 1197 && pendingArea(request) == AreaType::Hand)
+			return false; // handled by streaming or deferred as an unproven belief action
 		int prizeSize = 0; for (CardRef ref : parent.players[player].prize) if (ref.isNull()) prizeSize++;
 		int handSize = 0; for (CardRef ref : parent.players[player].hand) if (ref.isNull()) handSize++;
 		int totalHidden = 0;
@@ -1210,8 +1528,10 @@ private:
 		ExactWeight expected = ExactWeight::multiply(baseWeight,
 			ExactWeight::multiply(chooseCount(totalHidden, prizeSize), chooseCount(totalHidden - prizeSize, handSize)));
 		noteWeight(expected);
-		std::string revealKey = keyFor(parent) + "\x1f" "BR2" "\x1f" + actionEquivalenceKey(parent, action)
+		std::string revealKey = keyFor(parent) + "\x1f" "BR3" "\x1f" + actionEquivalenceKey(parent, action)
 			+ "\x1f" + baseWeight.text();
+		appendSemantic(revealKey, player); appendSemantic(revealKey, request.pendingDetail);
+		appendSemantic(revealKey, request.pendingEffectCardId); appendSemantic(revealKey, request.pendingEffectPlayer);
 		for (int observer = 0; observer < 2; ++observer) appendKnowledgeKey(revealKey, baseKnowledge[observer]);
 		auto [found, inserted] = partialBeliefReveals.try_emplace(revealKey);
 		PartialBeliefRevealEntry& partial = found->second;
@@ -1275,10 +1595,13 @@ private:
 		return true;
 	}
 
-	ExactScore revealAndReplay(const State& parent, const std::vector<int>& action) {
+	ExactScore revealAndReplay(const State& parent, const ExactHiddenState& request,
+		const std::vector<int>& action) {
+		if (request.pendingEffectCardId == 1197 && pendingArea(request) == AreaType::Hand)
+			return solveProvisionalXerosicStreaming(parent, request, action);
 		std::vector<BeliefWorld> worlds;
 		auto knowledge = initialKnowledge();
-		if (!expandRevealBelief(parent, action, ExactWeight(1), knowledge, worlds) || worlds.empty()) return unknown();
+		if (!expandRevealBelief(parent, request, action, ExactWeight(1), knowledge, worlds) || worlds.empty()) return unknown();
 		metrics.beliefWorldsBefore += worlds.size();
 		return solveBelief(std::move(worlds));
 	}
@@ -1489,6 +1812,7 @@ private:
 		for (const CommonAction& common : actions) {
 			if (expired()) return unknown();
 			std::vector<BeliefWorld> children;
+			bool provisionalBeliefDeferred = false;
 			for (const BeliefWorld& world : worlds) {
 				std::vector<int> mapped;
 				if (!remapAction(*world.state, common.semantic, mapped)) {
@@ -1498,10 +1822,16 @@ private:
 				auto child = std::make_unique<State>(*world.state);
 				if (!advance(*child, mapped)) return unknown();
 				if (child->exact.pending == ExactPendingType::RevealDeck) {
-					if (!expandRevealBelief(*world.state, mapped, world.weight, world.knowledge, children)) return unknown();
+					if (child->exact.pendingEffectCardId == 1197 && pendingArea(child->exact) == AreaType::Hand) {
+						// The bootstrap policy is streamed only from a single concrete
+						// root.  Expanding it inside another belief would multiply large
+						// State sets, so retain an honest unproven interval for now.
+						provisionalBeliefDeferred = true; metrics.provisionalOpponentPolicyNodes++; break;
+					}
+					if (!expandRevealBelief(*world.state, child->exact, mapped, world.weight, world.knowledge, children)) return unknown();
 				} else children.push_back({ std::move(child), world.weight, world.knowledge });
 			}
-			ExactScore score = solveBelief(std::move(children));
+			ExactScore score = provisionalBeliefDeferred ? unknown() : solveBelief(std::move(children));
 			if (first || (maximize ? ExactCompare(score.lower, best.lower) > 0
 				: ExactCompare(score.upper, best.upper) < 0)) {
 				best = score; best.action = common.representative; first = false;
@@ -1560,6 +1890,9 @@ private:
 			std::vector<std::pair<ExactScore, ExactWeight>> scores;
 			for (auto& item : observations) {
 				ExactWeight mass = beliefMass(item.second);
+				bool policyCertified = true;
+				for (const BeliefWorld& world : item.second)
+					policyCertified = policyCertified && !world.state->exact.provisionalOpponentPolicy;
 				std::vector<std::string> beliefTokens;
 				for (const BeliefWorld& world : item.second)
 					beliefTokens.push_back(beliefWorldKey(world) + "@" + world.weight.text());
@@ -1570,7 +1903,7 @@ private:
 				long long value;
 				if (cached != evaluationCache.end()) value = cached->second;
 				else { value = evaluateBeliefInformationState(item.second, mass); evaluationCache.emplace(std::move(cacheKey), value); }
-				scores.push_back({ { ExactFraction::integer(value), ExactFraction::integer(value), {}, true }, mass });
+				scores.push_back({ { ExactFraction::integer(value), ExactFraction::integer(value), {}, policyCertified }, mass });
 				metrics.leaves++;
 			}
 			return finish(aggregateBeliefScores(scores, total));
@@ -1833,7 +2166,7 @@ private:
 				}
 			} else {
 				score = child->exact.pending == ExactPendingType::RevealDeck
-					? revealAndReplay(state, action) : solveOwned(std::move(child));
+					? revealAndReplay(state, child->exact, action) : solveOwned(std::move(child));
 			}
 			if (partial != nullptr) {
 				auto found = partial->actionBounds.find(actionKey);
@@ -1914,7 +2247,7 @@ private:
 		if (state.isFinish() || IsExactTurnLeaf(state)) {
 			metrics.leaves++;
 			auto value = ExactFraction::integer(evaluate(state));
-			return { value, value, {}, true };
+			return { value, value, {}, !state.exact.provisionalOpponentPolicy };
 		}
 		std::string key = keyFor(state);
 		const bool shareable = usingSharedTable;

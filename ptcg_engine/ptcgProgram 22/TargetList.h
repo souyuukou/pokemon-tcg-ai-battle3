@@ -728,7 +728,11 @@ inline void TargetList(const State& state, const Target& target, std::vector<Are
 					}
 					break;
 				case AreaType::Hand:
-					if (deferUnknown(ps.hand, ExactPendingType::Opaque)) return;
+					// A known validation profile can enumerate an unknown hand in the
+					// same replayable way as a deck reveal.  The pending detail keeps
+					// the actual zone, so the planner does not expose the deck merely
+					// because the implementation uses one interruption kind.
+					if (deferUnknown(ps.hand, ExactPendingType::RevealDeck)) return;
 					if (target.skipEnemyTarget && playerIndex != state.getCard(effectCard.card).playerIndex) {
 						for (CardRef ref : ps.hand) {
 							output.push_back(state.makeAreaRef(ref));

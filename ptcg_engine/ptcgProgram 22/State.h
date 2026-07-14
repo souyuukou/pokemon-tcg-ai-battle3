@@ -81,6 +81,10 @@ struct ExactHiddenState {
 	std::array<std::array<int, DECK_SIZE>, 2> cardId = {};
 	std::array<std::array<unsigned char, DECK_SIZE>, 2> cardCount = {};
 	std::array<bool, 2> profileKnown = {};
+	// The fixed-deck bootstrap may use a deterministic opponent choice while
+	// retaining exact chance weights.  Such a state is playable and evaluable,
+	// but it is not a minimax certificate.
+	bool provisionalOpponentPolicy = false;
 
 	void clearPending() {
 		pending = ExactPendingType::None;

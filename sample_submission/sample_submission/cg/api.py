@@ -747,6 +747,27 @@ def exact_decide_v2(agent_observation: Observation, deck: list[int], hand_values
     if result.get("error"): raise RuntimeError(f"ExactDecideV2 failed: {result['error']}")
     return result
 
+def exact_evaluate_action_v2(agent_observation: Observation, deck: list[int], hand_values: list[int],
+                             budget_milliseconds: int, option_index: int,
+                             opponent_deck: list[int] | None = None) -> dict:
+    """Evaluate one root option with an optional closed-world opponent profile."""
+    global agent_ptr
+    if not hasattr(lib, "ExactEvaluateActionV2"):
+        raise RuntimeError("ExactEvaluateActionV2 is not available in this native library")
+    if "agent_ptr" not in globals(): agent_ptr = lib.AgentStart()
+    if len(deck) != len(hand_values): raise ValueError("deck and hand_values length mismatch")
+    serialized = agent_observation.search_begin_input
+    own_arg = (ctypes.c_int * len(deck))(*deck)
+    value_arg = (ctypes.c_int * len(hand_values))(*hand_values)
+    opponent = list(opponent_deck or [])
+    opponent_arg = (ctypes.c_int * len(opponent))(*opponent) if opponent else None
+    raw = lib.ExactEvaluateActionV2(agent_ptr, serialized.encode("ascii"), len(serialized),
+                                    own_arg, value_arg, len(deck), opponent_arg, len(opponent),
+                                    int(budget_milliseconds), int(option_index))
+    result = json.loads(raw.decode())
+    if result.get("error"): raise RuntimeError(f"ExactEvaluateActionV2 failed: {result['error']}")
+    return result
+
 def exact_turn_begin(agent_observation: Observation, deck: list[int], hand_values: list[int],
                      budget_milliseconds: int, opponent_deck: list[int] | None = None) -> dict:
     """Start a persistent exact turn policy and return its first action."""

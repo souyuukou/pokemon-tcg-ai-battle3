@@ -94,6 +94,13 @@ if hasattr(lib, "ExactDecideV2"):
         ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.c_int,
         ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int]
 
+if hasattr(lib, "ExactEvaluateActionV2"):
+    lib.ExactEvaluateActionV2.restype = ctypes.c_char_p
+    lib.ExactEvaluateActionV2.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int, ctypes.c_int]
+
 if hasattr(lib, "ExactTurnBegin"):
     lib.ExactTurnBegin.restype = ctypes.c_char_p
     lib.ExactTurnBegin.argtypes = [

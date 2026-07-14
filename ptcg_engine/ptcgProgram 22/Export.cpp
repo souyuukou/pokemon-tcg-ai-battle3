@@ -369,6 +369,9 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
 	 j.appendCommaKey("attackPreviewUnavailableCount"); AppendUnsignedLongLong(j, decision.metrics.attackPreviewUnavailableCount);
 	 j.appendCommaKey("entityFeatureCount"); AppendUnsignedLongLong(j, decision.metrics.entityFeatureCount);
 	 j.appendCommaKey("comboFeatureCount"); AppendUnsignedLongLong(j, decision.metrics.comboFeatureCount);
+	 j.appendCommaKey("provisionalOpponentPolicyNodes"); AppendUnsignedLongLong(j, decision.metrics.provisionalOpponentPolicyNodes);
+	 j.appendCommaKeyValue("provisionalOpponentPolicy", decision.metrics.provisionalOpponentPolicyNodes > 0);
+	 j.appendCommaKeyValue("opponentPolicyOptimal", decision.metrics.provisionalOpponentPolicyNodes == 0);
 	 j.appendCommaKeyValue("hiddenInformationLeakDetected", decision.metrics.hiddenInformationLeakDetected);
 	 j.appendCommaKey("rootActions"); j.append('[');
 	 for (int ri : range(decision.rootActions)) {
@@ -434,6 +437,7 @@ static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
 	into.attackPreviewExactCount += from.attackPreviewExactCount;
 	into.attackPreviewUnavailableCount += from.attackPreviewUnavailableCount;
 	into.entityFeatureCount += from.entityFeatureCount; into.comboFeatureCount += from.comboFeatureCount;
+	into.provisionalOpponentPolicyNodes += from.provisionalOpponentPolicyNodes;
 	into.hiddenInformationLeakDetected = into.hiddenInformationLeakDetected || from.hiddenInformationLeakDetected;
 	into.probabilityExact = into.probabilityExact && from.probabilityExact;
 	into.informationSetSafe = into.informationSetSafe && from.informationSetSafe;
@@ -644,6 +648,7 @@ static const char8_t* ExactProgressJson(ApiData* data, long long sessionId, cons
   j.appendCommaKeyValue("informationSetSafe", metrics.informationSetSafe);
   j.appendCommaKey("beliefNodes"); AppendUnsignedLongLong(j, metrics.beliefNodes);
   j.appendCommaKey("informationSets"); AppendUnsignedLongLong(j, metrics.informationSets);
+	j.appendCommaKey("provisionalOpponentPolicyNodes"); AppendUnsignedLongLong(j, metrics.provisionalOpponentPolicyNodes);
   j.appendCommaKey("bigWeightPromotions"); AppendUnsignedLongLong(j, metrics.bigWeightPromotions);
   j.appendCommaKeyValue("maxWeightBits", (int)metrics.maxWeightBits);
   j.append('}');
@@ -867,6 +872,26 @@ extern "C" {
           opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount,
           nullptr, data->exactEvaluator);
       return ExactDecisionJson(data, planner.decide(data->state));
+    } catch (...) {
+      data->jsonBuilder.clear(); data->jsonBuilder.appendStr("{\"error\":99}");
+      return data->jsonBuilder.buf.c_str();
+    }
+  }
+
+  GAME_API const char8_t* ExactEvaluateActionV2(ApiData* data, const char* serialized, int count,
+      int* deck, int* handValues, int deckCount, int* opponentDeck, int opponentDeckCount,
+      int budgetMilliseconds, int optionIndex) {
+    if (data->apiDataType != 2 || deckCount <= 0 || deckCount > DECK_SIZE
+        || opponentDeckCount < 0 || opponentDeckCount > DECK_SIZE) {
+      data->jsonBuilder.clear(); data->jsonBuilder.appendStr("{\"error\":30}");
+      return data->jsonBuilder.buf.c_str();
+    }
+    try {
+      SetBattleData(data, serialized, count);
+      ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds,
+          opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount,
+          nullptr, data->exactEvaluator);
+      return ExactDecisionJson(data, planner.evaluateRootAction(data->state, optionIndex));
     } catch (...) {
       data->jsonBuilder.clear(); data->jsonBuilder.appendStr("{\"error\":99}");
       return data->jsonBuilder.buf.c_str();

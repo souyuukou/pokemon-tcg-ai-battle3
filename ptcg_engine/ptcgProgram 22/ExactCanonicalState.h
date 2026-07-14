@@ -269,7 +269,7 @@ private:
 		pod(exact.prizeExchangeable); pod(exact.pending); pod(exact.pendingPlayer); pod(exact.pendingCount);
 		pod(exact.pendingDetail); pod(exact.pendingIntent); pod(exact.blockReason); pod(exact.pendingEffectCardId);
 		pod(exact.pendingEffectPlayer); pod(exact.pendingSkillId); pod(exact.pendingNullCount); pod(exact.typeCount);
-		pod(exact.cardId); pod(exact.cardCount); pod(exact.profileKnown);
+		pod(exact.cardId); pod(exact.cardCount); pod(exact.profileKnown); pod(exact.provisionalOpponentPolicy);
 		for (const TurnHistory& history : scalar.turnHistories) {
 			pod(history.ko); pod(history.koTeamRocket); pod(history.koAttackDamage);
 			pod(history.koAttackDamageEthan); pod(history.koAttackDamageHop);
