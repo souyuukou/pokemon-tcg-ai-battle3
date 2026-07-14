@@ -118,7 +118,7 @@ inline CardRef MoveCard(State& state, int playerIndex, AreaType fromArea, int fr
 	if (state.exact.enabled && toArea == AreaType::Deck
 		&& state.exact.deckUnknown[playerIndex]
 		&& fromArea != AreaType::Deck && fromArea != AreaType::DeckBottom) {
-		state.exact.addHiddenCard(state.getCard(ref).cardId);
+		state.exact.addHiddenCard(playerIndex, state.getCard(ref).cardId);
 	}
 	if (!noLog) {
 		if (toArea != AreaType::PreEvolution) {
@@ -269,7 +269,13 @@ inline void ShuffleDeck(State& state, int playerIndex, bool noLog = false) {
 		} else if (state.game->config.deviceRand) {
 			std::shuffle(ps.deck.begin(), ps.deck.end(), std::random_device());
 		} else {
-			std::shuffle(ps.deck.begin(), ps.deck.end(), state.game->rng);
+			// std::shuffle is permitted to use different algorithms on MSVC and
+			// libstdc++.  Seeded regression battles require byte-for-byte replay
+			// across platforms, so use an explicit Fisher-Yates mapping.
+			for (int i = (int)ps.deck.size() - 1; i > 0; --i) {
+				int j = (int)(state.game->rng() % (unsigned int)(i + 1));
+				std::swap(ps.deck[i], ps.deck[j]);
+			}
 		}
 		if (!noLog) {
 			LogShuffle(state, playerIndex);

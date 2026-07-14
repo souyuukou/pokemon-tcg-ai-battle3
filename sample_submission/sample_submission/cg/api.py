@@ -660,5 +660,41 @@ def exact_decide(agent_observation: Observation, deck: list[int], hand_values: l
         raise RuntimeError(f"ExactDecide failed: {result['error']}")
     return result
 
+def exact_evaluate_action(agent_observation: Observation, deck: list[int], hand_values: list[int],
+                          budget_milliseconds: int, option_index: int) -> dict:
+    """Evaluate one root option; intended for deterministic exact-search diagnostics."""
+    global agent_ptr
+    if not hasattr(lib, "ExactEvaluateAction"):
+        raise RuntimeError("ExactEvaluateAction is not available in this native library")
+    if "agent_ptr" not in globals(): agent_ptr = lib.AgentStart()
+    serialized = agent_observation.search_begin_input
+    deck_arg = (ctypes.c_int * len(deck))(*deck)
+    value_arg = (ctypes.c_int * len(hand_values))(*hand_values)
+    raw = lib.ExactEvaluateAction(agent_ptr, serialized.encode("ascii"), len(serialized),
+                                  deck_arg, value_arg, len(deck), int(budget_milliseconds), int(option_index))
+    result = json.loads(raw.decode())
+    if result.get("error"): raise RuntimeError(f"ExactEvaluateAction failed: {result['error']}")
+    return result
+
+def exact_decide_v2(agent_observation: Observation, deck: list[int], hand_values: list[int],
+                    budget_milliseconds: int, opponent_deck: list[int] | None = None) -> dict:
+    """Exact search with an optional known opponent deck for validation runs."""
+    global agent_ptr
+    if not hasattr(lib, "ExactDecideV2"):
+        raise RuntimeError("ExactDecideV2 is not available in this native library")
+    if "agent_ptr" not in globals(): agent_ptr = lib.AgentStart()
+    if len(deck) != len(hand_values): raise ValueError("deck and hand_values length mismatch")
+    serialized = agent_observation.search_begin_input
+    own_arg = (ctypes.c_int * len(deck))(*deck)
+    value_arg = (ctypes.c_int * len(hand_values))(*hand_values)
+    opponent = list(opponent_deck or [])
+    opponent_arg = (ctypes.c_int * len(opponent))(*opponent) if opponent else None
+    raw = lib.ExactDecideV2(agent_ptr, serialized.encode("ascii"), len(serialized),
+                            own_arg, value_arg, len(deck), opponent_arg, len(opponent),
+                            int(budget_milliseconds))
+    result = json.loads(raw.decode())
+    if result.get("error"): raise RuntimeError(f"ExactDecideV2 failed: {result['error']}")
+    return result
+
 #endregion functions
 

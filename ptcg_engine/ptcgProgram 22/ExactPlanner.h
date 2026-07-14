@@ -4,7 +4,9 @@
 
 #include <chrono>
 #include <numeric>
+#include <memory>
 #include <unordered_map>
+#include <unordered_set>
 
 struct ExactFraction {
 	long long numerator = 0;
@@ -79,6 +81,41 @@ inline int ExactCompare(const ExactFraction& a, const ExactFraction& b) {
 	return a.numerator < 0 ? -cmp : cmp;
 }
 
+inline unsigned long long ExactRotl64(unsigned long long value, int bits) {
+	return (value << bits) | (value >> (64 - bits));
+}
+
+inline unsigned long long ExactSipHash24(const std::string& bytes, unsigned long long k0, unsigned long long k1) {
+	unsigned long long v0 = 0x736f6d6570736575ULL ^ k0, v1 = 0x646f72616e646f6dULL ^ k1;
+	unsigned long long v2 = 0x6c7967656e657261ULL ^ k0, v3 = 0x7465646279746573ULL ^ k1;
+	auto rounds = [&](int count) {
+		for (int i = 0; i < count; ++i) {
+			v0 += v1; v1 = ExactRotl64(v1, 13); v1 ^= v0; v0 = ExactRotl64(v0, 32);
+			v2 += v3; v3 = ExactRotl64(v3, 16); v3 ^= v2;
+			v0 += v3; v3 = ExactRotl64(v3, 21); v3 ^= v0;
+			v2 += v1; v1 = ExactRotl64(v1, 17); v1 ^= v2; v2 = ExactRotl64(v2, 32);
+		}
+	};
+	size_t offset = 0;
+	for (; offset + 8 <= bytes.size(); offset += 8) {
+		unsigned long long word = 0;
+		for (int i = 0; i < 8; ++i) word |= (unsigned long long)(unsigned char)bytes[offset + i] << (8 * i);
+		v3 ^= word; rounds(2); v0 ^= word;
+	}
+	unsigned long long tail = (unsigned long long)bytes.size() << 56;
+	for (size_t i = offset; i < bytes.size(); ++i) tail |= (unsigned long long)(unsigned char)bytes[i] << (8 * (i - offset));
+	v3 ^= tail; rounds(2); v0 ^= tail; v2 ^= 0xff; rounds(4);
+	return v0 ^ v1 ^ v2 ^ v3;
+}
+
+struct ExactStringHasher {
+	size_t operator()(const std::string& bytes) const noexcept {
+		unsigned long long lo = ExactSipHash24(bytes, 0x7766554433221100ULL, 0xffeeddccbbaa9988ULL);
+		unsigned long long hi = ExactSipHash24(bytes, 0x8899aabbccddeeffULL, 0x0011223344556677ULL);
+		return (size_t)(lo ^ ExactRotl64(hi, 1));
+	}
+};
+
 struct ExactScore {
 	ExactFraction lower = ExactFraction::integer(-100'000'000);
 	ExactFraction upper = ExactFraction::integer(100'000'000);
@@ -96,6 +133,21 @@ struct ExactMetrics {
 	unsigned long long exceptions = 0;
 	std::string lastException;
 	int lastPendingDetail = 0;
+	unsigned long long unknownOpponentList = 0;
+	unsigned long long unsupportedConcreteReference = 0;
+	unsigned long long interruptedTransition = 0;
+	unsigned long long rawOutcomes = 0;
+	unsigned long long groupedOutcomes = 0;
+	unsigned long long depthLimitNodes = 0;
+	int maxDepth = 0;
+	int lastDepthSelectType = 0;
+	int lastDepthTurnActionCount = 0;
+	int rootWorkers = 1;
+	int lastPendingPlayer = -1;
+	int lastPendingEffectCardId = 0;
+	int lastPendingEffectPlayer = -1;
+	int lastPendingNullCount = 0;
+	bool lastPendingDeckUnknown = false;
 };
 
 struct ExactDecision {
@@ -105,12 +157,14 @@ struct ExactDecision {
 
 class ExactPlanner {
 public:
-	ExactPlanner(const int* deck, const int* handValues, int deckCount, int budgetMilliseconds)
+	ExactPlanner(const int* deck, const int* handValues, int deckCount, int budgetMilliseconds,
+		const int* opponentDeck = nullptr, int opponentDeckCount = 0)
 		: deadline(std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(1, budgetMilliseconds))) {
 		for (int i = 0; i < deckCount; ++i) {
-			profileCount[deck[i]]++;
+			actorProfileCount[deck[i]]++;
 			handValue[deck[i]] = handValues == nullptr ? 100 : handValues[i];
 		}
+		for (int i = 0; opponentDeck != nullptr && i < opponentDeckCount; ++i) opponentProfileCount[opponentDeck[i]]++;
 	}
 
 	ExactDecision decide(State root) {
@@ -145,25 +199,29 @@ public:
 	}
 
 private:
-	std::unordered_map<int, int> profileCount;
+	std::unordered_map<int, int> actorProfileCount;
+	std::unordered_map<int, int> opponentProfileCount;
 	std::unordered_map<int, int> handValue;
 	std::chrono::steady_clock::time_point deadline;
 	ExactMetrics metrics;
 	int actor = 0;
-	std::unordered_map<std::string, ExactScore> transposition;
+	// Two fixed SipHash-2-4 digests index the table; std::string equality still
+	// compares every canonical byte, so a digest collision cannot merge states.
+	std::unordered_map<std::string, ExactScore, ExactStringHasher> transposition;
 	static constexpr size_t MaxTranspositionEntries = 250'000;
 	static constexpr size_t MaxTranspositionBytes = 550ULL * 1024ULL * 1024ULL;
 	size_t transpositionBytes = 0;
+	int recursionDepth = 0;
 
 	bool expired() {
 		if (std::chrono::steady_clock::now() < deadline) return false;
 		metrics.timedOut = true; return true;
 	}
 
-	std::string keyFor(State state) const {
-		state.logs.clear();
-		state.logIndex = {};
-		state.selected.clear();
+	std::string keyFor(const State& input) const {
+		auto copy = std::make_unique<State>(input);
+		State& state = *copy;
+		state.logs.clear(); state.logIndex = {}; state.selected.clear();
 		BinaryWriter writer;
 		state.serialize(writer);
 		return std::string((const char*)writer.buf.data(), writer.buf.size());
@@ -173,16 +231,21 @@ private:
 		state.exact = {};
 		state.exact.enabled = true;
 		state.exact.actor = (signed char)actor;
-		auto remaining = profileCount;
-		for (const Card& card : state.allCard) {
-			auto it = remaining.find(card.cardId);
-			if (card.cardId != 0 && card.playerIndex == actor && it != remaining.end() && it->second > 0) it->second--;
-		}
-		for (const auto& [id, count] : remaining) {
-			if (count <= 0) continue;
-			int index = state.exact.typeCount++;
-			state.exact.cardId[index] = id;
-			state.exact.cardCount[index] = (unsigned char)count;
+		for (int player = 0; player < 2; ++player) {
+			const auto& profile = player == actor ? actorProfileCount : opponentProfileCount;
+			if (profile.empty()) continue;
+			state.exact.profileKnown[player] = true;
+			auto remaining = profile;
+			for (const Card& card : state.allCard) {
+				auto it = remaining.find(card.cardId);
+				if (card.cardId != 0 && card.playerIndex == player && it != remaining.end() && it->second > 0) it->second--;
+			}
+			for (const auto& [id, count] : remaining) {
+				if (count <= 0) continue;
+				int index = state.exact.typeCount[player]++;
+				state.exact.cardId[player][index] = id;
+				state.exact.cardCount[player][index] = (unsigned char)count;
+			}
 		}
 		auto hasNull = [](const auto& list) { for (CardRef ref : list) if (ref.isNull()) return true; return false; };
 		for (int p = 0; p < 2; ++p) {
@@ -222,25 +285,35 @@ private:
 
 	ExactScore unknown() const { return {}; }
 
-	std::vector<std::vector<int>> legalActions(const State& state) const {
-		std::vector<std::vector<int>> output;
-		std::vector<int> current;
-		std::function<void(int, int)> choose = [&](int start, int left) {
-			if (left == 0) { output.push_back(current); return; }
-			for (int i = start; i <= (int)state.options.size() - left; ++i) {
-				current.push_back(i); choose(i + 1, left - 1); current.pop_back();
+	template<class Callback>
+	bool forEachLegalAction(const State& state, Callback&& callback) {
+		// Evaluate End first so an interrupted main node always has a real leaf
+		// lower bound.  The regular generator skips that one duplicate.
+		int endIndex = -1;
+		if (state.selectType == SelectType::Main && state.selectMin <= 1 && state.selectMax >= 1) {
+			for (int i = 0; i < (int)state.options.size(); ++i) {
+				if (state.options[i].type == SelectOptionType::End) { endIndex = i; break; }
 			}
-		};
-		for (int count = state.selectMin; count <= state.selectMax; ++count) choose(0, count);
-		if (state.selectType == SelectType::Main) {
-			std::stable_sort(output.begin(), output.end(), [&](const auto& left, const auto& right) {
-				auto isEnd = [&](const auto& action) {
-					return action.size() == 1 && state.options[action[0]].type == SelectOptionType::End;
-				};
-				return isEnd(left) && !isEnd(right);
-			});
+			if (endIndex >= 0 && !callback(std::vector<int>{ endIndex })) return false;
 		}
-		return output;
+		std::vector<int> current;
+		std::function<bool(int, int)> choose = [&](int start, int left) {
+			if (expired()) return false;
+			if (left == 0) {
+				if (current.size() == 1 && current[0] == endIndex) return true;
+				return callback(current);
+			}
+			for (int i = start; i <= (int)state.options.size() - left; ++i) {
+				current.push_back(i);
+				if (!choose(i + 1, left - 1)) return false;
+				current.pop_back();
+			}
+			return true;
+		};
+		for (int count = state.selectMin; count <= state.selectMax; ++count) {
+			if (!choose(0, count)) return false;
+		}
+		return true;
 	}
 
 	bool advance(State& state, const std::vector<int>& action) {
@@ -257,11 +330,13 @@ private:
 			metrics.exceptions++;
 			metrics.lastException = error.what();
 			state.exact.pending = ExactPendingType::Opaque;
+			state.exact.blockReason = ExactBlockReason::Exception;
 			return true;
 		} catch (...) {
 			metrics.exceptions++;
 			metrics.lastException = "unknown";
 			state.exact.pending = ExactPendingType::Opaque;
+			state.exact.blockReason = ExactBlockReason::Exception;
 			return true;
 		}
 	}
@@ -272,14 +347,47 @@ private:
 		if (freeIndex < 0) throw std::runtime_error("no exact card slot");
 		CardRef ref(freeIndex);
 		Card& card = state.allCard[freeIndex]; card = {}; card.init(cardId, state.moveCounter++, player); card.area = area;
-		state.getCardRef(area, areaIndex, player) = ref;
+		PlayerState& ps = state.players[player];
+		switch (area) {
+		case AreaType::Deck: ps.deck.at(areaIndex) = ref; break;
+		case AreaType::Hand: ps.hand.at(areaIndex) = ref; break;
+		case AreaType::Prize: ps.prize.at(areaIndex) = ref; break;
+		default: throw std::runtime_error("unsupported exact materialization area");
+		}
 		return ref;
 	}
 
-	void decrementPool(State& state, int cardId) {
-		for (int i = 0; i < state.exact.typeCount; ++i) if (state.exact.cardId[i] == cardId) {
-			if (state.exact.cardCount[i] == 0) throw std::runtime_error("empty hidden card type");
-			state.exact.cardCount[i]--; return;
+	std::string actionEquivalenceKey(const State& state, const std::vector<int>& action) const {
+		std::vector<std::string> tokens;
+		tokens.reserve(action.size());
+		for (int selectedIndex : action) {
+			const SelectOption& option = state.options[selectedIndex];
+			std::string token;
+			if (option.type == SelectOptionType::Card) {
+				CardPosition pos = option.getCardPosition();
+				if (pos.area == AreaType::Deck && state.exact.deckExchangeable[pos.playerIndex]) {
+					CardRef ref = state.getCardRef(pos);
+					int id = ref.isNull() ? 0 : state.getCard(ref).cardId;
+					token = "D:" + std::to_string(pos.playerIndex) + ":" + std::to_string(id);
+				}
+			}
+			if (token.empty()) {
+				token = "O:" + std::to_string((int)option.type) + ":" + std::to_string(option.param0)
+					+ ":" + std::to_string(option.param1) + ":" + std::to_string(option.param2)
+					+ ":" + std::to_string(option.param3) + ":" + std::to_string(option.param4);
+			}
+			tokens.push_back(std::move(token));
+		}
+		std::sort(tokens.begin(), tokens.end());
+		std::string result;
+		for (const std::string& token : tokens) { result += std::to_string(token.size()); result += ':'; result += token; }
+		return result;
+	}
+
+	void decrementPool(State& state, int player, int cardId) {
+		for (int i = 0; i < state.exact.typeCount[player]; ++i) if (state.exact.cardId[player][i] == cardId) {
+			if (state.exact.cardCount[player][i] == 0) throw std::runtime_error("empty hidden card type");
+			state.exact.cardCount[player][i]--; return;
 		}
 		throw std::runtime_error("unknown hidden card type");
 	}
@@ -292,25 +400,30 @@ private:
 		return value;
 	}
 
-	void materializeUnknownZones(State& state, const std::vector<int>& prizeCounts) {
-		int player = state.exact.actor;
+	void materializeUnknownZones(State& state, int player, const std::vector<int>& prizeCounts,
+		const std::vector<int>& handCounts) {
 		PlayerState& ps = state.players[player];
-		std::vector<int> prizeIds, deckIds;
-		for (int i = 0; i < state.exact.typeCount; ++i) {
-			int p = prizeCounts[i];
-			for (int n = 0; n < p; ++n) prizeIds.push_back(state.exact.cardId[i]);
-			for (int n = p; n < state.exact.cardCount[i]; ++n) deckIds.push_back(state.exact.cardId[i]);
+		std::vector<int> prizeIds, handIds, deckIds;
+		for (int i = 0; i < state.exact.typeCount[player]; ++i) {
+			int p = prizeCounts[i], h = handCounts[i];
+			for (int n = 0; n < p; ++n) prizeIds.push_back(state.exact.cardId[player][i]);
+			for (int n = 0; n < h; ++n) handIds.push_back(state.exact.cardId[player][i]);
+			for (int n = p + h; n < state.exact.cardCount[player][i]; ++n) deckIds.push_back(state.exact.cardId[player][i]);
 		}
-		int prizeAt = 0, deckAt = 0;
+		int prizeAt = 0, handAt = 0, deckAt = 0;
 		for (int i = 0; i < ps.prize.size(); ++i) if (ps.prize[i].isNull()) {
 			if (prizeAt >= (int)prizeIds.size()) throw std::runtime_error("prize materialization mismatch");
 			materialize(state, player, AreaType::Prize, i, prizeIds[prizeAt++]);
+		}
+		for (int i = 0; i < ps.hand.size(); ++i) if (ps.hand[i].isNull()) {
+			if (handAt >= (int)handIds.size()) throw std::runtime_error("hand materialization mismatch");
+			materialize(state, player, AreaType::Hand, i, handIds[handAt++]);
 		}
 		for (int i = 0; i < ps.deck.size(); ++i) if (ps.deck[i].isNull()) {
 			if (deckAt >= (int)deckIds.size()) throw std::runtime_error("deck materialization mismatch");
 			materialize(state, player, AreaType::Deck, i, deckIds[deckAt++]);
 		}
-		if (prizeAt != (int)prizeIds.size() || deckAt != (int)deckIds.size()) throw std::runtime_error("hidden zone size mismatch");
+		if (prizeAt != (int)prizeIds.size() || handAt != (int)handIds.size() || deckAt != (int)deckIds.size()) throw std::runtime_error("hidden zone size mismatch");
 		state.exact.deckUnknown[player] = false;
 		state.exact.deckExchangeable[player] = true;
 		state.exact.prizeExchangeable[player] = true;
@@ -318,31 +431,48 @@ private:
 	}
 
 	ExactScore revealAndReplay(const State& parent, const std::vector<int>& action) {
-		int prizeSize = parent.players[actor].prize.size();
+		int player = parent.exact.pendingPlayer >= 0 ? parent.exact.pendingPlayer : actor;
+		if (!parent.exact.profileKnown[player]) return unknown();
+		int prizeSize = parent.players[player].prize.size();
+		int handSize = 0; for (CardRef ref : parent.players[player].hand) if (ref.isNull()) handSize++;
 		int totalHidden = 0;
-		for (int i = 0; i < parent.exact.typeCount; ++i) totalHidden += parent.exact.cardCount[i];
+		for (int i = 0; i < parent.exact.typeCount[player]; ++i) totalHidden += parent.exact.cardCount[player][i];
 		if (prizeSize < 0 || prizeSize > totalHidden) return unknown();
-		unsigned long long totalWeight = chooseCount(totalHidden, prizeSize);
+		unsigned long long totalWeight = chooseCount(totalHidden, prizeSize) * chooseCount(totalHidden - prizeSize, handSize);
 		if (totalWeight == 0) return unknown();
 		ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
 		bool certified = true, any = false;
-		std::vector<int> prizeCounts(parent.exact.typeCount, 0);
+		std::vector<int> prizeCounts(parent.exact.typeCount[player], 0);
+		std::vector<int> handCounts(parent.exact.typeCount[player], 0);
+		auto evaluateWorld = [&](unsigned long long weight) {
+			auto world = std::make_unique<State>(parent);
+			try {
+				materializeUnknownZones(*world, player, prizeCounts, handCounts);
+				if (!advance(*world, action)) return true;
+			} catch (...) { return false; }
+			ExactScore score = solve(*world);
+			auto l = score.lower.scaled(weight, totalWeight), u = score.upper.scaled(weight, totalWeight);
+			lower = ExactFraction::add(lower, l); upper = ExactFraction::add(upper, u);
+			if (!lower.valid || !upper.valid) { metrics.arithmeticOverflow = true; return false; }
+			certified = certified && score.certified; any = true; return true;
+		};
+		std::function<bool(int, int, unsigned long long)> enumerateHands;
+		enumerateHands = [&](int type, int left, unsigned long long weight) {
+			if (expired()) return false;
+			if (type == parent.exact.typeCount[player]) return left == 0 ? evaluateWorld(weight) : true;
+			int available = parent.exact.cardCount[player][type] - prizeCounts[type];
+			for (int take = 0; take <= std::min(available, left); ++take) {
+				handCounts[type] = take;
+				if (!enumerateHands(type + 1, left - take, weight * chooseCount(available, take))) return false;
+			}
+			handCounts[type] = 0; return true;
+		};
 		std::function<bool(int, int, unsigned long long)> enumerate = [&](int type, int left, unsigned long long weight) {
 			if (expired()) return false;
-			if (type == parent.exact.typeCount) {
-				if (left != 0) return true;
-				State world = parent;
-				try {
-					materializeUnknownZones(world, prizeCounts);
-					if (!advance(world, action)) return true;
-				} catch (...) { return false; }
-				ExactScore score = solve(world);
-				auto l = score.lower.scaled(weight, totalWeight), u = score.upper.scaled(weight, totalWeight);
-				lower = ExactFraction::add(lower, l); upper = ExactFraction::add(upper, u);
-				if (!lower.valid || !upper.valid) { metrics.arithmeticOverflow = true; return false; }
-				certified = certified && score.certified; any = true; return true;
+			if (type == parent.exact.typeCount[player]) {
+				return left == 0 ? enumerateHands(0, handSize, weight) : true;
 			}
-			int available = parent.exact.cardCount[type];
+			int available = parent.exact.cardCount[player][type];
 			for (int take = 0; take <= std::min(available, left); ++take) {
 				prizeCounts[type] = take;
 				if (!enumerate(type + 1, left - take, weight * chooseCount(available, take))) return false;
@@ -366,7 +496,7 @@ private:
 				if (index < 0) throw std::runtime_error("hidden deck slot missing");
 				materialize(state, player, AreaType::Deck, index, cardId);
 			}
-			decrementPool(state, cardId);
+			decrementPool(state, player, cardId);
 		} else {
 			for (int i = 0; i < ps.deck.size(); ++i) if (state.getCard(ps.deck[i]).cardId == cardId) { index = i; break; }
 			if (index < 0) throw std::runtime_error("draw card missing");
@@ -384,7 +514,7 @@ private:
 		if (index < 0) {
 			for (int i = 0; i < ps.prize.size(); ++i) if (state.getCard(ps.prize[i]).cardId == cardId) { index = i; break; }
 		} else {
-			materialize(state, player, AreaType::Prize, index, cardId); decrementPool(state, cardId);
+			materialize(state, player, AreaType::Prize, index, cardId); decrementPool(state, player, cardId);
 		}
 		CardRef ref = ps.prize[index];
 		state.targetList.push_back(state.makeAreaRef(ref));
@@ -399,8 +529,8 @@ private:
 		int player = state.exact.pendingPlayer;
 		if (player != actor && state.exact.deckUnknown[player]) return result;
 		if (state.exact.deckUnknown[player]) {
-			for (int i = 0; i < state.exact.typeCount; ++i) if (state.exact.cardCount[i] > 0)
-				result.push_back({ state.exact.cardId[i], state.exact.cardCount[i] });
+			for (int i = 0; i < state.exact.typeCount[player]; ++i) if (state.exact.cardCount[player][i] > 0)
+				result.push_back({ state.exact.cardId[player][i], state.exact.cardCount[player][i] });
 		} else {
 			std::unordered_map<int, unsigned long long> counts;
 			const auto& list = state.exact.pending == ExactPendingType::Draw ? state.players[player].deck : state.players[player].prize;
@@ -410,7 +540,7 @@ private:
 		return result;
 	}
 
-	ExactScore chance(State state) {
+	ExactScore chance(const State& state) {
 		auto types = chanceCardTypes(state);
 		if (types.empty()) return unknown();
 		unsigned long long total = 0; for (auto [_, w] : types) total += w;
@@ -418,11 +548,11 @@ private:
 		bool certified = true;
 		for (auto [id, weight] : types) {
 			if (expired()) return unknown();
-			State child = state;
+			auto child = std::make_unique<State>(state);
 			try {
-				if (state.exact.pending == ExactPendingType::Draw) resolveDraw(child, id); else resolvePrize(child, id);
+				if (state.exact.pending == ExactPendingType::Draw) resolveDraw(*child, id); else resolvePrize(*child, id);
 			} catch (...) { return unknown(); }
-			ExactScore score = solve(child);
+			ExactScore score = solve(*child);
 			auto l = score.lower.scaled(weight, total), u = score.upper.scaled(weight, total);
 			lower = ExactFraction::add(lower, l); upper = ExactFraction::add(upper, u);
 			if (!lower.valid || !upper.valid) { metrics.arithmeticOverflow = true; return unknown(); }
@@ -435,9 +565,9 @@ private:
 		ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
 		bool certified = true;
 		for (int option = 0; option < 2; ++option) {
-			State child = state;
-			if (!advance(child, { option })) return unknown();
-			ExactScore score = solve(child);
+			auto child = std::make_unique<State>(state);
+			if (!advance(*child, { option })) return unknown();
+			ExactScore score = solve(*child);
 			lower = ExactFraction::add(lower, score.lower.scaled(1, 2));
 			upper = ExactFraction::add(upper, score.upper.scaled(1, 2));
 			if (!lower.valid || !upper.valid) { metrics.arithmeticOverflow = true; return unknown(); }
@@ -451,18 +581,15 @@ private:
 		bool first = true;
 		ExactFraction aggregate = maximize ? ExactFraction::integer(-100'000'000) : ExactFraction::integer(100'000'000);
 		bool allCertified = true;
-		for (const auto& action : legalActions(state)) {
-			if (expired()) {
-				if (first) return unknown();
-				if (maximize) result.upper = ExactFraction::integer(100'000'000);
-				else result.lower = ExactFraction::integer(-100'000'000);
-				result.certified = false;
-				return result;
-			}
-			State child = state;
-			if (!advance(child, action)) continue;
-			ExactScore score = child.exact.pending == ExactPendingType::RevealDeck
-				? revealAndReplay(state, action) : solve(child);
+		std::unordered_set<std::string> equivalentActions;
+		bool completed = forEachLegalAction(state, [&](const std::vector<int>& action) {
+			metrics.rawOutcomes++;
+			std::string actionKey = actionEquivalenceKey(state, action);
+			if (!equivalentActions.insert(std::move(actionKey)).second) { metrics.groupedOutcomes++; return true; }
+			auto child = std::make_unique<State>(state);
+			if (!advance(*child, action)) return true;
+			ExactScore score = child->exact.pending == ExactPendingType::RevealDeck
+				? revealAndReplay(state, action) : solve(*child);
 			if (maximize) {
 				if (ExactCompare(score.upper, aggregate) > 0) aggregate = score.upper;
 			} else {
@@ -472,16 +599,48 @@ private:
 			if (first || (maximize ? ExactCompare(score.lower, result.lower) > 0 : ExactCompare(score.upper, result.upper) < 0)) {
 				result = score; result.action = action; first = false;
 			}
-		}
+			return !expired();
+		});
 		if (first) return unknown();
+		if (!completed) {
+			if (maximize) result.upper = ExactFraction::integer(100'000'000);
+			else result.lower = ExactFraction::integer(-100'000'000);
+			result.certified = false;
+			return result;
+		}
 		if (maximize) result.upper = aggregate; else result.lower = aggregate;
 		result.certified = allCertified && ExactCompare(result.lower, result.upper) == 0;
 		return result;
 	}
 
-	ExactScore solve(State state) {
+	ExactScore solve(const State& input) {
+		struct DepthGuard { int& depth; DepthGuard(int& value) : depth(value) { depth++; } ~DepthGuard() { depth--; } } guard(recursionDepth);
+		metrics.maxDepth = std::max(metrics.maxDepth, recursionDepth);
+		if (recursionDepth > 384) {
+			metrics.depthLimitNodes++;
+			metrics.lastDepthSelectType = (int)input.selectType;
+			metrics.lastDepthTurnActionCount = input.turnActionCount;
+			return unknown();
+		}
+		auto owned = std::make_unique<State>(input);
+		State& state = *owned;
 		metrics.expanded++;
 		if (expired()) return unknown();
+		// Automatic engine continuations are not search-tree depth.  Running
+		// each one through solve() recursively can exhaust the C++ stack long
+		// before the wall-clock budget, so settle them iteratively.
+		try {
+			while (!state.isFinish() && !IsExactTurnLeaf(state)
+				&& state.exact.pending == ExactPendingType::None && state.selectType == SelectType::None) {
+				state.step();
+				metrics.expanded++;
+				if (expired()) return unknown();
+			}
+		} catch (const std::exception& error) {
+			metrics.exceptions++; metrics.lastException = error.what(); return unknown();
+		} catch (...) {
+			metrics.exceptions++; metrics.lastException = "automatic transition"; return unknown();
+		}
 		std::string key = keyFor(state);
 		auto cached = transposition.find(key);
 		if (cached != transposition.end()) { metrics.merged++; return cached->second; }
@@ -491,13 +650,22 @@ private:
 			auto value = ExactFraction::integer(evaluate(state));
 			result = { value, value, {}, true };
 		} else if (state.exact.pending == ExactPendingType::Opaque || state.exact.pending == ExactPendingType::RevealDeck) {
-			metrics.opaque++; metrics.lastPendingDetail = state.exact.pendingDetail; result = unknown();
+			metrics.opaque++; metrics.lastPendingDetail = state.exact.pendingDetail;
+			metrics.lastPendingPlayer = state.exact.pendingPlayer;
+			metrics.lastPendingEffectCardId = state.exact.pendingEffectCardId;
+			metrics.lastPendingEffectPlayer = state.exact.pendingEffectPlayer;
+			metrics.lastPendingNullCount = state.exact.pendingNullCount;
+			if (state.exact.pendingPlayer >= 0) metrics.lastPendingDeckUnknown = state.exact.deckUnknown[state.exact.pendingPlayer];
+			switch (state.exact.blockReason) {
+			case ExactBlockReason::UnknownOpponentList: metrics.unknownOpponentList++; break;
+			case ExactBlockReason::InterruptedTransition: metrics.interruptedTransition++; break;
+			default: metrics.unsupportedConcreteReference++; break;
+			}
+			result = unknown();
 		} else if (state.exact.pending == ExactPendingType::Draw || state.exact.pending == ExactPendingType::TakePrize) {
 			result = chance(state);
 		} else if (state.selectType == SelectType::YesNo && state.selectContext == SelectContext::CoinHead) {
 			result = coinChance(state);
-		} else if (state.selectType == SelectType::None) {
-			try { state.step(); result = solve(state); } catch (...) { result = unknown(); }
 		} else {
 			result = decision(state, state.selectPlayer == actor);
 		}
