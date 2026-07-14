@@ -5,7 +5,8 @@ import time
 import pytest
 
 from cg.api import (exact_decide, exact_decide_v2, exact_turn_advance,
-                    exact_turn_begin, exact_turn_release, to_observation_class)
+                    exact_turn_begin, exact_turn_progress, exact_turn_release,
+                    to_observation_class)
 from cg.game import battle_finish, battle_select, battle_start_seeded
 from exact_solver.profile import load_profile
 
@@ -28,6 +29,20 @@ def _seeded_first_main(seed: int):
 def _hand_values(profile):
     values = profile.evaluator["hand_values"]
     return [int(values.get(str(card_id), values.get("default", 100))) for card_id in profile.cards]
+
+
+def _seeded_second_main(seed: int = 6):
+    """Replay the certified turn-one policy without re-running its 132s proof."""
+    profile, deck, observation = _seeded_first_main(seed)
+    assert seed == 6, "the recorded exact policy is a seed-6 regression fixture"
+    for action in ([0], [5], [0], [0]):
+        observation = battle_select(action)
+    for _ in range(30):
+        select = observation.get("select")
+        if select and select["type"] == 0 and select["context"] == 0:
+            return profile, deck, observation
+        observation = battle_select(deck if select is None else list(range(select["maxCount"])))
+    raise AssertionError("seeded battle did not reach the second main selection")
 
 
 def test_seeded_battle_is_reproducible_and_contains_deck_search():
@@ -67,11 +82,37 @@ def test_completed_turn_policy_reroots_without_research():
                                  1_000, opponent_deck=deck)
         session_id = first["sessionId"]
         second = exact_turn_advance(session_id, to_observation_class(observation), 100)
+        # Progress is read-only and exposes the canonical-DAG diagnostics without
+        # consuming another search slice.
+        progress = exact_turn_progress(session_id)
+        assert progress["sessionId"] == session_id
+        assert progress["expandedNodes"] == second["expandedNodes"]
+        assert progress["sessionBytes"] == second["sessionBytes"]
         assert first["selected"] == second["selected"] == [0]
         assert first["certified"] is second["certified"] is True
         assert second["policyHits"] >= 1
         assert second["avoidedExpandedNodes"] >= 1
         assert second["resumedNodes"] == 0
+    finally:
+        if session_id is not None:
+            exact_turn_release(session_id)
+        battle_finish()
+
+
+def test_turn2_reports_every_root_interval_and_certifies_end():
+    session_id = None
+    try:
+        profile, deck, observation = _seeded_second_main()
+        result = exact_turn_begin(to_observation_class(observation), deck, _hand_values(profile),
+                                  1_000, opponent_deck=deck)
+        session_id = result["sessionId"]
+        roots = {tuple(item["selected"]): item for item in result["rootActions"]}
+        assert set(roots) == {(0,), (1,), (2,), (3,), (4,)}
+        assert roots[(4,)]["certified"] is True
+        assert roots[(4,)]["lowerNumerator"] == roots[(4,)]["upperNumerator"] == -3520
+        assert result["selected"] == [4]
+        assert result["rootRetryKeyMismatches"] == 0
+        assert result["successorMerges"] >= 1  # duplicate Telepath Energy copy
     finally:
         if session_id is not None:
             exact_turn_release(session_id)
