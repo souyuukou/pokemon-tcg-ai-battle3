@@ -148,6 +148,18 @@ struct ExactMetrics {
 	int lastPendingEffectPlayer = -1;
 	int lastPendingNullCount = 0;
 	bool lastPendingDeckUnknown = false;
+	unsigned long long policyNodes = 0;
+	unsigned long long policyHits = 0;
+	unsigned long long policyMisses = 0;
+	unsigned long long rerootCount = 0;
+	unsigned long long resumedNodes = 0;
+	unsigned long long avoidedExpandedNodes = 0;
+	unsigned long long partialDecisionNodes = 0;
+	unsigned long long partialChanceNodes = 0;
+	unsigned long long semanticActionRemaps = 0;
+	unsigned long long sessionInvalidations = 0;
+	unsigned long long sessionBytes = 0;
+	long long deadlineOverrunMs = 0;
 };
 
 struct ExactDecision {
@@ -165,6 +177,11 @@ public:
 			handValue[deck[i]] = handValues == nullptr ? 100 : handValues[i];
 		}
 		for (int i = 0; opponentDeck != nullptr && i < opponentDeckCount; ++i) opponentProfileCount[opponentDeck[i]]++;
+	}
+
+	void setBudgetMilliseconds(int budgetMilliseconds) {
+		deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max(1, budgetMilliseconds));
+		metrics.timedOut = false;
 	}
 
 	ExactDecision decide(State root) {
@@ -198,7 +215,52 @@ public:
 		return result;
 	}
 
+	// Re-root a completed turn policy at the currently observed decision.  The
+	// key deliberately contains only information exposed by ToJsonApi; hidden
+	// materializations therefore cannot leak into a later action.
+	bool lookupPolicy(const State& observed, ExactDecision& result) {
+		std::string key = observationKeyFor(observed);
+		auto it = policy.find(key);
+		if (it == policy.end() || it->second.empty()) { metrics.policyMisses++; return false; }
+		const ExactPolicyEntry* selected = &it->second.front();
+		for (const ExactPolicyEntry& candidate : it->second) {
+			if (candidate.actionTokens != selected->actionTokens
+				|| ExactCompare(candidate.score.lower, selected->score.lower) != 0
+				|| ExactCompare(candidate.score.upper, selected->score.upper) != 0) {
+				// The same observation was reached with a different belief.  Until
+				// those beliefs are conditioned by a unique history, fail closed.
+				metrics.policyMisses++; return false;
+			}
+		}
+		std::vector<int> remapped;
+		if (!remapAction(observed, selected->actionTokens, remapped)) { metrics.policyMisses++; return false; }
+		result.score = selected->score;
+		result.score.action = std::move(remapped);
+		metrics.policyHits++;
+		metrics.rerootCount++;
+		metrics.semanticActionRemaps++;
+		metrics.avoidedExpandedNodes += selected->subtreeExpanded;
+		result.metrics = metrics;
+		return selected->score.certified;
+	}
+
+	ExactDecision resume(State root, int budgetMilliseconds) {
+		setBudgetMilliseconds(budgetMilliseconds);
+		unsigned long long before = metrics.expanded;
+		ExactDecision result = decide(std::move(root));
+		metrics.resumedNodes += metrics.expanded - before;
+		result.metrics = metrics;
+		return result;
+	}
+
+	const ExactMetrics& currentMetrics() const { return metrics; }
+
 private:
+	struct ExactPolicyEntry {
+		ExactScore score;
+		std::vector<std::string> actionTokens;
+		unsigned long long subtreeExpanded = 0;
+	};
 	std::unordered_map<int, int> actorProfileCount;
 	std::unordered_map<int, int> opponentProfileCount;
 	std::unordered_map<int, int> handValue;
@@ -208,14 +270,21 @@ private:
 	// Two fixed SipHash-2-4 digests index the table; std::string equality still
 	// compares every canonical byte, so a digest collision cannot merge states.
 	std::unordered_map<std::string, ExactScore, ExactStringHasher> transposition;
+	std::unordered_map<std::string, std::vector<ExactPolicyEntry>, ExactStringHasher> policy;
 	static constexpr size_t MaxTranspositionEntries = 250'000;
 	static constexpr size_t MaxTranspositionBytes = 550ULL * 1024ULL * 1024ULL;
+	static constexpr size_t MaxPolicyEntries = 200'000;
+	static constexpr size_t MaxPolicyBytes = 256ULL * 1024ULL * 1024ULL;
 	size_t transpositionBytes = 0;
+	size_t policyBytes = 0;
 	int recursionDepth = 0;
 
 	bool expired() {
 		if (std::chrono::steady_clock::now() < deadline) return false;
-		metrics.timedOut = true; return true;
+		metrics.timedOut = true;
+		metrics.deadlineOverrunMs = std::max<long long>(metrics.deadlineOverrunMs,
+			std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - deadline).count());
+		return true;
 	}
 
 	std::string keyFor(const State& input) const {
@@ -225,6 +294,162 @@ private:
 		BinaryWriter writer;
 		state.serialize(writer);
 		return std::string((const char*)writer.buf.data(), writer.buf.size());
+	}
+
+	static void appendSemantic(std::string& out, long long value) {
+		out += std::to_string(value); out.push_back(';');
+	}
+
+	std::string cardToken(const State& state, CardRef ref, bool pokemon) const {
+		if (ref.isNull()) return "?";
+		const Card& card = state.getCard(ref);
+		std::string token;
+		appendSemantic(token, card.cardId);
+		appendSemantic(token, card.playerIndex);
+		if (!pokemon) return token;
+		appendSemantic(token, state.getHp(card));
+		appendSemantic(token, state.getMaxHp(card));
+		appendSemantic(token, card.appear ? 1 : 0);
+		auto& energyTypes = state.game->energyList;
+		state.getEnergies(card.playerIndex, ref, energyTypes);
+		std::vector<int> types;
+		for (EnergyType type : energyTypes) types.push_back(EnergyTypeIndex(type));
+		std::sort(types.begin(), types.end());
+		for (int type : types) appendSemantic(token, type);
+		token.push_back('|');
+		auto& cards = state.game->cardList;
+		state.getEnergyCards(ref, cards);
+		std::vector<int> ids;
+		for (CardRef child : cards) ids.push_back(state.getCard(child).cardId);
+		auto tools = state.getAttachedToolRef(card);
+		for (CardRef child : tools) ids.push_back(state.getCard(child).cardId + 100000);
+		auto evolutions = state.getPreEvolutions(card);
+		for (CardRef child : evolutions) ids.push_back(state.getCard(child).cardId + 200000);
+		std::sort(ids.begin(), ids.end());
+		for (int id : ids) appendSemantic(token, id);
+		return token;
+	}
+
+	template<class List>
+	void appendCardList(std::string& out, const State& state, const List& list,
+		bool pokemon, bool unordered, bool hidden) const {
+		appendSemantic(out, list.size());
+		if (hidden) return;
+		std::vector<std::string> tokens;
+		for (CardRef ref : list) tokens.push_back(cardToken(state, ref, pokemon));
+		if (unordered) std::sort(tokens.begin(), tokens.end());
+		for (const std::string& token : tokens) {
+			appendSemantic(out, (long long)token.size()); out += token;
+		}
+	}
+
+	std::string optionSemanticToken(const State& state, const SelectOption& option) const {
+		std::string token;
+		appendSemantic(token, (int)option.type);
+		auto appendPosition = [&](AreaType area, int index, int player) {
+			appendSemantic(token, (int)area); appendSemantic(token, player);
+			try {
+				CardRef ref = state.getCardRef(area, index, player);
+				std::string card = cardToken(state, ref, area == AreaType::Active || area == AreaType::Bench);
+				appendSemantic(token, (long long)card.size()); token += card;
+			} catch (...) { appendSemantic(token, index); }
+		};
+		switch (option.type) {
+		case SelectOptionType::Card:
+		case SelectOptionType::ToolCard:
+		case SelectOptionType::EnergyCard:
+		case SelectOptionType::Energy:
+			appendPosition((AreaType)option.param0, option.param1, option.param2);
+			appendSemantic(token, option.param3); appendSemantic(token, option.param4); break;
+		case SelectOptionType::Play:
+			appendPosition(AreaType::Hand, option.param0, state.selectPlayer); break;
+		case SelectOptionType::Attach:
+		case SelectOptionType::Evolve:
+			appendPosition((AreaType)option.param0, option.param1, state.selectPlayer);
+			appendPosition((AreaType)option.param2, option.param3, state.selectPlayer); break;
+		case SelectOptionType::Ability:
+		case SelectOptionType::Discard:
+			appendPosition((AreaType)option.param0, option.param1, state.selectPlayer); break;
+		case SelectOptionType::Skill:
+			appendSemantic(token, option.param0); break; // serial is deliberately omitted
+		default:
+			appendSemantic(token, option.param0); appendSemantic(token, option.param1);
+			appendSemantic(token, option.param2); appendSemantic(token, option.param3);
+			appendSemantic(token, option.param4); break;
+		}
+		return token;
+	}
+
+	std::string observationKeyFor(const State& state) const {
+		const int observer = state.selectPlayer;
+		std::string key;
+		appendSemantic(key, state.turn); appendSemantic(key, state.turnActionCount);
+		appendSemantic(key, (int)state.phase); appendSemantic(key, (int)state.gameResult);
+		appendSemantic(key, state.firstPlayer); appendSemantic(key, state.turnState);
+		appendSemantic(key, (int)state.selectType); appendSemantic(key, (int)state.selectContext);
+		appendSemantic(key, state.selectPlayer); appendSemantic(key, state.selectMin);
+		appendSemantic(key, state.selectMax); appendSemantic(key, state.remainDamageCounter);
+		appendSemantic(key, state.remainEnergyCost);
+		appendCardList(key, state, state.stadium, false, true, false);
+		for (int player = 0; player < 2; ++player) {
+			const PlayerState& ps = state.players[player];
+			appendCardList(key, state, ps.active, true, false, false);
+			appendCardList(key, state, ps.bench, true, true, false);
+			appendSemantic(key, state.benchCapacity(player));
+			appendCardList(key, state, ps.trash, false, true, false);
+			appendCardList(key, state, ps.prize, false, true, true);
+			appendCardList(key, state, ps.hand, false, true, player != observer);
+			appendSemantic(key, ps.deck.size());
+			if (state.selectDeck && player == observer)
+				appendCardList(key, state, ps.deck, false, true, false);
+			appendSemantic(key, ps.poisonDamageCounter); appendSemantic(key, (int)ps.badStatus);
+			appendSemantic(key, ps.burned ? 1 : 0);
+		}
+		std::vector<std::string> options;
+		for (const SelectOption& option : state.options) options.push_back(optionSemanticToken(state, option));
+		std::sort(options.begin(), options.end());
+		for (const std::string& option : options) { appendSemantic(key, (long long)option.size()); key += option; }
+		if (!state.contextCard.isNull()) { key += "C"; key += cardToken(state, state.contextCard, false); }
+		if (state.onEffect()) { key += "E"; key += cardToken(state, state.getEffectCard().card, false); }
+		return key;
+	}
+
+	std::vector<std::string> semanticAction(const State& state, const std::vector<int>& action) const {
+		std::vector<std::string> tokens;
+		for (int index : action) tokens.push_back(optionSemanticToken(state, state.options.at(index)));
+		std::sort(tokens.begin(), tokens.end());
+		return tokens;
+	}
+
+	bool remapAction(const State& state, const std::vector<std::string>& wanted, std::vector<int>& result) const {
+		std::vector<bool> used(state.options.size(), false);
+		for (const std::string& token : wanted) {
+			int found = -1;
+			for (int i = 0; i < (int)state.options.size(); ++i) if (!used[i]
+				&& optionSemanticToken(state, state.options[i]) == token) { found = i; break; }
+			if (found < 0) return false;
+			used[found] = true; result.push_back(found);
+		}
+		std::sort(result.begin(), result.end());
+		return (int)result.size() >= state.selectMin && (int)result.size() <= state.selectMax;
+	}
+
+	void rememberPolicy(const State& state, const ExactScore& score, unsigned long long subtreeExpanded) {
+		if (score.action.empty() && state.selectMin != 0) return;
+		if (policy.size() >= MaxPolicyEntries || policyBytes >= MaxPolicyBytes) return;
+		std::string key = observationKeyFor(state);
+		ExactPolicyEntry entry{ score, semanticAction(state, score.action), subtreeExpanded };
+		size_t bytes = key.size() + sizeof(ExactPolicyEntry) + 64;
+		for (const std::string& token : entry.actionTokens) bytes += token.size();
+		if (policyBytes + bytes > MaxPolicyBytes) return;
+		auto& bucket = policy[key];
+		for (const ExactPolicyEntry& existing : bucket) {
+			if (existing.actionTokens == entry.actionTokens
+				&& ExactCompare(existing.score.lower, entry.score.lower) == 0
+				&& ExactCompare(existing.score.upper, entry.score.upper) == 0) return;
+		}
+		policyBytes += bytes; bucket.push_back(std::move(entry));
+		metrics.policyNodes++; metrics.sessionBytes = transpositionBytes + policyBytes;
 	}
 
 	void initializeHidden(State& state) {
@@ -547,7 +772,7 @@ private:
 		ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
 		bool certified = true;
 		for (auto [id, weight] : types) {
-			if (expired()) return unknown();
+			if (expired()) { metrics.partialChanceNodes++; return unknown(); }
 			auto child = std::make_unique<State>(state);
 			try {
 				if (state.exact.pending == ExactPendingType::Draw) resolveDraw(*child, id); else resolvePrize(*child, id);
@@ -565,6 +790,7 @@ private:
 		ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
 		bool certified = true;
 		for (int option = 0; option < 2; ++option) {
+			if (expired()) { metrics.partialChanceNodes++; return unknown(); }
 			auto child = std::make_unique<State>(state);
 			if (!advance(*child, { option })) return unknown();
 			ExactScore score = solve(*child);
@@ -577,6 +803,7 @@ private:
 	}
 
 	ExactScore decision(const State& state, bool maximize) {
+		unsigned long long expandedBefore = metrics.expanded;
 		ExactScore result;
 		bool first = true;
 		ExactFraction aggregate = maximize ? ExactFraction::integer(-100'000'000) : ExactFraction::integer(100'000'000);
@@ -606,10 +833,13 @@ private:
 			if (maximize) result.upper = ExactFraction::integer(100'000'000);
 			else result.lower = ExactFraction::integer(-100'000'000);
 			result.certified = false;
+			metrics.partialDecisionNodes++;
+			rememberPolicy(state, result, metrics.expanded - expandedBefore);
 			return result;
 		}
 		if (maximize) result.upper = aggregate; else result.lower = aggregate;
 		result.certified = allCertified && ExactCompare(result.lower, result.upper) == 0;
+		rememberPolicy(state, result, metrics.expanded - expandedBefore);
 		return result;
 	}
 
