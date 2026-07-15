@@ -596,11 +596,21 @@ struct ExactTurnSession {
         output->game = *source.game;
         output->planner = std::make_unique<ExactPlanner>(deck, handValues, deckCount, budgetMilliseconds,
           opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount, sharedTable, evaluator);
+		output->planner->setConcreteWorldCaching(true);
 		output->actions.resize(source.options.size());
 		std::vector<bool> structurallyBlocked(source.options.size(), false);
 		std::vector<int> assigned;
 		for (int position = parity; position < (int)orderedOptions.size(); position += 2)
 			assigned.push_back(orderedOptions[position]);
+		// End plus one expensive representative used to leave the End worker idle
+		// for almost the entire deadline. Let that worker traverse the expensive
+		// action in reverse while the other worker traverses it normally. Completed
+		// descendants are exchanged through the collision-safe shared TT.
+		if (parity == 0 && orderedOptions.size() == 2
+			&& source.options[orderedOptions[0]].type == SelectOptionType::End
+			&& std::find(assigned.begin(), assigned.end(), orderedOptions[1]) == assigned.end())
+			assigned.push_back(orderedOptions[1]);
+		output->planner->setReverseActionOrder(parity == 0 && assigned.size() > 1);
 		for (int option : assigned) output->actions[option].action = { option };
 		if (source.options.size() <= 2) {
 			for (int option : assigned) {
@@ -636,7 +646,6 @@ struct ExactTurnSession {
 					}
 					attempted = true;
 					if (output->planner->resourceStopped()) { resourceStopped = true; break; }
-					if (!firstRound) break; // finish one representative before starting the next
 				}
 				firstRound = false;
 				if (!pending || !attempted || resourceStopped) break;
@@ -647,24 +656,52 @@ struct ExactTurnSession {
       auto future0 = std::async(std::launch::async, run, 0);
       auto future1 = std::async(std::launch::async, run, 1);
       workers[0] = future0.get(); workers[1] = future1.get();
-      bool first = true, allCertified = true;
-      ExactFraction maxUpper = ExactFraction::integer(-100'000'000);
-      int selectedWorker = 0;
 	  std::unordered_map<int, ExactScore> representativeScores;
+	  std::unordered_map<int, int> representativeWorker;
       for (int wi = 0; wi < 2; ++wi) {
         for (const ExactScore& item : workers[wi]->actions) {
 		  if (item.action.empty()) continue;
-		  representativeScores[item.action.front()] = item;
-		  decision.rootActions.push_back({ item.action, item.lower, item.upper, item.certified });
-          if (first || ExactCompare(item.lower, decision.score.lower) > 0
-              || (ExactCompare(item.lower, decision.score.lower) == 0 && item.action < decision.score.action)) {
-            decision.score = item; selectedWorker = wi; first = false;
-          }
-          if (ExactCompare(item.upper, maxUpper) > 0) maxUpper = item.upper;
-          allCertified = allCertified && item.certified;
+		  int option = item.action.front();
+		  auto found = representativeScores.find(option);
+		  if (found == representativeScores.end()) {
+			representativeScores.emplace(option, item);
+			representativeWorker[option] = wi;
+		  } else {
+			bool existingCertified = found->second.certified;
+			// Both intervals enclose the same exact value. Their intersection
+			// combines progress made from opposite traversal directions without
+			// sharing mutable partial cursors between workers.
+			if (ExactCompare(item.lower, found->second.lower) > 0) {
+			  found->second.lower = item.lower;
+			  representativeWorker[option] = wi;
+			}
+			if (ExactCompare(item.upper, found->second.upper) < 0)
+			  found->second.upper = item.upper;
+			if (item.certified && !existingCertified) representativeWorker[option] = wi;
+			if (ExactCompare(found->second.lower, found->second.upper) > 0) {
+			  found->second = ExactScore{};
+			} else {
+			  found->second.certified = ExactCompare(found->second.lower, found->second.upper) == 0;
+			}
+		  }
         }
         MergeExactMetrics(decision.metrics, workers[wi]->planner->currentMetrics());
       }
+	  bool first = true, allCertified = true;
+	  ExactFraction maxUpper = ExactFraction::integer(-100'000'000);
+	  int selectedWorker = 0;
+	  for (int option : orderedOptions) {
+		auto found = representativeScores.find(option);
+		if (found == representativeScores.end()) continue;
+		ExactScore item = found->second; item.action = { option };
+		decision.rootActions.push_back({ item.action, item.lower, item.upper, item.certified });
+		if (first || ExactCompare(item.lower, decision.score.lower) > 0
+			|| (ExactCompare(item.lower, decision.score.lower) == 0 && item.action < decision.score.action)) {
+		  decision.score = item; selectedWorker = representativeWorker[option]; first = false;
+		}
+		if (ExactCompare(item.upper, maxUpper) > 0) maxUpper = item.upper;
+		allCertified = allCertified && item.certified;
+	  }
 	  for (int option = 0; option < (int)representative.size(); ++option) {
 		if (representative[option] == option) continue;
 		auto found = representativeScores.find(representative[option]);
@@ -688,6 +725,7 @@ struct ExactTurnSession {
       game = std::make_unique<Game>(*source.game);
       planner = std::make_unique<ExactPlanner>(deck, handValues, deckCount, budgetMilliseconds,
         opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount, nullptr, evaluator);
+	  planner->setConcreteWorldCaching(true);
       State local = source; local.game = game.get();
       decision = planner->decide(local);
     }

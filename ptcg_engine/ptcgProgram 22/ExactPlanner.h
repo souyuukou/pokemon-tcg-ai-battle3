@@ -389,6 +389,12 @@ public:
 		metrics.timedOut = false;
 	}
 
+	// A second root worker may traverse the same expensive action from the
+	// opposite side. Completed descendants are shared through the immutable TT,
+	// so the two cores do not spend the deadline on the same prefix.
+	void setReverseActionOrder(bool reverse) { reverseActionOrder = reverse; }
+	void setConcreteWorldCaching(bool enabled) { concreteWorldCaching = enabled; }
+
 	ExactDecision decide(State root) {
 		rootActionValues.clear();
 		canonicalMainEnabled = root.selectType == SelectType::Main && root.options.size() > 2;
@@ -674,10 +680,11 @@ private:
 	size_t policyBytes = 0;
 	int recursionDepth = 0;
 	bool canonicalMainEnabled = false;
-	// Full own-deck reveals produce singleton information sets.  Inside one of
-	// those worlds, retaining canonical TT/policy keys costs substantially more
-	// than the shallow first-turn subtree and cannot merge with another hidden
-	// allocation.  The outer exact reveal cursor remains resumable.
+	bool reverseActionOrder = false;
+	bool concreteWorldCaching = false;
+	// Full own-deck reveals produce singleton information sets. Turn sessions may
+	// opt into concreteWorldCaching for large later-turn DAGs; one-shot calls keep
+	// the lower-overhead streaming path.
 	bool singletonRevealStreaming = false;
 	unsigned long long resourceCheckCounter = 0;
 	unsigned long long nodeQuantumDeadline = std::numeric_limits<unsigned long long>::max();
@@ -765,6 +772,12 @@ private:
 			int cardId = state.getCard(ref).cardId;
 			auto master = CardTable.find(cardId);
 			if (master == CardTable.end()) { reachable.insert(cardId); continue; }
+			// Once the once-per-turn attachment has been consumed, an Energy
+			// subsequently exposed by a search/draw cannot become an operator this
+			// turn. Treating Enriching Energy as reachable here forced every deck
+			// identity to split solely because its attach effect draws four cards.
+			if (state.energyPlayed && IsEnergy(master->second.cardType)) continue;
+			if (state.stadiumPlayed && master->second.cardType == CardType::Stadium) continue;
 			// A Supporter absent from the legal option list cannot become legal
 			// later in the same turn (first-turn prohibition or already used).
 			// Evolution cards are likewise unreachable during either player's
@@ -1256,13 +1269,14 @@ private:
 	template<class Callback>
 	bool forEachLegalAction(const State& state, Callback&& callback) {
 		// Evaluate End first so an interrupted main node always has a real leaf
-		// lower bound.  The regular generator skips that one duplicate.
+		// lower bound. An assisting reverse worker deliberately reaches it last.
 		int endIndex = -1;
 		if (state.selectType == SelectType::Main && state.selectMin <= 1 && state.selectMax >= 1) {
 			for (int i = 0; i < (int)state.options.size(); ++i) {
 				if (state.options[i].type == SelectOptionType::End) { endIndex = i; break; }
 			}
-			if (endIndex >= 0 && !callback(std::vector<int>{ endIndex })) return false;
+			if (!reverseActionOrder && endIndex >= 0
+				&& !callback(std::vector<int>{ endIndex })) return false;
 		}
 		struct OptionGroup { std::string key; std::vector<int> index; };
 		std::vector<OptionGroup> groups;
@@ -1273,12 +1287,13 @@ private:
 			if (inserted) groups.push_back({ std::move(key), {} });
 			groups[found->second].index.push_back(i);
 		}
+		if (reverseActionOrder) std::reverse(groups.begin(), groups.end());
 		std::vector<int> current;
 		std::function<bool(int, int)> choose = [&](int group, int left) {
 			if (expired()) return false;
 			if (left == 0) {
 				std::vector<int> action = current; std::sort(action.begin(), action.end());
-				if (action.size() == 1 && action[0] == endIndex) return true;
+				if (!reverseActionOrder && action.size() == 1 && action[0] == endIndex) return true;
 				return callback(action);
 			}
 			if (group >= (int)groups.size()) return true;
@@ -1286,14 +1301,18 @@ private:
 			for (int i = group; i < (int)groups.size(); ++i) remainingCapacity += (int)groups[i].index.size();
 			if (remainingCapacity < left) return true;
 			int maximum = std::min(left, (int)groups[group].index.size());
-			for (int take = 0; take <= maximum; ++take) {
+			int take = reverseActionOrder ? maximum : 0;
+			for (; reverseActionOrder ? take >= 0 : take <= maximum;
+				take += reverseActionOrder ? -1 : 1) {
 				for (int i = 0; i < take; ++i) current.push_back(groups[group].index[i]);
 				if (!choose(group + 1, left - take)) return false;
 				for (int i = 0; i < take; ++i) current.pop_back();
 			}
 			return true;
 		};
-		for (int count = state.selectMin; count <= state.selectMax; ++count) {
+		int count = reverseActionOrder ? state.selectMax : state.selectMin;
+		for (; reverseActionOrder ? count >= state.selectMin : count <= state.selectMax;
+			count += reverseActionOrder ? -1 : 1) {
 			if (!choose(0, count)) return false;
 		}
 		return true;
@@ -1346,6 +1365,18 @@ private:
 		for (int selectedIndex : action) {
 			const SelectOption& option = state.options[selectedIndex];
 			std::string token;
+			// Copies of the same card in hand are exchangeable for play, attach,
+			// and evolve. Physical hand indices caused factorial duplicate action
+			// prefixes before canonical successors had a chance to merge them.
+			if (option.type == SelectOptionType::Play) {
+				CardRef ref = state.getCardRef(AreaType::Hand, option.param0, state.selectPlayer);
+				if (!ref.isNull()) token = "PLAY:" + std::to_string(state.getCard(ref).cardId);
+			} else if (option.type == SelectOptionType::Attach || option.type == SelectOptionType::Evolve) {
+				CardRef ref = state.getCardRef((AreaType)option.param0, option.param1, state.selectPlayer);
+				if (!ref.isNull()) token = (option.type == SelectOptionType::Attach ? "ATTACH:" : "EVOLVE:")
+					+ std::to_string(state.getCard(ref).cardId) + ":" + std::to_string(option.param2)
+					+ ":" + std::to_string(option.param3);
+			}
 			if (option.type == SelectOptionType::Card) {
 				CardPosition pos = option.getCardPosition();
 				bool exchangeable = (pos.area == AreaType::Deck && state.exact.deckExchangeable[pos.playerIndex])
@@ -1864,6 +1895,8 @@ private:
 				metrics.chanceMassMismatches++; metrics.probabilityExact = false;
 				partialPartitionReveals.erase(found); return unknown();
 			}
+			if (reverseActionOrder)
+				std::reverse(partial.allocations.begin(), partial.allocations.end());
 			partial.totalWeight = totalWeight;
 			partial.accountedBytes = revealKey.size() + sizeof(PartialPartitionRevealEntry);
 			for (const auto& allocation : partial.allocations)
@@ -1918,11 +1951,9 @@ private:
 					StreamingGuard(bool& value) : flag(value), previous(value) { flag = true; }
 					~StreamingGuard() { flag = previous; }
 				} streaming(singletonRevealStreaming);
-				// Root workers normally yield every 20k nodes.  A concrete search
-				// world cannot retain partial TT entries in streaming mode, so yielding
-				// halfway through it would restart the same world forever.  Give one
-				// world a bounded larger quantum; the wall-clock and RSS checks remain
-				// active inside every expansion.
+				// Root workers normally yield every 20k nodes. Give one concrete world
+				// a bounded larger quantum to amortize reconstruction; canonical TT and
+				// partial cursors still make the boundary exactly resumable.
 				struct QuantumGuard { unsigned long long& limit; unsigned long long previous;
 					QuantumGuard(unsigned long long& value, unsigned long long expanded)
 						: limit(value), previous(value) {
@@ -2538,7 +2569,9 @@ private:
 			return multiDrawChance(state, nodeKey);
 		auto types = chanceCardTypes(state);
 		if (types.empty()) return unknown();
-		PartialChanceEntry* partial = singletonRevealStreaming ? nullptr : partialChanceFor(nodeKey);
+		PartialChanceEntry* partial = (!nodeKey.empty()
+			&& (!singletonRevealStreaming || (canonicalMainEnabled && concreteWorldCaching)))
+			? partialChanceFor(nodeKey) : nullptr;
 		ExactWeight total; for (const auto& item : types) total += item.second;
 		noteWeight(total);
 		ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
@@ -2617,7 +2650,9 @@ private:
 		bool allCertified = true;
 		std::unordered_set<std::string> equivalentActions;
 		std::unordered_map<std::string, std::pair<ExactScore, unsigned long long>, ExactStringHasher> successorScores;
-		PartialDecisionEntry* partial = singletonRevealStreaming ? nullptr : partialDecisionFor(nodeKey);
+		PartialDecisionEntry* partial = (!nodeKey.empty()
+			&& (!singletonRevealStreaming || (canonicalMainEnabled && concreteWorldCaching)))
+			? partialDecisionFor(nodeKey) : nullptr;
 		size_t actionOrdinal = 0;
 		bool completed = forEachLegalAction(state, [&](const std::vector<int>& action) {
 			metrics.rawOutcomes++;
@@ -2645,7 +2680,8 @@ private:
 			auto child = std::make_unique<State>(state);
 			if (!advance(*child, action)) return true;
 			ExactScore score;
-			if (!singletonRevealStreaming && canonicalMainEnabled && child->selectType == SelectType::Main
+			if (canonicalMainEnabled && (!singletonRevealStreaming || concreteWorldCaching)
+				&& child->selectType == SelectType::Main
 				&& child->exact.pending == ExactPendingType::None) {
 				std::string successorKey = keyFor(*child);
 				auto successor = successorScores.find(successorKey);
@@ -2762,13 +2798,23 @@ private:
 				return partitionCached;
 			}
 		}
+		// A concrete reveal world can still contain a large turn DAG (notably when
+		// Enriching Energy enables a four-card draw). The former streaming fast path
+		// disabled both TT and partial cursors, so a 500k-node quantum restarted that
+		// world from its first action forever. Retain exact canonical state and
+		// resumable entries whenever root canonicalization is enabled.
+		const bool cacheConcreteWorld = singletonRevealStreaming && canonicalMainEnabled && concreteWorldCaching
+			&& (state.selectType == SelectType::Main
+				|| state.exact.pending == ExactPendingType::Draw
+				|| state.exact.pending == ExactPendingType::TakePrize);
 		std::string key;
-		if (!singletonRevealStreaming) key = keyFor(state);
-		const bool shareable = usingSharedTable && !singletonRevealStreaming;
+		if (!partitionMainKey.empty()) key = partitionMainKey;
+		else if (!singletonRevealStreaming || cacheConcreteWorld) key = keyFor(state);
+		const bool shareable = usingSharedTable && (!singletonRevealStreaming || cacheConcreteWorld);
 		ExactScore cached;
 		bool cacheHit = false;
 		if (shareable) cacheHit = transposition->find(key, cached);
-		else if (!singletonRevealStreaming) {
+		else if (!singletonRevealStreaming || cacheConcreteWorld) {
 			auto found = localTransposition.find(key);
 			if (found != localTransposition.end()) { cached = found->second; cacheHit = true; }
 		}
@@ -2800,7 +2846,7 @@ private:
 		} else {
 			result = decision(state, state.selectPlayer == actor, key);
 		}
-		if (result.certified && !singletonRevealStreaming) {
+		if (result.certified && (!singletonRevealStreaming || cacheConcreteWorld)) {
 			auto partialDecision = partialDecisions.find(key);
 			if (partialDecision != partialDecisions.end()) {
 				partialBytes -= std::min(partialBytes, partialDecision->second.accountedBytes);

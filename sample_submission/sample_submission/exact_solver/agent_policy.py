@@ -92,6 +92,18 @@ def _turn_slice_milliseconds(ctx: PolicyContext, is_new_turn: bool, usable_ms: i
     return max(1, min(remaining_turn_ms, turn_cap if is_new_turn else selection_cap, usable_ms))
 
 
+def _turn_owner(current) -> int | None:
+    """Return the player whose turn it is; setup has no turn owner."""
+    if current is None or current.turn <= 0 or current.firstPlayer not in (0, 1):
+        return None
+    return current.firstPlayer if current.turn % 2 == 1 else 1 - current.firstPlayer
+
+
+def _fixed_opponent_turn_action(select) -> list[int]:
+    """Choose one stable legal representative without inspecting hidden identity."""
+    return list(range(select.minCount))
+
+
 def choose_action(obs, *, context: PolicyContext | None = None,
                   opponent_deck: list[int] | None = None) -> tuple[list[int], bool, str]:
     """Return action, certification flag, reason.
@@ -114,10 +126,28 @@ def choose_action(obs, *, context: PolicyContext | None = None,
 
     select = obs.select
     if select is None: raise ValueError("deck request is not an action")
-    if select.minCount == select.maxCount == 0: return finish([], True, "forced-empty")
     option_count = len(select.option)
     if not 0 <= select.minCount <= select.maxCount <= option_count:
         raise ValueError("invalid observation")
+
+    # Effects resolved during the opponent's turn can ask this process to choose
+    # a promotion, discard, switch target, and similar options.  They are outside
+    # the own-turn planning objective.  Starting a 90-second ExactTurnSession for
+    # them consumed most of the match clock in real episodes, so use the fixed
+    # lowest-index legal representative requested for the submission policy.
+    owner = _turn_owner(obs.current)
+    if owner is not None and owner != obs.current.yourIndex:
+        if ctx.session_id is not None:
+            try:
+                from cg.api import exact_turn_release
+                exact_turn_release(ctx.session_id)
+            except (RuntimeError, OSError):
+                pass
+            ctx.session_id = None
+        ctx.last_turn = None
+        return finish(_fixed_opponent_turn_action(select), False,
+                      "fixed-opponent-turn-selection")
+    if select.minCount == select.maxCount == 0: return finish([], True, "forced-empty")
     if select.minCount == select.maxCount == option_count:
         return finish(list(range(option_count)), True, "forced-all")
     global _last_turn, last_decision
