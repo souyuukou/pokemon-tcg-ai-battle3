@@ -329,6 +329,12 @@ struct ExactMetrics {
 	unsigned long long dynamicPartitionCacheHits = 0;
 	unsigned long long dynamicPartitionMaxClasses = 0;
 	unsigned long long dynamicPartitionMaxVisibleIdentities = 0;
+	unsigned long long continuationDraws = 0;
+	unsigned long long continuationDrawClasses = 0;
+	unsigned long long continuationClassOutcomes = 0;
+	unsigned long long continuationConditionalSplits = 0;
+	unsigned long long continuationDrawOutcomes = 0;
+	unsigned long long continuationAtomsMerged = 0;
 	int dynamicPartitionFallbackCardId = 0;
 	int dynamicPartitionFallbackEffectType = 0;
 	int dynamicPartitionFallbackTargetType = 0;
@@ -627,9 +633,16 @@ private:
 		ExactWeight totalWeight, processedWeight;
 		size_t accountedBytes = 0;
 	};
+	struct MultiDrawOutcome {
+		std::vector<int> atomCounts;
+		ExactWeight weight;
+		std::string continuationKey;
+	};
 	struct PartialMultiDrawEntry {
-		BoundedCompositionCursor cursor;
-		std::vector<int> bounds, counts;
+		std::vector<int> bounds;
+		std::string continuationSchema;
+		std::vector<MultiDrawOutcome> outcomes;
+		size_t outcomeIndex = 0;
 		ExactFraction completedLower = ExactFraction::integer(0);
 		ExactFraction completedUpper = ExactFraction::integer(0);
 		ExactWeight totalWeight, processedWeight, pendingWeight;
@@ -668,6 +681,7 @@ private:
 	std::unordered_map<std::string, ExactScore, ExactStringHasher> partitionTurnRevealScores;
 	std::unordered_map<std::string, ExactScore, ExactStringHasher> partitionTurnMainScores;
 	std::unordered_map<std::string, ExactCardPartition, ExactStringHasher> partitionAnalysisCache;
+	std::unordered_map<int, std::vector<long long>> continuationIdentityCache;
 	size_t beliefTranspositionBytes = 0;
 	static constexpr size_t MaxPolicyEntries = 100'000;
 	static constexpr size_t MaxPolicyBytes = 64ULL * 1024ULL * 1024ULL;
@@ -737,8 +751,50 @@ private:
 		}
 	}
 
+	static bool isDrawEffect(EffectType type) {
+		switch (type) {
+		case EffectType::Draw: case EffectType::DrawTargetCount:
+		case EffectType::DrawPrizeCount: case EffectType::DrawUntil:
+		case EffectType::DrawUntilPsychic: case EffectType::DrawMirror: return true;
+		default: return false;
+		}
+	}
+
+	std::vector<long long> continuationIdentityKey(int cardId) {
+		auto cached = continuationIdentityCache.find(cardId);
+		if (cached != continuationIdentityCache.end()) return cached->second;
+		std::vector<long long> key;
+		if (evaluator && evaluator->isLoaded()) {
+			auto model = evaluator->cardContinuationSignature(cardId);
+			key.reserve(model.size() + 96);
+			for (std::int16_t value : model) key.push_back(value);
+		} else key.push_back(cardId);
+		auto found = CardTable.find(cardId);
+		if (found == CardTable.end()) { key.push_back(cardId); continuationIdentityCache[cardId] = key; return key; }
+		const CardMaster& card = found->second;
+		key.push_back((int)card.cardType); key.push_back((int)card.pokemonType);
+		key.push_back((int)card.evolutionType); key.push_back((int)card.energyType);
+		key.push_back(card.energyCount); key.push_back(card.hp);
+		// Pokemon and Energy can carry identity-specific evolution, attack, Ability,
+		// or attachment semantics which are not completely represented by the V3
+		// leaf accumulator. Keep them singleton unless a future compiler proves a
+		// complete continuation signature for those rule objects.
+		if (card.cardType == CardType::Pokemon || IsEnergy(card.cardType))
+			key.push_back(cardId);
+		auto appendText = [&](const std::u8string& text) {
+			key.push_back(-1); key.push_back((long long)text.size());
+			for (char8_t value : text) key.push_back((unsigned char)value);
+		};
+		// V3 combo features derive evolutionary relations from these strings.
+		if (card.cardType == CardType::Pokemon) {
+			appendText(card.name); appendText(card.nameEn);
+			appendText(card.evolvesFrom); appendText(card.evolvesFrom2);
+		}
+		continuationIdentityCache[cardId] = key; return key;
+	}
+
 	ExactCardPartition turnDependencyPartition(const State& state,
-		const ExactHiddenState* pending = nullptr) {
+		const ExactHiddenState* pending = nullptr, bool drawContinuationOnly = false) {
 		std::vector<ExactCardAtom> population;
 		for (int i = 0; i < state.exact.typeCount[actor]; ++i)
 			if (state.exact.cardCount[actor][i] > 0)
@@ -790,7 +846,29 @@ private:
 				|| reachable.contains(cardId))
 				reachable.insert(cardId);
 		}
+		// A draw reveals the concrete card to its owner. Any card which could become
+		// a legal operator later in this turn must therefore be an identity-visible
+		// continuation class before the draw is aggregated. This closes the strategy
+		// fusion hole where two currently-in-deck Items shared model weights but
+		// offered different actions after being drawn.
+		if (drawContinuationOnly) {
+			const PlayerState& player = state.players[actor];
+			for (const ExactCardAtom& atom : population) {
+				auto found = CardTable.find(atom.cardId);
+				if (found == CardTable.end()) { reachable.insert(atom.cardId); continue; }
+				const CardMaster& card = found->second;
+				bool exhausted = IsEnergy(card.cardType) && state.energyPlayed;
+				exhausted = exhausted || (card.cardType == CardType::Supporter
+					&& (state.supporterPlayed || player.thisTurn.cannotPlaySupporter
+						|| (state.turn <= 1 && !card.canPlayFirstTurn)));
+				exhausted = exhausted || (card.cardType == CardType::Stadium
+					&& (state.stadiumPlayed || player.cannotPlayStadium
+						|| player.thisTurn.cannotPlayStadium));
+				if (!exhausted) reachable.insert(atom.cardId);
+			}
+		}
 		std::string dependencyKey = "TURN-DEPENDENCY-V1|";
+		appendSemantic(dependencyKey, drawContinuationOnly ? 1 : 0);
 		appendSemantic(dependencyKey, state.turn <= 2 ? 1 : 0);
 		for (const ExactCardAtom& atom : population) {
 			appendSemantic(dependencyKey, atom.cardId); appendSemantic(dependencyKey, atom.count);
@@ -861,7 +939,10 @@ private:
 			for (const Skill* skill : master->second.getSkills()) if (skill != nullptr) {
 				for (const Effect& effect : skill->effects) {
 					dependencyEffectType = (int)effect.effectType;
-					if (exposesArbitraryDeckIdentity(effect.effectType)) {
+					bool arbitraryIdentity = exposesArbitraryDeckIdentity(effect.effectType);
+					if (arbitraryIdentity && isDrawEffect(effect.effectType) && drawContinuationOnly
+						&& evaluator && evaluator->isLoaded()) arbitraryIdentity = false;
+					if (arbitraryIdentity) {
 						exposeAll = true;
 						metrics.dynamicPartitionFallbackCardId = id;
 						metrics.dynamicPartitionFallbackEffectType = (int)effect.effectType;
@@ -879,6 +960,14 @@ private:
 			}
 		}
 		if (exposeAll) partition.exposeAllIdentities();
+		else if (drawContinuationOnly) {
+			partition.refineVisible([&](int cardId) { return reachable.contains(cardId); });
+			partition.refineEquivalent([&](int cardId) {
+				// With no model loaded, retain card identity. Structural zero-evaluator
+				// tests are not allowed to weaken the certified model equivalence rule.
+				return continuationIdentityKey(cardId);
+			});
+		}
 		metrics.dynamicPartitionBuilds++;
 		metrics.dynamicPartitionMaxClasses = std::max<unsigned long long>(
 			metrics.dynamicPartitionMaxClasses, partition.classes().size());
@@ -2469,30 +2558,190 @@ private:
 		return result;
 	}
 
+	struct DrawContinuationClass {
+		std::vector<std::pair<int, int>> atoms;
+		int count = 0;
+	};
+
+	std::vector<DrawContinuationClass> drawContinuationClasses(const State& state,
+		const std::vector<std::pair<int, ExactWeight>>& types, std::string& schema) {
+		std::map<int, int> available;
+		for (const auto& item : types) {
+			if (!item.second.fitsUnsignedLongLong()
+				|| item.second.unsignedLongLong() > (unsigned long long)DECK_SIZE) return {};
+			available[item.first] = (int)item.second.unsignedLongLong();
+		}
+		ExactCardPartition partition = turnDependencyPartition(state, nullptr, true);
+		std::set<int> assigned;
+		std::vector<DrawContinuationClass> result;
+		for (const ExactCardClass& source : partition.classes()) {
+			DrawContinuationClass target;
+			for (const ExactCardAtom& atom : source.atoms) {
+				auto found = available.find(atom.cardId);
+				if (found == available.end() || found->second <= 0) continue;
+				target.atoms.push_back({ atom.cardId, found->second });
+				target.count += found->second; assigned.insert(atom.cardId);
+			}
+			if (target.count > 0) result.push_back(std::move(target));
+		}
+		// A stale or partially materialized profile must never silently drop an
+		// identity. Conservatively retain any unmatched card as a singleton class.
+		for (const auto& item : available) if (!assigned.contains(item.first))
+			result.push_back({ { { item.first, item.second } }, item.second });
+		std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
+			return left.atoms.front().first < right.atoms.front().first;
+		});
+		schema = "CONTINUATION-DRAW-V1|";
+		for (const DrawContinuationClass& group : result) {
+			appendSemantic(schema, group.count); appendSemantic(schema, (long long)group.atoms.size());
+			for (const auto& atom : group.atoms) {
+				appendSemantic(schema, atom.first); appendSemantic(schema, atom.second);
+			}
+		}
+		return result;
+	}
+
 	ExactScore multiDrawChance(const State& state, const std::string& nodeKey) {
 		auto types = chanceCardTypes(state);
 		const int drawCount = state.exact.pendingCount;
 		if (types.empty() || drawCount <= 1) return unknown();
+		std::string continuationSchema;
+		std::vector<DrawContinuationClass> classes;
+		if (state.exact.pendingPlayer == actor)
+			classes = drawContinuationClasses(state, types, continuationSchema);
+		else {
+			continuationSchema = "CONTINUATION-DRAW-SINGLETON|";
+			for (const auto& item : types) {
+				if (!item.second.fitsUnsignedLongLong()) return unknown();
+				int count = (int)item.second.unsignedLongLong();
+				classes.push_back({ { { item.first, count } }, count });
+				appendSemantic(continuationSchema, item.first); appendSemantic(continuationSchema, count);
+			}
+		}
+		if (classes.empty()) return unknown();
 		std::vector<int> bounds; bounds.reserve(types.size());
 		int available = 0;
-		for (const auto& item : types) {
-			if (!item.second.fitsUnsignedLongLong()
-				|| item.second.unsignedLongLong() > (unsigned long long)std::numeric_limits<int>::max()) return unknown();
-			bounds.push_back((int)item.second.unsignedLongLong()); available += bounds.back();
+		for (const auto& type : types) {
+			if (!type.second.fitsUnsignedLongLong()
+				|| type.second.unsignedLongLong() > (unsigned long long)DECK_SIZE) return unknown();
+			bounds.push_back((int)type.second.unsignedLongLong()); available += bounds.back();
 		}
 		if (drawCount > available) return unknown();
 		std::string resumeKey = nodeKey + "\x1fMULTI-DRAW";
 		auto [found, inserted] = partialMultiDraws.try_emplace(resumeKey);
 		PartialMultiDrawEntry& partial = found->second;
 		if (inserted || !partial.initialized) {
-			partial.bounds = bounds; partial.counts.assign(bounds.size(), 0);
-			partial.cursor.reset(bounds, drawCount);
+			partial.bounds = bounds;
+			partial.continuationSchema = continuationSchema;
 			partial.totalWeight = chooseCount(available, drawCount);
+			std::map<int, int> typeIndex;
+			for (int i = 0; i < (int)types.size(); ++i) typeIndex[types[i].first] = i;
+			std::vector<int> classBounds; classBounds.reserve(classes.size());
+			for (const DrawContinuationClass& group : classes) classBounds.push_back(group.count);
+			BoundedCompositionCursor classCursor; classCursor.reset(classBounds, drawCount);
+			std::vector<int> classCounts;
+			std::unordered_map<std::string, size_t, ExactStringHasher> byContinuation;
+			ExactWeight generated;
+			unsigned long long rawDrawOutcomes = 0;
+			// The outer enumeration axis is the continuation class, not card ID.
+			// Only after observing a class-count vector do we conditionally split a
+			// class into atoms. This preserves exact hypergeometric mass while
+			// avoiding identity enumeration for classes which need no refinement.
+			struct ConditionalAllocation {
+				std::vector<std::pair<int, int>> counts;
+				ExactWeight weight;
+				std::string symmetricKey;
+			};
+			while (classCursor.next(classCounts)) {
+				metrics.continuationClassOutcomes++;
+				std::vector<std::vector<ConditionalAllocation>> allocations(classes.size());
+				ExactWeight outerWeight(1);
+				bool valid = true;
+				for (int groupIndex = 0; groupIndex < (int)classes.size(); ++groupIndex) {
+					const DrawContinuationClass& group = classes[groupIndex];
+					const int take = classCounts[groupIndex];
+					outerWeight = ExactWeight::multiply(outerWeight, chooseCount(group.count, take));
+					std::vector<int> atomBounds; atomBounds.reserve(group.atoms.size());
+					for (const auto& atom : group.atoms) atomBounds.push_back(atom.second);
+					BoundedCompositionCursor atomCursor; atomCursor.reset(atomBounds, take);
+					std::vector<int> localCounts;
+					ExactWeight conditionalMass;
+					while (atomCursor.next(localCounts)) {
+						ConditionalAllocation allocation;
+						allocation.weight = ExactWeight(1);
+						std::vector<std::pair<int, int>> symmetric;
+						for (int atomIndex = 0; atomIndex < (int)group.atoms.size(); ++atomIndex) {
+							const auto& atom = group.atoms[atomIndex];
+							allocation.weight = ExactWeight::multiply(allocation.weight,
+								chooseCount(atom.second, localCounts[atomIndex]));
+							if (localCounts[atomIndex] > 0)
+								allocation.counts.push_back({ typeIndex.at(atom.first), localCounts[atomIndex] });
+							symmetric.push_back({ atom.second, localCounts[atomIndex] });
+						}
+						std::sort(symmetric.begin(), symmetric.end());
+						appendSemantic(allocation.symmetricKey, (long long)symmetric.size());
+						for (const auto& pair : symmetric) {
+							appendSemantic(allocation.symmetricKey, pair.first);
+							appendSemantic(allocation.symmetricKey, pair.second);
+						}
+						conditionalMass += allocation.weight;
+						allocations[groupIndex].push_back(std::move(allocation));
+					}
+					if (conditionalMass != chooseCount(group.count, take)) { valid = false; break; }
+					if (allocations[groupIndex].size() > 1)
+						metrics.continuationConditionalSplits += allocations[groupIndex].size() - 1;
+				}
+				if (!valid) {
+					metrics.chanceMassMismatches++; metrics.probabilityExact = false;
+					partialMultiDraws.erase(found); return unknown();
+				}
+				ExactWeight generatedForClassVector;
+				std::vector<int> atomCounts(bounds.size(), 0);
+				std::function<void(int, const ExactWeight&, std::string)> combine;
+				combine = [&](int groupIndex, const ExactWeight& weight, std::string key) {
+					if (groupIndex == (int)allocations.size()) {
+						auto [position, created] = byContinuation.emplace(key, partial.outcomes.size());
+						if (created) partial.outcomes.push_back({ atomCounts, weight, std::move(key) });
+						else partial.outcomes[position->second].weight += weight;
+						generated += weight; generatedForClassVector += weight;
+						metrics.rawOutcomes++; rawDrawOutcomes++;
+						return;
+					}
+					for (const ConditionalAllocation& allocation : allocations[groupIndex]) {
+						for (const auto& item : allocation.counts) atomCounts[item.first] = item.second;
+						combine(groupIndex + 1, ExactWeight::multiply(weight, allocation.weight),
+							key + allocation.symmetricKey);
+						for (const auto& item : allocation.counts) atomCounts[item.first] = 0;
+					}
+				};
+				combine(0, ExactWeight(1), {});
+				if (generatedForClassVector != outerWeight) {
+					metrics.chanceMassMismatches++; metrics.probabilityExact = false;
+					partialMultiDraws.erase(found); return unknown();
+				}
+			}
+			if (generated != partial.totalWeight) {
+				metrics.chanceMassMismatches++; metrics.probabilityExact = false;
+				partialMultiDraws.erase(found); return unknown();
+			}
+			std::sort(partial.outcomes.begin(), partial.outcomes.end(), [](const auto& left, const auto& right) {
+				return left.continuationKey < right.continuationKey;
+			});
+			metrics.groupedOutcomes += rawDrawOutcomes >= partial.outcomes.size()
+				? rawDrawOutcomes - partial.outcomes.size() : 0;
 			partial.initialized = true;
 			partial.accountedBytes = resumeKey.size() + sizeof(PartialMultiDrawEntry)
 				+ bounds.size() * sizeof(int) * 8;
+			for (const auto& outcome : partial.outcomes)
+				partial.accountedBytes += sizeof(MultiDrawOutcome)
+					+ outcome.atomCounts.size() * sizeof(int) + outcome.continuationKey.size();
 			partialBytes += partial.accountedBytes;
-		} else if (partial.bounds != bounds || partial.totalWeight != chooseCount(available, drawCount)) {
+			metrics.continuationDraws++;
+			metrics.continuationDrawClasses += classes.size();
+			for (const auto& group : classes) if (group.atoms.size() > 1)
+				metrics.continuationAtomsMerged += group.atoms.size() - 1;
+		} else if (partial.bounds != bounds || partial.continuationSchema != continuationSchema
+			|| partial.totalWeight != chooseCount(available, drawCount)) {
 			return unknown();
 		}
 		const ExactWeight& total = partial.totalWeight;
@@ -2521,23 +2770,17 @@ private:
 			}
 			~QuantumGuard() { limit = previous; }
 		} quantum(nodeQuantumDeadline, metrics.expanded);
-		while (true) {
-			if (!partial.pending) {
-				if (!partial.cursor.next(partial.counts)) break;
-				partial.pendingWeight = ExactWeight(1);
-				for (int i = 0; i < (int)partial.counts.size(); ++i)
-					partial.pendingWeight = ExactWeight::multiply(partial.pendingWeight,
-						chooseCount(partial.bounds[i], partial.counts[i]));
-				partial.pending = true;
-			}
+		while (partial.outcomeIndex < partial.outcomes.size()) {
+			const MultiDrawOutcome& outcome = partial.outcomes[partial.outcomeIndex];
+			partial.pendingWeight = outcome.weight; partial.pending = true;
 			if (expired()) {
 				metrics.partialChanceNodes++;
 				return incomplete();
 			}
 			auto child = std::make_unique<State>(state);
 			try {
-				for (int i = 0; i < (int)partial.counts.size(); ++i)
-					for (int n = 0; n < partial.counts[i]; ++n) resolveDraw(*child, types[i].first);
+				for (int i = 0; i < (int)outcome.atomCounts.size(); ++i)
+					for (int n = 0; n < outcome.atomCounts[i]; ++n) resolveDraw(*child, types[i].first);
 			} catch (...) { return unknown(); }
 			ExactScore score = solveOwned(std::move(child));
 			if (!score.certified) { metrics.partialChanceNodes++; return incomplete(&score); }
@@ -2549,7 +2792,8 @@ private:
 				metrics.arithmeticOverflow = true; return unknown();
 			}
 			partial.processedWeight += partial.pendingWeight; noteWeight(partial.processedWeight);
-			metrics.enumeratedHiddenWorlds++;
+			metrics.enumeratedHiddenWorlds++; metrics.continuationDrawOutcomes++;
+			partial.outcomeIndex++;
 			partial.pendingWeight = ExactWeight(); partial.pending = false;
 		}
 		if (partial.processedWeight != total) {

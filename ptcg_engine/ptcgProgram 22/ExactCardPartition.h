@@ -10,8 +10,10 @@
 #include "Skill.h"
 
 #include <algorithm>
+#include <map>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 // A reversible partition of a card-count population.  Search keys and chance
@@ -70,6 +72,32 @@ public:
 				else { hidden.atoms.push_back(atom); hidden.count += atom.count; }
 			}
 			if (!hidden.atoms.empty()) refined.push_back(std::move(hidden));
+		}
+		std::sort(refined.begin(), refined.end(), [](const auto& left, const auto& right) {
+			int li = left.atoms.empty() ? 0 : left.atoms.front().cardId;
+			int ri = right.atoms.empty() ? 0 : right.atoms.front().cardId;
+			return li < ri;
+		});
+		classes_ = std::move(refined);
+	}
+
+	// Split a hidden class only when a continuation can distinguish its atoms.
+	// Unlike refineVisible(), equal keys stay exchangeable and are not exposed as
+	// physical identities. Key equality is exact; callers must not use a digest.
+	template<class KeyFunction>
+	void refineEquivalent(KeyFunction keyFor) {
+		std::vector<ExactCardClass> refined;
+		for (const ExactCardClass& group : classes_) {
+			if (group.operatorVisible || group.atoms.size() <= 1) {
+				refined.push_back(group); continue;
+			}
+			using Key = std::decay_t<decltype(keyFor(group.atoms.front().cardId))>;
+			std::map<Key, ExactCardClass> byKey;
+			for (const ExactCardAtom& atom : group.atoms) {
+				ExactCardClass& target = byKey[keyFor(atom.cardId)];
+				target.atoms.push_back(atom); target.count += atom.count;
+			}
+			for (auto& item : byKey) refined.push_back(std::move(item.second));
 		}
 		std::sort(refined.begin(), refined.end(), [](const auto& left, const auto& right) {
 			int li = left.atoms.empty() ? 0 : left.atoms.front().cardId;

@@ -24,6 +24,11 @@ public:
 		if (!loaded || features.overflow) return false;
 		value = sparseV3.evaluate(features); return true;
 	}
+	std::vector<std::int16_t> cardContinuationSignature(int cardId) const {
+		return loaded ? sparseV3.cardContinuationSignature(cardId)
+			: std::vector<std::int16_t>{ (std::int16_t)(cardId & 0x7fff),
+				(std::int16_t)((unsigned)cardId >> 15) };
+	}
 	long long evaluate(const State& state, int actor,
 		const std::unordered_map<int, int>* actorProfile = nullptr,
 		const ExactSparseEvaluatorV3::BeliefInput* belief = nullptr) const {

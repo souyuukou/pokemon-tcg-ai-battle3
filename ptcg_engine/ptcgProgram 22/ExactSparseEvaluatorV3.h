@@ -425,6 +425,27 @@ public:
 		return std::clamp(score, (long long)-NonTerminalLimit, (long long)NonTerminalLimit);
 	}
 
+	// Exact model-side part of a turn continuation signature.  A card that is
+	// proven rule-inert for the remainder of the turn may share a draw class only
+	// when every global sparse relation (including generated combo aliases) has
+	// the same integer pre-activation contribution.  Returning the full vector,
+	// rather than a digest, prevents evaluator collisions from merging outcomes.
+	std::vector<std::int16_t> cardContinuationSignature(int cardId) const {
+		std::array<int, 3> aliases{ cardId, ComboTokenBase + cardId,
+			ComboTokenBase + 250'000 + cardId };
+		std::vector<std::int16_t> signature;
+		signature.reserve(aliases.size() * GlobalRelationCount * GlobalHiddenCount);
+		for (int alias : aliases) {
+			int token = indexFor(alias);
+			for (int relation = 0; relation < GlobalRelationCount; ++relation) {
+				size_t base = ((size_t)relation * tokens.size() + token) * GlobalHiddenCount;
+				for (int hidden = 0; hidden < GlobalHiddenCount; ++hidden)
+					signature.push_back(globalSparseWeight[base + hidden]);
+			}
+		}
+		return signature;
+	}
+
 private:
 #pragma pack(push, 1)
 	struct Header {

@@ -453,6 +453,12 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
 	 j.appendCommaKey("dynamicPartitionCacheHits"); AppendUnsignedLongLong(j, decision.metrics.dynamicPartitionCacheHits);
 	 j.appendCommaKey("dynamicPartitionMaxClasses"); AppendUnsignedLongLong(j, decision.metrics.dynamicPartitionMaxClasses);
 	 j.appendCommaKey("dynamicPartitionMaxVisibleIdentities"); AppendUnsignedLongLong(j, decision.metrics.dynamicPartitionMaxVisibleIdentities);
+	 j.appendCommaKey("continuationDraws"); AppendUnsignedLongLong(j, decision.metrics.continuationDraws);
+	 j.appendCommaKey("continuationDrawClasses"); AppendUnsignedLongLong(j, decision.metrics.continuationDrawClasses);
+	 j.appendCommaKey("continuationClassOutcomes"); AppendUnsignedLongLong(j, decision.metrics.continuationClassOutcomes);
+	 j.appendCommaKey("continuationConditionalSplits"); AppendUnsignedLongLong(j, decision.metrics.continuationConditionalSplits);
+	 j.appendCommaKey("continuationDrawOutcomes"); AppendUnsignedLongLong(j, decision.metrics.continuationDrawOutcomes);
+	 j.appendCommaKey("continuationAtomsMerged"); AppendUnsignedLongLong(j, decision.metrics.continuationAtomsMerged);
 	 j.appendCommaKeyValue("dynamicPartitionFallbackCardId", decision.metrics.dynamicPartitionFallbackCardId);
 	 j.appendCommaKeyValue("dynamicPartitionFallbackEffectType", decision.metrics.dynamicPartitionFallbackEffectType);
 	 j.appendCommaKeyValue("dynamicPartitionFallbackTargetType", decision.metrics.dynamicPartitionFallbackTargetType);
@@ -531,6 +537,12 @@ static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
 	into.dynamicPartitionMaxClasses = std::max(into.dynamicPartitionMaxClasses, from.dynamicPartitionMaxClasses);
 	into.dynamicPartitionMaxVisibleIdentities = std::max(into.dynamicPartitionMaxVisibleIdentities,
 		from.dynamicPartitionMaxVisibleIdentities);
+	into.continuationDraws += from.continuationDraws;
+	into.continuationDrawClasses += from.continuationDrawClasses;
+	into.continuationClassOutcomes += from.continuationClassOutcomes;
+	into.continuationConditionalSplits += from.continuationConditionalSplits;
+	into.continuationDrawOutcomes += from.continuationDrawOutcomes;
+	into.continuationAtomsMerged += from.continuationAtomsMerged;
 	if (from.dynamicPartitionFallbackCardId != 0) {
 		into.dynamicPartitionFallbackCardId = from.dynamicPartitionFallbackCardId;
 		into.dynamicPartitionFallbackEffectType = from.dynamicPartitionFallbackEffectType;
