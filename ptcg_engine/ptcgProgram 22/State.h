@@ -278,8 +278,6 @@ struct State {
 	int moveCounter; // カードが移動する度に増やす
 	int currentSkillOrder;
 
-	ExactHiddenState exact;
-
 	std::array<TurnHistory, 3> turnHistories; // インデックス0が今のターン
 
 	ByteFixedList<CardRef, 1> stadium;
@@ -312,9 +310,16 @@ struct State {
 	std::vector<GameFunction> functionStack;
 	std::vector<Log> logs;
 
+	// Search-only state must remain outside the raw wire-format prefix copied by
+	// serialize()/deserialize().  Placing this before `options` changes every
+	// following offset and makes observations emitted by the official runtime
+	// deserialize as a different State.
+	ExactHiddenState exact;
+
 	void clear() {
 		int count = (int)((unsigned char*)&options - (unsigned char*)&turn);
 		std::memset(&turn, 0, count);
+		exact = ExactHiddenState{};
 	}
 
 	void serialize(BinaryWriter& b) const {
@@ -337,6 +342,7 @@ struct State {
 	}
 
 	void deserialize(BinaryReader& b) {
+		exact = ExactHiddenState{};
 		b.set(&turn, &options);
 
 		b.set(options);

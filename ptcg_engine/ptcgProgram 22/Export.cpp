@@ -23,6 +23,17 @@ static JsonBuilder AllCardJson;
 static JsonBuilder AllAttackJson;
 static void AppendUnsignedLongLong(JsonBuilder& j, unsigned long long value);
 
+static const char8_t* ExactErrorJson(ApiData* data, int code, const std::string& message = {}) {
+  JsonBuilder& j = data->jsonBuilder;
+  j.clear(); j.append('{'); j.appendKeyValue("error", code);
+  if (!message.empty()) {
+    j.appendCommaKey("message");
+    j.appendDoubleQuote(std::u8string((const char8_t*)message.c_str(), message.size()));
+  }
+  j.append('}');
+  return j.buf.c_str();
+}
+
 extern "C" GAME_API const char8_t* ExactLoadEvaluatorModel(ApiData* data, const char* path) {
   JsonBuilder& j = data->jsonBuilder;
   j.clear(); j.append('{');
@@ -1083,9 +1094,10 @@ extern "C" {
         ExactSessions[data][id] = std::move(session);
       }
       return ExactDecisionJson(data, decision, id);
+    } catch (const std::exception& error) {
+      return ExactErrorJson(data, 99, error.what());
     } catch (...) {
-      data->jsonBuilder.clear(); data->jsonBuilder.appendStr("{\"error\":99}");
-      return data->jsonBuilder.buf.c_str();
+      return ExactErrorJson(data, 99, "unknown native exception");
     }
   }
 

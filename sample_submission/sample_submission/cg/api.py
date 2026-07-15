@@ -786,7 +786,9 @@ def exact_turn_begin(agent_observation: Observation, deck: list[int], hand_value
                              own_arg, value_arg, len(deck), opponent_arg, len(opponent),
                              int(budget_milliseconds))
     result = json.loads(raw.decode())
-    if result.get("error"): raise RuntimeError(f"ExactTurnBegin failed: {result['error']}")
+    if result.get("error"):
+        detail = f": {result['message']}" if result.get("message") else ""
+        raise RuntimeError(f"ExactTurnBegin failed: {result['error']}{detail}")
     return result
 
 def exact_turn_advance(session_id: int, agent_observation: Observation,
