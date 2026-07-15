@@ -76,6 +76,7 @@ struct ExactHiddenState {
 	int pendingEffectCardId = 0;
 	signed char pendingEffectPlayer = -1;
 	int pendingSkillId = 0;
+	int pendingEffectIndex = -1;
 	unsigned char pendingNullCount = 0;
 	std::array<unsigned char, 2> typeCount = {};
 	std::array<std::array<int, DECK_SIZE>, 2> cardId = {};
@@ -96,6 +97,7 @@ struct ExactHiddenState {
 		pendingEffectCardId = 0;
 		pendingEffectPlayer = -1;
 		pendingSkillId = 0;
+		pendingEffectIndex = -1;
 		pendingNullCount = 0;
 	}
 

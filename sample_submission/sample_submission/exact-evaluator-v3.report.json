@@ -1,5 +1,5 @@
 {
-  "modelSha256": "3b5b4fe5078e91bee492552eab52df0ef94939576085c57d22740e5b2d3ca115",
+  "modelSha256": "d5cec11773dd796501709d02d69ef4b478f1168a7ff6cd6fdfd17b4b13871e27",
   "datasetSha256": "85985134eeb9070e90af073f830101a0114029d4e74c806df1cb105baddead57",
   "deck": "majkel1337-85795098",
   "acceptedReplays": 2000,
@@ -11,11 +11,13 @@
     "test": 6341
   },
   "bestEpoch": 20,
-  "bestValidationMse": 0.7016485588331042,
-  "testFloatMse": 0.8873232357913995,
-  "testQuantizedMse": 0.7333781352503652,
+  "bestValidationMse": 0.7045863911624727,
+  "testFloatMse": 0.8715698882554423,
+  "testQatReferenceMse": 0.7423218558573365,
+  "testQuantizedMse": 0.7350654943897824,
   "zeroMse": 1.0,
-  "signAccuracy": 0.7178774495560929,
+  "signAccuracy": 0.7194731893752244,
+  "pairedBaseline": "constant-zero",
   "nativeBitExact": true,
   "allGatesPassed": true
 }

@@ -414,7 +414,11 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
 	 j.appendCommaKey("enumeratedHiddenWorlds"); AppendUnsignedLongLong(j, decision.metrics.enumeratedHiddenWorlds);
 	 j.appendCommaKeyValue("currentRootAction", decision.metrics.currentRootAction);
 	 j.appendCommaKey("peakRssBytes"); AppendUnsignedLongLong(j, decision.metrics.peakRssBytes);
-	 j.appendCommaKeyValue("memoryLimitReached", decision.metrics.memoryLimitReached);
+  j.appendCommaKeyValue("memoryLimitReached", decision.metrics.memoryLimitReached);
+  j.appendCommaKeyValue("structurallyBlocked", decision.metrics.structurallyBlocked);
+  j.appendCommaKey("searchStatus");
+  j.appendDoubleQuote(decision.score.certified ? u8"certified"
+    : (decision.metrics.structurallyBlocked ? u8"blocked" : u8"resumable"));
 	 j.appendCommaKey("partialDecisionHits"); AppendUnsignedLongLong(j, decision.metrics.partialDecisionHits);
 	 j.appendCommaKey("partialChanceHits"); AppendUnsignedLongLong(j, decision.metrics.partialChanceHits);
 	 j.appendCommaKey("partialTableBytes"); AppendUnsignedLongLong(j, decision.metrics.partialTableBytes);
@@ -433,6 +437,14 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
 	 j.appendCommaKey("entityFeatureCount"); AppendUnsignedLongLong(j, decision.metrics.entityFeatureCount);
 	 j.appendCommaKey("comboFeatureCount"); AppendUnsignedLongLong(j, decision.metrics.comboFeatureCount);
 	 j.appendCommaKey("provisionalOpponentPolicyNodes"); AppendUnsignedLongLong(j, decision.metrics.provisionalOpponentPolicyNodes);
+	 j.appendCommaKey("dynamicPartitionBuilds"); AppendUnsignedLongLong(j, decision.metrics.dynamicPartitionBuilds);
+	 j.appendCommaKey("dynamicPartitionFallbacks"); AppendUnsignedLongLong(j, decision.metrics.dynamicPartitionFallbacks);
+	 j.appendCommaKey("dynamicPartitionCacheHits"); AppendUnsignedLongLong(j, decision.metrics.dynamicPartitionCacheHits);
+	 j.appendCommaKey("dynamicPartitionMaxClasses"); AppendUnsignedLongLong(j, decision.metrics.dynamicPartitionMaxClasses);
+	 j.appendCommaKey("dynamicPartitionMaxVisibleIdentities"); AppendUnsignedLongLong(j, decision.metrics.dynamicPartitionMaxVisibleIdentities);
+	 j.appendCommaKeyValue("dynamicPartitionFallbackCardId", decision.metrics.dynamicPartitionFallbackCardId);
+	 j.appendCommaKeyValue("dynamicPartitionFallbackEffectType", decision.metrics.dynamicPartitionFallbackEffectType);
+	 j.appendCommaKeyValue("dynamicPartitionFallbackTargetType", decision.metrics.dynamicPartitionFallbackTargetType);
 	 j.appendCommaKeyValue("provisionalOpponentPolicy", decision.metrics.provisionalOpponentPolicyNodes > 0);
 	 j.appendCommaKeyValue("opponentPolicyOptimal", decision.metrics.provisionalOpponentPolicyNodes == 0);
 	 j.appendCommaKeyValue("hiddenInformationLeakDetected", decision.metrics.hiddenInformationLeakDetected);
@@ -485,7 +497,8 @@ static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
 	into.enumeratedHiddenWorlds += from.enumeratedHiddenWorlds;
 	if (from.currentRootAction >= 0) into.currentRootAction = from.currentRootAction;
 	into.peakRssBytes = std::max(into.peakRssBytes, from.peakRssBytes);
-	into.memoryLimitReached = into.memoryLimitReached || from.memoryLimitReached;
+  into.memoryLimitReached = into.memoryLimitReached || from.memoryLimitReached;
+  into.structurallyBlocked = into.structurallyBlocked || from.structurallyBlocked;
 	into.partialDecisionHits += from.partialDecisionHits;
 	into.partialChanceHits += from.partialChanceHits;
 	into.partialTableBytes += from.partialTableBytes;
@@ -501,6 +514,17 @@ static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
 	into.attackPreviewUnavailableCount += from.attackPreviewUnavailableCount;
 	into.entityFeatureCount += from.entityFeatureCount; into.comboFeatureCount += from.comboFeatureCount;
 	into.provisionalOpponentPolicyNodes += from.provisionalOpponentPolicyNodes;
+	into.dynamicPartitionBuilds += from.dynamicPartitionBuilds;
+	into.dynamicPartitionFallbacks += from.dynamicPartitionFallbacks;
+	into.dynamicPartitionCacheHits += from.dynamicPartitionCacheHits;
+	into.dynamicPartitionMaxClasses = std::max(into.dynamicPartitionMaxClasses, from.dynamicPartitionMaxClasses);
+	into.dynamicPartitionMaxVisibleIdentities = std::max(into.dynamicPartitionMaxVisibleIdentities,
+		from.dynamicPartitionMaxVisibleIdentities);
+	if (from.dynamicPartitionFallbackCardId != 0) {
+		into.dynamicPartitionFallbackCardId = from.dynamicPartitionFallbackCardId;
+		into.dynamicPartitionFallbackEffectType = from.dynamicPartitionFallbackEffectType;
+		into.dynamicPartitionFallbackTargetType = from.dynamicPartitionFallbackTargetType;
+	}
 	into.hiddenInformationLeakDetected = into.hiddenInformationLeakDetected || from.hiddenInformationLeakDetected;
 	into.probabilityExact = into.probabilityExact && from.probabilityExact;
 	into.informationSetSafe = into.informationSetSafe && from.informationSetSafe;
@@ -562,6 +586,7 @@ struct ExactTurnSession {
         output->planner = std::make_unique<ExactPlanner>(deck, handValues, deckCount, budgetMilliseconds,
           opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount, sharedTable, evaluator);
 		output->actions.resize(source.options.size());
+		std::vector<bool> structurallyBlocked(source.options.size(), false);
 		std::vector<int> assigned;
 		for (int position = parity; position < (int)orderedOptions.size(); position += 2)
 			assigned.push_back(orderedOptions[position]);
@@ -579,7 +604,7 @@ struct ExactTurnSession {
 			while (std::chrono::steady_clock::now() < absoluteDeadline) {
 				bool pending = false, attempted = false, resourceStopped = false;
 				for (int option : assigned) {
-					if (output->actions[option].certified) continue;
+					if (output->actions[option].certified || structurallyBlocked[option]) continue;
 					pending = true;
 					auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
 						absoluteDeadline - std::chrono::steady_clock::now()).count();
@@ -587,7 +612,10 @@ struct ExactTurnSession {
 					int slice = (int)std::min<long long>(remaining, firstRound ? firstRoundSlice : sliceMilliseconds);
 					output->planner->setBudgetMilliseconds(std::max(1, slice));
 					State local = source; local.game = &output->game;
+					unsigned long long unknownBefore = output->planner->currentMetrics().unknownOpponentList;
 					ExactScore fresh = output->planner->evaluateRootAction(local, option).score;
+					if (output->planner->currentMetrics().unknownOpponentList > unknownBefore)
+						structurallyBlocked[option] = true;
 					ExactScore& saved = output->actions[option];
 					if (saved.action.empty()) saved = fresh;
 					else {
@@ -705,6 +733,10 @@ static const char8_t* ExactProgressJson(ApiData* data, long long sessionId, cons
   j.appendCommaKey("sessionBytes"); AppendUnsignedLongLong(j, metrics.sessionBytes);
 	 j.appendCommaKey("peakRssBytes"); AppendUnsignedLongLong(j, metrics.peakRssBytes);
 	 j.appendCommaKeyValue("memoryLimitReached", metrics.memoryLimitReached);
+	 j.appendCommaKeyValue("structurallyBlocked", metrics.structurallyBlocked);
+	 j.appendCommaKey("searchStatus");
+	 j.appendDoubleQuote(session.lastDecision.score.certified ? u8"certified"
+		 : (metrics.structurallyBlocked ? u8"blocked" : u8"resumable"));
   j.appendCommaKey("elapsedMilliseconds"); AppendLongLong(j, session.elapsedMilliseconds());
   j.appendCommaKeyValue("certified", session.lastDecision.score.certified);
   j.appendCommaKeyValue("probabilityExact", metrics.probabilityExact);
@@ -959,12 +991,14 @@ extern "C" {
               if (remaining <= 0) break;
               planner.setBudgetMilliseconds((int)std::max<long long>(1, remaining));
               State local = root; local.game = &game;
+              unsigned long long unknownBefore = planner.currentMetrics().unknownOpponentList;
               ExactScore fresh = planner.evaluateRootAction(local, option).score;
               if (ExactCompare(fresh.lower, saved.lower) > 0)
                 saved.lower = fresh.lower;
               if (ExactCompare(fresh.upper, saved.upper) < 0)
                 saved.upper = fresh.upper;
               saved.certified = fresh.certified || ExactCompare(saved.lower, saved.upper) == 0;
+              if (planner.currentMetrics().unknownOpponentList > unknownBefore) break;
               if (planner.resourceStopped()) break;
             }
             output.actions.push_back({ option, saved });

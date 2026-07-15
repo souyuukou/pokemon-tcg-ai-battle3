@@ -112,17 +112,16 @@ A との直接の積集合は **`1197 Xerosic’s Machinations` 3枚だけ**で�
 
 ### 今回必要な対策
 
-2026-07-14時点のbootstrap実装では、固定デッキ同士かつXerosicの相手手札がすべて非公開の
-場合に限り、相手は「カードIDの大きいカードから捨てる」決定的方策を使う。手札の出現確率は
-全枚数ベクトルを整数重みで集約しておりサンプリングしないが、相手の最適選択ではないため
-`provisionalOpponentPolicy=true`、`certified=false`を返す。belief内で再びこの処理が必要に
-なった経路は、State群を膨張させず未認証区間として残す。
+現実装ではカードID固有のbootstrap方策を削除した。Xerosicの相手手札multisetを多変量
+超幾何分布で全列挙し、各手札情報集合で合法な捨て札multisetを全列挙してMinを取る。
+同じ公開捨て札へ到達する継続探索は再利用し、未処理質量は厳密な上下限として保持する。
+短いsliceで未完でも、処理済み情報集合に暫定方策は混ざらない。
 
 closed-worldの単一root actionを監査するため、任意の相手固定デッキを受け取る
-`ExactEvaluateActionV2`も追加した。これはbootstrapのテスト用であり、本番で未知の相手デッキを
+`ExactEvaluateActionV2`も追加した。これはclosed-worldテスト用であり、本番で未知の相手デッキを
 補完するAPIではない。
 
-#### P0: Xerosic を相手手札の情報集合 Min として解く
+#### P0: Xerosic の相手手札情報集合 Min（実装済み）
 
 1. 効果実行後の pending から `player=opponent`, `zone=hand`, `intent=ConcreteCards` を
    不変な問い合わせオブジェクトへコピーする。効果実行前の parent から player を推測しない。
@@ -130,16 +129,14 @@ closed-worldの単一root actionを監査するため、任意の相手固定デ
 3. 4枚以上なら、相手手札だけをカード ID 別枚数ベクトルで全列挙する。手札枚数を `H`、
    未公開プールを `n_i` とすると重みは `product(C(n_i,h_i))`、総質量は `C(N,H)` である。
 4. この時点で不要な相手サイドと山札の分割は列挙しない。手札の補集合を残余beliefとして
-   保持し、後で本当に山札・サイドが参照された場合だけ分割する。
+   保持する。使用後に到達可能な非Supporter効果が相手手札identityを読む場合は、この圧縮を
+   禁止して完全belief経路へ戻す。
 5. 同じ相手観測（手札multisetと相手自身の知識）内では、捨てる枚数ベクトルを全列挙し、
    root 評価を最小にするものを選ぶ。捨てる順番と同名物理コピーは一つにする。
 6. 公開された捨て札と残余beliefが同じ後続を統合し、Chance総質量の一致を検査する。
 7. closed-world では相手固定デッキを列挙 prior に使う。本番で相手 prior がなければ、
-   Xerosic を含む root action だけを未認証区間にし、他の root action の認証は維持する。
-
-現実装の `expandRevealBelief()` は、効果後 child で発生した pending を処理する際にも
-効果前 parent の `pendingPlayer` を参照し、未設定なら root actor にフォールバックする。
-Xerosic では相手手札ではなく自分側を具体化し得るため、上記1を最優先で直す。
+   Xerosic を含む root action を即座に `searchStatus="blocked"` とし、同じrootを時間切れまで
+   再試行しない。他のroot actionの探索は維持する。
 
 #### P1: きぜつ後の相手バトルポケモン選択
 

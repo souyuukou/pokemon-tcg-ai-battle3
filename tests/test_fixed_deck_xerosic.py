@@ -1,4 +1,4 @@
-from cg.api import exact_evaluate_action_v2, to_observation_class
+from cg.api import exact_evaluate_action, exact_evaluate_action_v2, to_observation_class
 from cg.game import battle_finish, battle_select, battle_start_seeded
 
 
@@ -30,7 +30,7 @@ def _seed0_second_main():
     raise AssertionError("seed 0 did not reach turn 2 main")
 
 
-def test_fixed_deck_xerosic_uses_exact_mass_and_provisional_choice():
+def test_fixed_deck_xerosic_uses_exact_information_set_minimisation():
     try:
         observation = _seed0_second_main()
         current = observation["current"]
@@ -50,12 +50,38 @@ def test_fixed_deck_xerosic_uses_exact_mass_and_provisional_choice():
         assert result["opaqueNodes"] == 0
         assert result["chanceMassMismatches"] == 0
         assert result["probabilityExact"] is True
-        assert result["provisionalOpponentPolicy"] is True
-        assert result["provisionalOpponentPolicyNodes"] >= 1
-        assert result["opponentPolicyOptimal"] is False
+        # The old card-ID-specific discard policy is gone.  Even when the short
+        # slice cannot finish the large continuation tree, every completed hand
+        # information set minimizes over all of that hand's legal discard sets.
+        assert result["provisionalOpponentPolicy"] is False
+        assert result["provisionalOpponentPolicyNodes"] == 0
+        assert result["opponentPolicyOptimal"] is True
+        assert result["informationSets"] > 0
         assert result["certified"] is False
+        assert result["partialChanceNodes"] >= 1
         assert result["rawOutcomes"] > result["groupedOutcomes"] > 0
         assert result["memoryLimitReached"] is False
         assert result["peakRssBytes"] < 3 * 1024**3
+    finally:
+        battle_finish()
+
+
+def test_unknown_opponent_hand_is_reported_as_blocked_without_spinning():
+    try:
+        observation = _seed0_second_main()
+        current = observation["current"]
+        select = observation["select"]
+        me = current["players"][current["yourIndex"]]
+        xerosic = next(i for i, option in enumerate(select["option"])
+                       if option["type"] == 7
+                       and me["hand"][option["index"]]["id"] == 1197)
+        result = exact_evaluate_action(
+            to_observation_class(observation), MAJKEL_85795098,
+            [100] * len(MAJKEL_85795098), 30_000, xerosic)
+        assert result["searchStatus"] == "blocked"
+        assert result["structurallyBlocked"] is True
+        assert result["unknownOpponentListNodes"] == 1
+        assert result["timedOut"] is False
+        assert result["certified"] is False
     finally:
         battle_finish()

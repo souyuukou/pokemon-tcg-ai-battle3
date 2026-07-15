@@ -1,7 +1,6 @@
 """Observation-safe action quotient and deterministic emergency policy."""
 
 from __future__ import annotations
-from itertools import combinations
 import os
 import time
 from dataclasses import dataclass, field
@@ -86,7 +85,7 @@ def _fallback_score(option) -> int:
 def _turn_slice_milliseconds(ctx: PolicyContext, is_new_turn: bool, usable_ms: int) -> int:
     """Return this call's slice while enforcing one absolute per-turn cap."""
     turn_cap = int(os.environ.get("PTCG_EXACT_TURN_MS", "90000"))
-    selection_cap = int(os.environ.get("PTCG_EXACT_SELECTION_MS", "10000"))
+    selection_cap = int(os.environ.get("PTCG_EXACT_SELECTION_MS", "5000"))
     remaining_turn_ms = turn_cap - int(ctx.turn_search_seconds * 1000)
     if remaining_turn_ms <= 0:
         raise RuntimeError("exact turn search budget reached")
@@ -117,8 +116,12 @@ def choose_action(obs, *, context: PolicyContext | None = None,
     if select is None: raise ValueError("deck request is not an action")
     if select.minCount == select.maxCount == 0: return finish([], True, "forced-empty")
     option_count = len(select.option)
-    if select.minCount > option_count: raise ValueError("invalid observation")
+    if not 0 <= select.minCount <= select.maxCount <= option_count:
+        raise ValueError("invalid observation")
+    if select.minCount == select.maxCount == option_count:
+        return finish(list(range(option_count)), True, "forced-all")
     global _last_turn, last_decision
+    native_failure = "native exact chance provider unavailable"
     try:
         if obs.current is None or obs.current.turn <= 0:
             raise RuntimeError("exact turn search starts after setup")
@@ -159,14 +162,32 @@ def choose_action(obs, *, context: PolicyContext | None = None,
                 _last_turn = ctx.last_turn
                 last_decision = native
             return finish(action, bool(native["certified"]), reason)
-    except (RuntimeError, ValueError, OSError, KeyError):
-        pass
-    count = select.maxCount
-    actions = combinations(range(option_count), count)
-    # Stable semantic tie-break, independent of physical option order where possible.
-    best = min(actions, key=lambda action: (
-        -sum(_fallback_score(select.option[i]) for i in action),
-        tuple(option_semantic_key(select.option[i]) for i in action),
+    except Exception as error:
+        native_failure = f"{type(error).__name__}: {error}"
+    # O(n log n), including variable-cardinality selections.  Enumerating every
+    # combination here used to make the emergency path itself exceed the clock
+    # on large search lists.
+    ranked = sorted(range(option_count), key=lambda index: (
+        -_fallback_score(select.option[index]),
+        option_semantic_key(select.option[index]),
+        index,
     ))
-    return finish(list(best), False, "emergency-policy: native exact chance provider unavailable")
+    prefix_score = 0
+    candidates = []
+    for count in range(0, select.maxCount + 1):
+        if count > 0:
+            prefix_score += _fallback_score(select.option[ranked[count - 1]])
+        if count < select.minCount:
+            continue
+        action = sorted(ranked[:count])
+        candidates.append((
+            -prefix_score,
+            tuple(sorted(option_semantic_key(select.option[i]) for i in action)),
+            count,
+            action,
+        ))
+    if not candidates:
+        raise ValueError("observation has no legal fallback cardinality")
+    best = min(candidates)[-1]
+    return finish(best, False, f"emergency-policy: {native_failure}")
 

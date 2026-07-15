@@ -126,6 +126,13 @@ def fake_quant(value, scale: float, minimum: int, maximum: int):
     return value + (quantized - value).detach()
 
 
+def fake_round_away(value, scale: float):
+    """Match the native signed divide rounding while preserving gradients."""
+    magnitude = (value.abs() * scale + .5).floor()
+    quantized = value.sign() * magnitude / scale
+    return value + (quantized - value).detach()
+
+
 def pack_batch(examples: list[Example], indices, token_index: dict[int, int], torch) -> PackedBatch:
     global_dense = []
     global_sparse = []
@@ -234,6 +241,11 @@ def main() -> None:
                     entity_acc = entity_acc.index_add(0, batch.entity_sparse_entity, contribution)
                 activation = torch.clamp(entity_acc, 0, 127)
                 projection = torch.bmm(activation[:, None, :], pool[batch.entity_pool]).squeeze(1)
+                if qat:
+                    # Native inference divides the int64 entity projection by
+                    # WEIGHT_SCALE with half-away-from-zero rounding before it
+                    # enters the global accumulator.
+                    projection = fake_round_away(projection, WEIGHT_SCALE)
                 global_acc = global_acc.index_add(0, batch.entity_sample, projection)
             return torch.clamp(global_acc, 0, 127) @ ow + ob
 
@@ -308,30 +320,39 @@ def main() -> None:
 
     def predictions(indices):
         floating_parts = []
+        qat_reference_parts = []
         with torch.no_grad():
             for start in range(0, len(indices), args.batch_size):
                 batch = pack_batch(examples, indices[start:start+args.batch_size], token_index, torch)
                 floating_parts.append(model(batch, False).numpy())
+                qat_reference_parts.append(model(batch, args.qat_epochs > 0).numpy())
         floating = np.concatenate(floating_parts) if floating_parts else np.empty(0)
+        qat_reference = np.concatenate(qat_reference_parts) if qat_reference_parts else np.empty(0)
         integer = np.asarray(predict_integer_many(quantized, [examples[i].feature for i in indices]),
                              dtype=np.float64) / 100_000_000
-        target = np.asarray([examples[i].target for i in indices]); return target, floating, integer
+        target = np.asarray([examples[i].target for i in indices])
+        return target, floating, qat_reference, integer
 
     report = {"examples": len(examples), "splits": {k:len(v) for k,v in splits.items()},
               "bestEpoch": best_epoch, "bestValidationMse": best_validation}
     gates = {"nativeBitExact": native_bit_exact, "hasUnseenTestSplit": bool(splits["test"])}
     if splits["test"]:
-        target, floating, integer = predictions(splits["test"])
+        target, floating, qat_reference, integer = predictions(splits["test"])
         test_weight = np.asarray([examples[i].weight for i in splits["test"]], dtype=np.float64)
         weighted = lambda values: float(np.sum(values * test_weight) / np.sum(test_weight))
         zero_mse = weighted(target**2)
-        float_mse = weighted((floating-target)**2); integer_mse = weighted((integer-target)**2)
+        float_mse = weighted((floating-target)**2)
+        qat_reference_mse = weighted((qat_reference-target)**2)
+        integer_mse = weighted((integer-target)**2)
         gates.update(zeroImprovement15=integer_mse <= zero_mse*.85,
                      signAccuracy70=weighted(np.sign(integer)==np.sign(target)) >= .70,
-                     quantizationWithin1Percent=(integer_mse-float_mse)/max(float_mse,1e-12) <= .01)
-        report.update(testFloatMse=float_mse,testQuantizedMse=integer_mse,zeroMse=zero_mse,
+                     quantizationWithin1Percent=abs(integer_mse-qat_reference_mse)
+                     / max(qat_reference_mse,1e-12) <= .01)
+        report.update(testFloatMse=float_mse, testQatReferenceMse=qat_reference_mse,
+                      testQuantizedMse=integer_mse,zeroMse=zero_mse,
                       signAccuracy=weighted(np.sign(integer)==np.sign(target)))
         baseline_by_key = json.loads(args.legacy_predictions.read_text()) if args.legacy_predictions else None
+        report["pairedBaseline"] = "legacy-predictions" if baseline_by_key is not None else "constant-zero"
         by_replay=defaultdict(list)
         for prediction,index in zip(integer,splits["test"]):
             e=examples[index]
@@ -339,7 +360,7 @@ def main() -> None:
             by_replay[e.replay_id].append((prediction-e.target)**2-(baseline-e.target)**2)
         paired=np.asarray([np.mean(v) for v in by_replay.values()])
         bootstrap=rng.choice(paired,(2000,len(paired)),replace=True).mean(1)
-        gates["beatsLegacyPaired95"] = float(np.quantile(bootstrap,.975)) < 0
+        gates["beatsBaselinePaired95"] = float(np.quantile(bootstrap,.975)) < 0
     report["gates"] = gates; report["allGatesPassed"] = bool(gates) and all(gates.values())
     print(json.dumps(report,indent=2))
     report_path = args.report or args.output.with_suffix(args.output.suffix + ".report.json")

@@ -4,6 +4,7 @@
 #include "ExactCanonicalState.h"
 #include "ExactCpuEvaluator.h"
 #include "ExactBigRational.h"
+#include "ExactCardPartition.h"
 
 #include <chrono>
 #include <numeric>
@@ -302,6 +303,7 @@ struct ExactMetrics {
 	int currentRootAction = -1;
 	unsigned long long peakRssBytes = 0;
 	bool memoryLimitReached = false;
+	bool structurallyBlocked = false;
 	unsigned long long partialDecisionHits = 0;
 	unsigned long long partialChanceHits = 0;
 	unsigned long long partialRevealHits = 0;
@@ -322,6 +324,14 @@ struct ExactMetrics {
 	unsigned long long entityFeatureCount = 0;
 	unsigned long long comboFeatureCount = 0;
 	unsigned long long provisionalOpponentPolicyNodes = 0;
+	unsigned long long dynamicPartitionBuilds = 0;
+	unsigned long long dynamicPartitionFallbacks = 0;
+	unsigned long long dynamicPartitionCacheHits = 0;
+	unsigned long long dynamicPartitionMaxClasses = 0;
+	unsigned long long dynamicPartitionMaxVisibleIdentities = 0;
+	int dynamicPartitionFallbackCardId = 0;
+	int dynamicPartitionFallbackEffectType = 0;
+	int dynamicPartitionFallbackTargetType = 0;
 	bool hiddenInformationLeakDetected = false;
 	bool probabilityExact = true;
 	bool informationSetSafe = true;
@@ -599,12 +609,12 @@ private:
 		bool initialized = false, handActive = false, completed = false;
 		size_t accountedBytes = 0;
 	};
-	struct FixedTurnRevealAllocation {
+	struct PartitionRevealAllocation {
 		std::vector<int> prizeCounts;
 		ExactWeight weight;
 	};
-	struct PartialFixedTurnRevealEntry {
-		std::vector<FixedTurnRevealAllocation> allocations;
+	struct PartialPartitionRevealEntry {
+		std::vector<PartitionRevealAllocation> allocations;
 		size_t index = 0;
 		ExactFraction completedLower = ExactFraction::integer(0);
 		ExactFraction completedUpper = ExactFraction::integer(0);
@@ -641,16 +651,17 @@ private:
 	std::unordered_map<std::string, PartialRevealEntry, ExactStringHasher> partialReveals;
 	std::unordered_map<std::string, PartialBeliefRevealEntry, ExactStringHasher> partialBeliefReveals;
 	// std::map keeps the outer reveal entry stable when a searched card starts a
-	// nested fixed-turn reveal and inserts another resumable entry.
-	std::map<std::string, PartialFixedTurnRevealEntry> partialFixedTurnReveals;
+	// nested partitioned reveal and inserts another resumable entry.
+	std::map<std::string, PartialPartitionRevealEntry> partialPartitionReveals;
 	std::map<std::string, PartialMultiDrawEntry> partialMultiDraws;
 	std::unordered_map<std::string, ExactScore, ExactStringHasher> beliefTransposition;
 	mutable std::unordered_map<std::string, long long, ExactStringHasher> evaluationCache;
-	// Fixed-deck turn-one search quotient.  The key retains the complete public
+	// Dynamic turn search quotient.  The key retains the complete public
 	// state, semantic search options, and every deck count that can affect a later
-	// turn-one search, while omitting identities irrelevant until the next turn.
-	std::unordered_map<std::string, ExactScore, ExactStringHasher> fixedFirstTurnRevealScores;
-	std::unordered_map<std::string, ExactScore, ExactStringHasher> fixedFirstTurnMainScores;
+	// query before the turn leaf, while omitting identities proven irrelevant.
+	std::unordered_map<std::string, ExactScore, ExactStringHasher> partitionTurnRevealScores;
+	std::unordered_map<std::string, ExactScore, ExactStringHasher> partitionTurnMainScores;
+	std::unordered_map<std::string, ExactCardPartition, ExactStringHasher> partitionAnalysisCache;
 	size_t beliefTranspositionBytes = 0;
 	static constexpr size_t MaxPolicyEntries = 100'000;
 	static constexpr size_t MaxPolicyBytes = 64ULL * 1024ULL * 1024ULL;
@@ -693,25 +704,192 @@ private:
 		return ExactCanonicalState::Build(input);
 	}
 
-	std::string fixedTurnOneMainKey(const State& state) const {
-		if (!singletonRevealStreaming || state.turn != 1 || state.selectPlayer != actor
-			|| state.selectType != SelectType::Main || state.exact.deckUnknown[actor]
-			|| !isMajkelFixedProfile(actorProfileCount)) return {};
-		// Enriching Energy can draw four cards later in this turn, so identities
-		// outside the search-target quotient still affect its exact transition.
-		for (CardRef ref : state.players[actor].hand)
-			if (!ref.isNull() && state.getCard(ref).cardId == 13) return {};
-		std::string key = "FIXED-TURN1-MAIN\x1f";
-		key += observationKeyFor(state, actor, nullptr, false);
-		static constexpr std::array<int, 6> relevantIds{ 66, 305, 343, 741, 742, 743 };
-		std::array<int, relevantIds.size()> counts{};
-		for (CardRef ref : state.players[actor].deck) if (!ref.isNull()) {
-			int id = state.getCard(ref).cardId;
-			for (int i = 0; i < (int)relevantIds.size(); ++i) if (id == relevantIds[i]) {
-				counts[i]++; break;
+	static bool targetIncludesDeck(const Target& target) {
+		for (AreaType area : target.areas) if (area == AreaType::Deck) return true;
+		return false;
+	}
+
+	static bool exposesArbitraryDeckIdentity(EffectType type) {
+		switch (type) {
+		case EffectType::Draw:
+		case EffectType::DrawTargetCount:
+		case EffectType::DrawPrizeCount:
+		case EffectType::DrawUntil:
+		case EffectType::DrawUntilPsychic:
+		case EffectType::DrawMirror:
+		case EffectType::LookDeck:
+		case EffectType::LookDeckReverse:
+		case EffectType::LookDeckBottom:
+		case EffectType::DeckToTrash:
+		case EffectType::DeckToTrashCoinUntilTail:
+		case EffectType::DeckBottomToTrash:
+		case EffectType::SwitchDeck:
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	ExactCardPartition turnDependencyPartition(const State& state,
+		const ExactHiddenState* pending = nullptr) {
+		std::vector<ExactCardAtom> population;
+		for (int i = 0; i < state.exact.typeCount[actor]; ++i)
+			if (state.exact.cardCount[actor][i] > 0)
+				population.push_back({ state.exact.cardId[actor][i], state.exact.cardCount[actor][i] });
+		ExactCardPartition partition(population);
+		std::set<int> reachable;
+		auto addRef = [&](AreaType area, int index) {
+			try {
+				CardRef ref = state.getCardRef(area, index, actor);
+				if (!ref.isNull()) reachable.insert(state.getCard(ref).cardId);
+			} catch (...) {}
+		};
+		// Seed from every owned card that can already act or can become playable
+		// later in this turn.  Current legality alone is insufficient: benching a
+		// Pokemon or changing a restriction may enable a card after this node.
+		for (const SelectOption& option : state.options) {
+			switch (option.type) {
+			case SelectOptionType::Play: addRef(AreaType::Hand, option.param0); break;
+			case SelectOptionType::Attach:
+			case SelectOptionType::Evolve: addRef((AreaType)option.param0, option.param1); break;
+			case SelectOptionType::Ability: addRef((AreaType)option.param0, option.param1); break;
+			case SelectOptionType::Skill: {
+				auto skill = SkillTable.find(option.param0);
+				if (skill != SkillTable.end()) reachable.insert(skill->second.cardId);
+				break;
+			}
+			default: break;
 			}
 		}
-		for (int count : counts) appendSemantic(key, count);
+		for (CardRef ref : state.players[actor].hand) if (!ref.isNull()) {
+			int cardId = state.getCard(ref).cardId;
+			auto master = CardTable.find(cardId);
+			if (master == CardTable.end()) { reachable.insert(cardId); continue; }
+			// A Supporter absent from the legal option list cannot become legal
+			// later in the same turn (first-turn prohibition or already used).
+			// Evolution cards are likewise unreachable during either player's
+			// first turn unless the engine already exposed a legal effect option.
+			bool firstTurnEvolution = state.turn <= 2
+				&& (master->second.evolutionType == EvolutionType::Stage1
+					|| master->second.evolutionType == EvolutionType::Stage2);
+			// Other cards may become legal after a bench/target/stadium change.
+			if ((!firstTurnEvolution && master->second.cardType != CardType::Supporter)
+				|| reachable.contains(cardId))
+				reachable.insert(cardId);
+		}
+		std::string dependencyKey = "TURN-DEPENDENCY-V1|";
+		appendSemantic(dependencyKey, state.turn <= 2 ? 1 : 0);
+		for (const ExactCardAtom& atom : population) {
+			appendSemantic(dependencyKey, atom.cardId); appendSemantic(dependencyKey, atom.count);
+		}
+		for (int id : reachable) appendSemantic(dependencyKey, id);
+		if (pending != nullptr) {
+			appendSemantic(dependencyKey, pending->pendingPlayer);
+			appendSemantic(dependencyKey, pending->pendingSkillId);
+			appendSemantic(dependencyKey, pending->pendingEffectIndex);
+			appendSemantic(dependencyKey, pending->pendingDetail);
+		}
+		auto cachedPartition = partitionAnalysisCache.find(dependencyKey);
+		if (cachedPartition != partitionAnalysisCache.end()) {
+			metrics.dynamicPartitionCacheHits++;
+			return cachedPartition->second;
+		}
+
+		bool exposeAll = false;
+		int dependencyCardId = 0;
+		int dependencyEffectType = 0;
+		auto applyTarget = [&](const Target& target) {
+			if (!targetIncludesDeck(target)) return;
+			std::set<int> matching;
+			for (const ExactCardAtom& atom : population) {
+				auto master = CardTable.find(atom.cardId);
+				if (master == CardTable.end()) { exposeAll = true; return; }
+				ExactStaticTargetResult result = ExactStaticTargetMatches(master->second, target);
+				if (!result.supported) {
+					exposeAll = true;
+					metrics.dynamicPartitionFallbackCardId = dependencyCardId;
+					metrics.dynamicPartitionFallbackEffectType = dependencyEffectType;
+					metrics.dynamicPartitionFallbackTargetType = (int)target.conditions.front().targetType;
+					return;
+				}
+				if (result.matches) matching.insert(atom.cardId);
+			}
+			partition.refineVisible([&](int cardId) { return matching.contains(cardId); });
+			for (int cardId : matching) {
+				auto master = CardTable.find(cardId);
+				if (master == CardTable.end()) { exposeAll = true; return; }
+				// Neither player can evolve during their first turn.  A searched
+				// evolution card is observable (and remains a singleton class), but
+				// its evolve-time Skill is not a reachable operator this turn.
+				if (state.turn <= 2 && (master->second.evolutionType == EvolutionType::Stage1
+					|| master->second.evolutionType == EvolutionType::Stage2)) continue;
+				reachable.insert(cardId);
+			}
+		};
+
+		if (pending != nullptr && pending->pendingSkillId > 0 && pending->pendingEffectIndex >= 0) {
+			auto skill = SkillTable.find(pending->pendingSkillId);
+			if (skill == SkillTable.end() || pending->pendingEffectIndex >= (int)skill->second.effects.size()) exposeAll = true;
+			else {
+				dependencyCardId = skill->second.cardId;
+				dependencyEffectType = (int)skill->second.effects[pending->pendingEffectIndex].effectType;
+				applyTarget(skill->second.effects[pending->pendingEffectIndex].target);
+			}
+		}
+
+		std::set<int> scanned;
+		while (!exposeAll) {
+			auto next = std::find_if(reachable.begin(), reachable.end(), [&](int id) { return !scanned.contains(id); });
+			if (next == reachable.end()) break;
+			int id = *next; scanned.insert(id);
+			dependencyCardId = id;
+			auto master = CardTable.find(id);
+			if (master == CardTable.end()) { exposeAll = true; break; }
+			for (const Skill* skill : master->second.getSkills()) if (skill != nullptr) {
+				for (const Effect& effect : skill->effects) {
+					dependencyEffectType = (int)effect.effectType;
+					if (exposesArbitraryDeckIdentity(effect.effectType)) {
+						exposeAll = true;
+						metrics.dynamicPartitionFallbackCardId = id;
+						metrics.dynamicPartitionFallbackEffectType = (int)effect.effectType;
+						break;
+					}
+					// An unfiltered deck-size condition is identity-free.  A filtered
+					// condition observes its predicate just as a selection does, even
+					// when no card is moved.
+					if (targetIncludesDeck(effect.target)
+						&& (!effect.isCondition || !effect.target.conditions.empty()))
+						applyTarget(effect.target);
+					if (exposeAll) break;
+				}
+				if (exposeAll) break;
+			}
+		}
+		if (exposeAll) partition.exposeAllIdentities();
+		metrics.dynamicPartitionBuilds++;
+		metrics.dynamicPartitionMaxClasses = std::max<unsigned long long>(
+			metrics.dynamicPartitionMaxClasses, partition.classes().size());
+		metrics.dynamicPartitionMaxVisibleIdentities = std::max<unsigned long long>(
+			metrics.dynamicPartitionMaxVisibleIdentities, partition.visibleCardIds().size());
+		if (!partition.hasCompressedClass()) metrics.dynamicPartitionFallbacks++;
+		if (partitionAnalysisCache.size() < 16'384)
+			partitionAnalysisCache.emplace(std::move(dependencyKey), partition);
+		return partition;
+	}
+
+	std::string partitionTurnMainKey(const State& state) {
+		if (!singletonRevealStreaming || state.selectPlayer != actor
+			|| state.selectType != SelectType::Main || state.exact.deckUnknown[actor]) return {};
+		ExactCardPartition partition = turnDependencyPartition(state);
+		if (!partition.hasCompressedClass()) return {};
+		std::string key = "DYNAMIC-TURN-MAIN\x1f" + partition.schemaKey();
+		key += observationKeyFor(state, actor, nullptr, false);
+		for (int id : partition.visibleCardIds()) {
+			int count = 0;
+			for (CardRef ref : state.players[actor].deck)
+				if (!ref.isNull() && state.getCard(ref).cardId == id) count++;
+			appendSemantic(key, id); appendSemantic(key, count);
+		}
 		return key;
 	}
 
@@ -1252,21 +1430,6 @@ private:
 		state.exact.clearPending();
 	}
 
-	bool isMajkelFixedProfile(const std::unordered_map<int, int>& profile) const {
-		static const std::array<std::pair<int, int>, 22> expected = {{
-			{ 5, 2 }, { 13, 1 }, { 19, 4 }, { 66, 2 }, { 140, 1 }, { 305, 3 },
-			{ 343, 1 }, { 741, 4 }, { 742, 4 }, { 743, 4 }, { 1079, 3 }, { 1081, 4 },
-			{ 1086, 4 }, { 1097, 1 }, { 1129, 1 }, { 1152, 4 }, { 1182, 3 }, { 1184, 1 },
-			{ 1197, 3 }, { 1225, 4 }, { 1231, 4 }, { 1266, 2 }
-		}};
-		if (profile.size() != expected.size()) return false;
-		for (const auto& item : expected) {
-			auto found = profile.find(item.first);
-			if (found == profile.end() || found->second != item.second) return false;
-		}
-		return true;
-	}
-
 	static AreaType pendingArea(const ExactHiddenState& request) {
 		int detail = request.pendingDetail;
 		if (request.pendingPlayer >= 0) detail -= 100 * request.pendingPlayer;
@@ -1288,11 +1451,108 @@ private:
 		state.exact.clearPending();
 	}
 
-	bool selectProvisionalXerosicDiscard(State& state, int player,
-		std::unordered_map<int, int>& discarded) {
-		if (state.selectPlayer != player || state.selectType != SelectType::Card
-			|| state.selectMin != state.selectMax || state.selectMin <= 0) return false;
-		std::vector<std::pair<int, int>> candidates;
+	void materializeUnknownHandFromPool(State& state, int player,
+		const std::vector<int>& handCounts) {
+		materializeUnknownHand(state, player, handCounts);
+		for (int i = 0; i < (int)handCounts.size(); ++i)
+			for (int n = 0; n < handCounts[i]; ++n)
+				decrementPool(state, player, state.exact.cardId[player][i]);
+	}
+
+	bool expandHiddenHandBelief(const State& parent, const ExactHiddenState& request,
+		const std::vector<int>& action, const ExactWeight& baseWeight,
+		const std::array<ExactKnowledgeState, 2>& baseKnowledge,
+		std::vector<BeliefWorld>& output) {
+		const int player = request.pendingPlayer;
+		if (player < 0 || player >= 2 || request.pending != ExactPendingType::RevealDeck
+			|| pendingArea(request) != AreaType::Hand || !parent.exact.profileKnown[player]) return false;
+		int handSize = 0;
+		for (CardRef ref : parent.players[player].hand) if (ref.isNull()) handSize++;
+		std::vector<int> bounds(parent.exact.typeCount[player]);
+		int totalHidden = 0;
+		for (int i = 0; i < (int)bounds.size(); ++i) {
+			bounds[i] = parent.exact.cardCount[player][i]; totalHidden += bounds[i];
+		}
+		if (handSize < 0 || handSize > totalHidden) return false;
+		ExactWeight expected = ExactWeight::multiply(baseWeight, chooseCount(totalHidden, handSize));
+		ExactWeight generated;
+		BoundedCompositionCursor cursor; cursor.reset(bounds, handSize);
+		std::vector<int> handCounts;
+		unsigned long long raw = 0;
+		while (cursor.next(handCounts)) {
+			if (expired()) return false;
+			ExactWeight allocation(1);
+			for (int i = 0; i < (int)bounds.size(); ++i)
+				allocation = ExactWeight::multiply(allocation, chooseCount(bounds[i], handCounts[i]));
+			if (allocation.zero()) continue;
+			ExactWeight weight = ExactWeight::multiply(baseWeight, allocation);
+			auto child = std::make_unique<State>(parent);
+			auto knowledge = baseKnowledge;
+			try {
+				materializeUnknownHandFromPool(*child, player, handCounts);
+				for (int i = 0; i < (int)handCounts.size(); ++i)
+					for (int n = 0; n < handCounts[i]; ++n)
+						appendKnowledgeFact(knowledge[player], 'H', parent.exact.cardId[player][i]);
+				if (!advance(*child, action)) return false;
+			} catch (...) { return false; }
+			output.push_back({ std::move(child), weight, std::move(knowledge) });
+			generated += weight; raw++; metrics.enumeratedHiddenWorlds++;
+		}
+		if (generated != expected) {
+			metrics.chanceMassMismatches++; metrics.probabilityExact = false; return false;
+		}
+		metrics.rawOutcomes += raw; metrics.groupedOutcomes += output.size();
+		return !output.empty();
+	}
+
+	bool isForcedHiddenHandDiscard(const ExactHiddenState& request, int& keepCount) const {
+		if (pendingArea(request) != AreaType::Hand || request.pendingSkillId <= 0
+			|| request.pendingEffectIndex < 0) return false;
+		auto skill = SkillTable.find(request.pendingSkillId);
+		if (skill == SkillTable.end() || request.pendingEffectIndex >= (int)skill->second.effects.size()) return false;
+		const Effect& effect = skill->second.effects[request.pendingEffectIndex];
+		if (effect.effectType != EffectType::ToTrash || effect.effectSelectType != EffectSelectType::CardUntil
+			|| !effect.enemySelect) return false;
+		keepCount = effect.selectCount;
+		return keepCount >= 0 && canForgetOpponentHandAfterForcedDiscard(request);
+	}
+
+	static bool targetReadsEnemyHand(const Target& target) {
+		bool hand = false;
+		for (AreaType area : target.areas) if (area == AreaType::Hand) { hand = true; break; }
+		if (!hand) return false;
+		return target.targetPlayer == TargetPlayer::Enemy || target.targetPlayer == TargetPlayer::Both;
+	}
+
+	bool canForgetOpponentHandAfterForcedDiscard(const ExactHiddenState& request) const {
+		auto effectCard = CardTable.find(request.pendingEffectCardId);
+		// The proof below relies on the once-per-turn Supporter rule: after this
+		// effect resolves, every other Supporter is unreachable until the leaf.
+		if (effectCard == CardTable.end() || effectCard->second.cardType != CardType::Supporter)
+			return false;
+		for (const auto& profile : actorProfileCount) {
+			auto card = CardTable.find(profile.first);
+			if (card == CardTable.end()) return false;
+			if (card->second.cardType == CardType::Supporter) continue;
+			auto reads = [](const Effect& effect) { return targetReadsEnemyHand(effect.target); };
+			for (const Skill* skill : card->second.getSkills()) {
+				if (skill == nullptr) continue;
+				for (const Effect& effect : skill->effects) if (reads(effect)) return false;
+			}
+			for (const Attack* attack : card->second.attacks) {
+				if (attack == nullptr) continue;
+				for (const Effect& effect : attack->preEffects) if (reads(effect)) return false;
+				for (const Effect& effect : attack->postEffects) if (reads(effect)) return false;
+			}
+		}
+		return true;
+	}
+
+	bool selectHiddenHandDiscard(State& state, int player, const std::vector<int>& discardCounts) {
+		std::unordered_map<int, int> remaining;
+		for (int i = 0; i < (int)discardCounts.size(); ++i)
+			if (discardCounts[i] > 0) remaining[state.exact.cardId[player][i]] = discardCounts[i];
+		std::vector<int> selected;
 		for (int optionIndex = 0; optionIndex < (int)state.options.size(); ++optionIndex) {
 			const SelectOption& option = state.options[optionIndex];
 			if (option.type != SelectOptionType::Card) continue;
@@ -1300,269 +1560,133 @@ private:
 			if (position.playerIndex != player || position.area != AreaType::Hand) continue;
 			CardRef ref = state.getCardRef(position);
 			if (ref.isNull()) return false;
-			candidates.push_back({ state.getCard(ref).cardId, optionIndex });
+			int id = state.getCard(ref).cardId;
+			auto found = remaining.find(id);
+			if (found != remaining.end() && found->second > 0) {
+				selected.push_back(optionIndex); found->second--;
+			}
 		}
-		if ((int)candidates.size() < state.selectMin) return false;
-		// Stable bootstrap policy: discard the highest card IDs first.  This is
-		// deliberately simple and is never reported as a minimax certificate.
-		std::sort(candidates.begin(), candidates.end(), [](const auto& left, const auto& right) {
-			if (left.first != right.first) return left.first > right.first;
-			return left.second < right.second;
-		});
-		std::vector<int> selected;
-		for (int i = 0; i < state.selectMin; ++i) {
-			selected.push_back(candidates[i].second);
-			discarded[candidates[i].first]++;
-		}
+		for (const auto& item : remaining) if (item.second != 0) return false;
+		if ((int)selected.size() != state.selectMin || state.selectMin != state.selectMax) return false;
 		std::sort(selected.begin(), selected.end());
 		return advance(state, selected);
 	}
 
-	void anonymizeXerosicHand(State& state, int player, const std::vector<int>& originalBounds,
-		const std::unordered_map<int, int>& discarded) {
+	void anonymizeHiddenHandAfterDiscard(State& state, int player,
+		const std::vector<int>& originalBounds, const std::vector<int>& discardCounts) {
 		PlayerState& ps = state.players[player];
 		for (int i = 0; i < ps.hand.size(); ++i) {
 			CardRef ref = ps.hand[i];
 			if (ref.isNull()) continue;
-			state.allCard[ref.cardIndex] = {};
-			ps.hand[i] = CardRef(0);
+			state.allCard[ref.cardIndex] = {}; ps.hand[i] = CardRef(0);
 		}
 		for (int i = 0; i < state.exact.typeCount[player]; ++i) {
-			int count = originalBounds[i];
-			auto found = discarded.find(state.exact.cardId[player][i]);
-			if (found != discarded.end()) count -= found->second;
-			if (count < 0 || count > 255) throw std::runtime_error("Xerosic hidden pool mismatch");
+			int count = originalBounds[i] - discardCounts[i];
+			if (count < 0 || count > 255) throw std::runtime_error("hidden hand residual mismatch");
 			state.exact.cardCount[player][i] = (unsigned char)count;
 		}
 		state.exact.deckUnknown[player] = true;
 		state.exact.prizeExchangeable[player] = true;
-		state.exact.provisionalOpponentPolicy = true;
+		state.exact.provisionalOpponentPolicy = false;
 		state.exact.clearPending();
 	}
 
-	bool expandProvisionalXerosicBelief(const State& parent, const ExactHiddenState& request,
-		const std::vector<int>& action, const ExactWeight& baseWeight,
-		const std::array<ExactKnowledgeState, 2>& baseKnowledge, std::vector<BeliefWorld>& output) {
+	ExactScore solveForcedHiddenHandDiscard(const State& parent, const ExactHiddenState& request,
+		const std::vector<int>& action, int keepCount) {
 		const int player = request.pendingPlayer;
-		if (request.pendingEffectCardId != 1197 || pendingArea(request) != AreaType::Hand
-			|| !isMajkelFixedProfile(actorProfileCount) || !isMajkelFixedProfile(opponentProfileCount)) return false;
-		int handSize = 0;
-		for (CardRef ref : parent.players[player].hand) {
-			if (!ref.isNull()) return false; // fixed-deck bootstrap supports a fully hidden hand
-			handSize++;
-		}
-		if (handSize <= 3) return false;
-		std::vector<int> bounds(parent.exact.typeCount[player]);
-		int totalHidden = 0;
-		for (int i = 0; i < (int)bounds.size(); ++i) {
-			bounds[i] = parent.exact.cardCount[player][i]; totalHidden += bounds[i];
-		}
-		if (handSize > totalHidden) return false;
-		ExactWeight expected = ExactWeight::multiply(baseWeight, chooseCount(totalHidden, handSize));
-		BoundedCompositionCursor cursor; cursor.reset(bounds, handSize);
-		std::vector<int> handCounts;
-		struct Outcome {
-			std::vector<int> representativeHand;
-			std::vector<int> discarded;
-			ExactWeight weight;
-		};
-		std::vector<int> idOrder(bounds.size());
-		std::iota(idOrder.begin(), idOrder.end(), 0);
-		std::sort(idOrder.begin(), idOrder.end(), [&](int left, int right) {
-			return parent.exact.cardId[player][left] < parent.exact.cardId[player][right];
-		});
-		struct CountKeyHash { size_t operator()(const std::array<unsigned char, DECK_SIZE>& key) const noexcept {
-			size_t value = 1469598103934665603ULL;
-			for (unsigned char count : key) { value ^= count; value *= 1099511628211ULL; }
-			return value;
-		} };
-		std::unordered_map<std::array<unsigned char, DECK_SIZE>, size_t, CountKeyHash> byDiscard;
-		std::vector<Outcome> outcomes;
-		ExactWeight generated;
-		unsigned long long raw = 0;
-		while (cursor.next(handCounts)) {
-			if (expired()) return false;
-			ExactWeight allocation(1);
-			for (int i = 0; i < (int)bounds.size(); ++i)
-				allocation = ExactWeight::multiply(allocation, chooseCount(bounds[i], handCounts[i]));
-			ExactWeight weight = ExactWeight::multiply(baseWeight, allocation);
-			std::array<unsigned char, DECK_SIZE> discardKey{};
-			for (int i = 0; i < (int)handCounts.size(); ++i) discardKey[i] = (unsigned char)handCounts[i];
-			int keep = 3;
-			for (int index : idOrder) {
-				int count = std::min(keep, (int)discardKey[index]);
-				discardKey[index] = (unsigned char)(discardKey[index] - count); keep -= count;
-				if (keep == 0) break;
-			}
-			if (keep != 0) return false;
-			auto found = byDiscard.find(discardKey);
-			if (found == byDiscard.end()) {
-				byDiscard.emplace(discardKey, outcomes.size());
-				std::vector<int> discardCounts(handCounts.size());
-				for (int i = 0; i < (int)discardCounts.size(); ++i) discardCounts[i] = discardKey[i];
-				outcomes.push_back({ handCounts, std::move(discardCounts), weight });
-			} else { outcomes[found->second].weight += weight; metrics.distributionMerges++; }
-			generated += weight; raw++; metrics.enumeratedHiddenWorlds++;
-		}
-		if (generated != expected) {
-			metrics.chanceMassMismatches++; metrics.probabilityExact = false; return false;
-		}
-		std::unordered_map<std::string, size_t, ExactStringHasher> bySuccessor;
-		for (const Outcome& outcome : outcomes) {
-			if (expired()) return false;
-			auto child = std::make_unique<State>(parent);
-			try {
-				materializeUnknownHand(*child, player, outcome.representativeHand);
-				if (!advance(*child, action)) return false;
-				std::unordered_map<int, int> discarded;
-				if (!selectProvisionalXerosicDiscard(*child, player, discarded)) return false;
-				for (int i = 0; i < (int)outcome.discarded.size(); ++i) {
-					int expectedCount = outcome.discarded[i];
-					int actualCount = discarded[parent.exact.cardId[player][i]];
-					if (actualCount != expectedCount) return false;
-				}
-				anonymizeXerosicHand(*child, player, bounds, discarded);
-			} catch (...) { return false; }
-			BeliefWorld candidate{ std::move(child), outcome.weight, baseKnowledge };
-			std::string key = beliefWorldKey(candidate);
-			auto found = bySuccessor.find(key);
-			if (found == bySuccessor.end()) {
-				bySuccessor.emplace(std::move(key), output.size()); output.push_back(std::move(candidate));
-			} else { output[found->second].weight += outcome.weight; metrics.distributionMerges++; }
-		}
-		metrics.rawOutcomes += raw; metrics.groupedOutcomes += outcomes.size();
-		metrics.provisionalOpponentPolicyNodes++;
-		return !output.empty();
-	}
-
-	ExactScore solveProvisionalXerosicStreaming(const State& parent, const ExactHiddenState& request,
-		const std::vector<int>& action) {
-		const int player = request.pendingPlayer;
-		if (request.pendingEffectCardId != 1197 || pendingArea(request) != AreaType::Hand
-			|| !isMajkelFixedProfile(actorProfileCount) || !isMajkelFixedProfile(opponentProfileCount)) return unknown();
+		if (player < 0 || player >= 2 || player == actor || !parent.exact.profileKnown[player]) return unknown();
 		int handSize = 0;
 		for (CardRef ref : parent.players[player].hand) {
 			if (!ref.isNull()) return unknown();
 			handSize++;
 		}
+		const int discardSize = handSize - keepCount;
+		if (discardSize <= 0) return unknown();
 		std::vector<int> bounds(parent.exact.typeCount[player]);
 		int totalHidden = 0;
 		for (int i = 0; i < (int)bounds.size(); ++i) {
 			bounds[i] = parent.exact.cardCount[player][i]; totalHidden += bounds[i];
 		}
-		if (handSize <= 3 || handSize > totalHidden) return unknown();
-		struct Outcome { std::vector<int> hand, discarded; unsigned long long weight = 0; };
-		std::vector<int> idOrder(bounds.size()); std::iota(idOrder.begin(), idOrder.end(), 0);
-		std::sort(idOrder.begin(), idOrder.end(), [&](int left, int right) {
-			return parent.exact.cardId[player][left] < parent.exact.cardId[player][right];
-		});
-		std::vector<Outcome> outcomes;
-		BoundedCompositionCursor discardCursor; discardCursor.reset(bounds, handSize - 3);
-		std::vector<int> discardCounts;
-		unsigned long long generated = 0;
-		unsigned long long raw = 0;
-		while (discardCursor.next(discardCounts)) {
-			if (expired()) return unknown();
-			int firstDiscard = -1;
-			for (int index : idOrder) if (discardCounts[index] > 0) { firstDiscard = index; break; }
-			if (firstDiscard < 0) return unknown();
-			std::vector<int> keepBounds(bounds.size());
-			const int boundaryId = parent.exact.cardId[player][firstDiscard];
-			for (int i = 0; i < (int)bounds.size(); ++i) {
-				int remaining = bounds[i] - discardCounts[i];
-				keepBounds[i] = parent.exact.cardId[player][i] <= boundaryId ? remaining : 0;
-			}
-			BoundedCompositionCursor keepCursor; keepCursor.reset(keepBounds, 3);
-			std::vector<int> keptCounts, representative;
-			unsigned long long outcomeWeight = 0;
-			while (keepCursor.next(keptCounts)) {
-				unsigned long long weight = 1;
-				for (int i = 0; i < (int)bounds.size(); ++i) {
-					ExactWeight factor = chooseCount(bounds[i], discardCounts[i] + keptCounts[i]);
-					if (!factor.fitsUnsignedLongLong()
-						|| factor.unsignedLongLong() > std::numeric_limits<unsigned long long>::max() / weight)
-						return unknown();
-					weight *= factor.unsignedLongLong();
-				}
-				if (outcomeWeight > std::numeric_limits<unsigned long long>::max() - weight) return unknown();
-				outcomeWeight += weight; raw++; metrics.enumeratedHiddenWorlds++;
-				if (representative.empty()) {
-					representative.resize(bounds.size());
-					for (int i = 0; i < (int)bounds.size(); ++i)
-						representative[i] = discardCounts[i] + keptCounts[i];
-				}
-			}
-			if (outcomeWeight == 0 || representative.empty()) continue;
-			if (generated > std::numeric_limits<unsigned long long>::max() - outcomeWeight) return unknown();
-			generated += outcomeWeight;
-			outcomes.push_back({ std::move(representative), discardCounts, outcomeWeight });
-		}
-		ExactWeight totalWeight = chooseCount(totalHidden, handSize);
-		if (!totalWeight.fitsUnsignedLongLong()) return unknown();
-		unsigned long long total = totalWeight.unsignedLongLong();
-		if (generated != total) {
-			metrics.chanceMassMismatches++; metrics.probabilityExact = false; return unknown();
-		}
-		metrics.rawOutcomes += raw; metrics.groupedOutcomes += outcomes.size();
-		metrics.provisionalOpponentPolicyNodes++;
-		// MSVC's heap keeps the pages touched by the many tiny composition
-		// temporaries in the working set even though only the compact outcomes
-		// remain live.  The fixed-deck bootstrap is allowed up to the match-wide
-		// 3 GiB limit; record the real peak, fail before crossing it, then return
-		// unused pages before recursive search applies the normal 2.7 GiB guard.
-		unsigned long long enumerationRss = ExactResidentBytes();
-		metrics.peakRssBytes = std::max(metrics.peakRssBytes, enumerationRss);
-		if (enumerationRss >= 3ULL * 1024ULL * 1024ULL * 1024ULL) {
-			metrics.memoryLimitReached = true; return unknown();
-		}
-		metrics.memoryLimitReached = false; // the provisional enumerator is governed by the 3 GiB check above
-#ifdef _WIN32
-		SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
-#endif
-		resourceCheckCounter = 0; // allow the working-set trim to take effect before the next sample
+		if (handSize > totalHidden) return unknown();
+		struct CountKeyHash { size_t operator()(const std::array<unsigned char, DECK_SIZE>& key) const noexcept {
+			size_t value = 1469598103934665603ULL;
+			for (unsigned char count : key) { value ^= count; value *= 1099511628211ULL; }
+			return value;
+		} };
+		std::unordered_map<std::array<unsigned char, DECK_SIZE>, ExactScore, CountKeyHash> discardScores;
+		ExactWeight totalWeight = chooseCount(totalHidden, handSize), processedWeight;
 		ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
-		unsigned long long processed = 0;
-		for (const Outcome& outcome : outcomes) {
-			// A transient 2.7 GiB bootstrap mark must not prevent evaluation after
-			// the explicit 3 GiB check and working-set trim above.
-			metrics.memoryLimitReached = false;
-			if (expired()) break;
-			auto child = std::make_unique<State>(parent);
-			try {
-				materializeUnknownHand(*child, player, outcome.hand);
-				if (!advance(*child, action)) return unknown();
-				std::unordered_map<int, int> discarded;
-				if (!selectProvisionalXerosicDiscard(*child, player, discarded)) return unknown();
-				for (int i = 0; i < (int)outcome.discarded.size(); ++i)
-					if (discarded[parent.exact.cardId[player][i]] != outcome.discarded[i]) return unknown();
-				anonymizeXerosicHand(*child, player, bounds, discarded);
-			} catch (...) { return unknown(); }
-			ExactScore score = solveOwned(std::move(child));
-			lower = ExactFraction::add(lower, score.lower.scaled(outcome.weight, total));
-			upper = ExactFraction::add(upper, score.upper.scaled(outcome.weight, total));
-			if (processed > std::numeric_limits<unsigned long long>::max() - outcome.weight) return unknown();
-			processed += outcome.weight;
-			if (!lower.valid || !upper.valid) { metrics.arithmeticOverflow = true; return unknown(); }
-#ifdef _WIN32
-			// State is intentionally streamed, but it is large enough that the CRT
-			// heap otherwise retains every freed State page until the call ends.
-			SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1);
-#endif
-			unsigned long long currentRss = ExactResidentBytes();
-			metrics.peakRssBytes = std::max(metrics.peakRssBytes, currentRss);
-			if (currentRss >= 3ULL * 1024ULL * 1024ULL * 1024ULL) {
-				metrics.memoryLimitReached = true; break;
+		unsigned long long handWorlds = 0;
+		// A root worker normally yields after 20k nodes.  Yielding before one
+		// information set has considered every legal discard would restart that
+		// minimisation and can never make progress.  Complete a bounded chunk while
+		// retaining the wall-clock and RSS checks performed by expired().
+		struct QuantumGuard { unsigned long long& limit; unsigned long long previous;
+			QuantumGuard(unsigned long long& value, unsigned long long expanded)
+				: limit(value), previous(value) {
+				if (value != std::numeric_limits<unsigned long long>::max())
+					value = std::max(value, expanded + 2'000'000ULL);
 			}
+			~QuantumGuard() { limit = previous; }
+		} quantum(nodeQuantumDeadline, metrics.expanded);
+		BoundedCompositionCursor handCursor; handCursor.reset(bounds, handSize);
+		std::vector<int> handCounts;
+		while (handCursor.next(handCounts)) {
+			if (expired()) break;
+			ExactWeight handWeight(1);
+			for (int i = 0; i < (int)bounds.size(); ++i)
+				handWeight = ExactWeight::multiply(handWeight, chooseCount(bounds[i], handCounts[i]));
+			BoundedCompositionCursor discardCursor; discardCursor.reset(handCounts, discardSize);
+			std::vector<int> discardCounts;
+			ExactFraction handLower = ExactFraction::integer(100'000'000);
+			ExactFraction handUpper = ExactFraction::integer(100'000'000);
+			bool foundAction = false;
+			while (discardCursor.next(discardCounts)) {
+				if (expired()) break;
+				std::array<unsigned char, DECK_SIZE> key{};
+				for (int i = 0; i < (int)discardCounts.size(); ++i) key[i] = (unsigned char)discardCounts[i];
+				auto cached = discardScores.find(key);
+				ExactScore score;
+				if (cached != discardScores.end()) { score = cached->second; metrics.successorMerges++; }
+				else {
+					std::vector<int> representative = discardCounts;
+					int left = keepCount;
+					for (int i = 0; i < (int)bounds.size() && left > 0; ++i) {
+						int take = std::min(left, bounds[i] - discardCounts[i]);
+						representative[i] += take; left -= take;
+					}
+					if (left != 0) return unknown();
+					auto child = std::make_unique<State>(parent);
+					try {
+						materializeUnknownHand(*child, player, representative);
+						if (!advance(*child, action)) return unknown();
+						if (!selectHiddenHandDiscard(*child, player, discardCounts)) return unknown();
+						anonymizeHiddenHandAfterDiscard(*child, player, bounds, discardCounts);
+					} catch (...) { return unknown(); }
+					score = solveOwned(std::move(child));
+					discardScores.emplace(key, score);
+					metrics.enumeratedHiddenWorlds++;
+				}
+				if (!foundAction || ExactCompare(score.lower, handLower) < 0) handLower = score.lower;
+				if (!foundAction || ExactCompare(score.upper, handUpper) < 0) handUpper = score.upper;
+				foundAction = true;
+			}
+			if (!foundAction || expired()) break;
+			lower = ExactFraction::add(lower, handLower.scaled(handWeight, totalWeight));
+			upper = ExactFraction::add(upper, handUpper.scaled(handWeight, totalWeight));
+			processedWeight += handWeight; metrics.informationSets++; handWorlds++;
 		}
-		unsigned long long remaining = processed >= total ? 0 : total - processed;
-		if (remaining != 0) {
-			lower = ExactFraction::add(lower, ExactFraction::integer(-100'000'000).scaled(remaining, total));
-			upper = ExactFraction::add(upper, ExactFraction::integer(100'000'000).scaled(remaining, total));
+		ExactWeight remaining = processedWeight >= totalWeight ? ExactWeight()
+			: ExactWeight::subtract(totalWeight, processedWeight);
+		if (!remaining.zero()) {
+			lower = ExactFraction::add(lower, ExactFraction::integer(-100'000'000).scaled(remaining, totalWeight));
+			upper = ExactFraction::add(upper, ExactFraction::integer(100'000'000).scaled(remaining, totalWeight));
 			metrics.partialChanceNodes++;
 		}
-		if (metrics.peakRssBytes < 3ULL * 1024ULL * 1024ULL * 1024ULL)
-			metrics.memoryLimitReached = false;
-		return { lower, upper, {}, false };
+		metrics.rawOutcomes += handWorlds;
+		metrics.groupedOutcomes += discardScores.size();
+		bool certified = remaining.zero() && ExactCompare(lower, upper) == 0;
+		return { lower, upper, {}, certified };
 	}
 
 	bool expandRevealBelief(const State& parent, const ExactHiddenState& request,
@@ -1572,8 +1696,6 @@ private:
 		int player = request.pendingPlayer;
 		if (player < 0 || player >= 2 || request.pending != ExactPendingType::RevealDeck) return false;
 		if (!parent.exact.profileKnown[player]) return false;
-		if (request.pendingEffectCardId == 1197 && pendingArea(request) == AreaType::Hand)
-			return false; // handled by streaming or deferred as an unproven belief action
 		int prizeSize = 0; for (CardRef ref : parent.players[player].prize) if (ref.isNull()) prizeSize++;
 		int handSize = 0; for (CardRef ref : parent.players[player].hand) if (ref.isNull()) handSize++;
 		int totalHidden = 0;
@@ -1654,8 +1776,17 @@ private:
 
 	ExactScore revealAndReplay(const State& parent, const ExactHiddenState& request,
 		const std::vector<int>& action) {
-		if (request.pendingEffectCardId == 1197 && pendingArea(request) == AreaType::Hand)
-			return solveProvisionalXerosicStreaming(parent, request, action);
+		if (pendingArea(request) == AreaType::Hand) {
+			int keepCount = 0;
+			if (isForcedHiddenHandDiscard(request, keepCount))
+				return solveForcedHiddenHandDiscard(parent, request, action, keepCount);
+			std::vector<BeliefWorld> worlds;
+			auto knowledge = initialKnowledge();
+			if (!expandHiddenHandBelief(parent, request, action, ExactWeight(1), knowledge, worlds)
+				|| worlds.empty()) return unknown();
+			metrics.beliefWorldsBefore += worlds.size();
+			return solveBelief(std::move(worlds));
+		}
 		// A player who searches their own complete deck can distinguish every
 		// (hand, prize) allocation represented below.  Different hand counts are
 		// visible in their hand; with equal hand counts, different prize counts
@@ -1673,25 +1804,27 @@ private:
 		return solveBelief(std::move(worlds));
 	}
 
-	bool isFixedTurnOneSearchRequest(const State& parent, const ExactHiddenState& request) const {
-		if (parent.turn != 1 || !isMajkelFixedProfile(actorProfileCount)) return false;
-		for (CardRef ref : parent.players[actor].hand)
-			if (!ref.isNull() && parent.getCard(ref).cardId == 13) return false;
-		return request.pendingEffectCardId == 1152 || request.pendingEffectCardId == 1086
-			|| request.pendingEffectCardId == 19;
+	bool dynamicTurnSearchPartition(const State& parent, const ExactHiddenState& request,
+		ExactCardPartition& partition) {
+		if (request.pending != ExactPendingType::RevealDeck
+			|| request.pendingPlayer != actor || pendingArea(request) != AreaType::Deck) return false;
+		partition = turnDependencyPartition(parent, &request);
+		return partition.hasCompressedClass();
 	}
 
-	ExactScore revealAndReplayFixedTurnOneSearch(const State& parent, const ExactHiddenState& request,
-		const std::vector<int>& action, int prizeSize, int totalHidden, const ExactWeight& totalWeight) {
+	ExactScore revealAndReplayPartitionedTurnSearch(const State& parent, const ExactHiddenState& request,
+		const std::vector<int>& action, int prizeSize, int totalHidden, const ExactWeight& totalWeight,
+		const ExactCardPartition& partition) {
 		const int player = request.pendingPlayer;
-		std::string revealKey = keyFor(parent) + "\x1fR5-FIXED-TURN1\x1f" + actionEquivalenceKey(parent, action);
+		std::string revealKey = keyFor(parent) + "\x1fR7-DYNAMIC-TURN\x1f"
+			+ partition.schemaKey() + actionEquivalenceKey(parent, action);
 		appendSemantic(revealKey, request.pendingDetail); appendSemantic(revealKey, request.pendingEffectCardId);
 		appendSemantic(revealKey, request.pendingEffectPlayer);
-		auto [found, inserted] = partialFixedTurnReveals.try_emplace(revealKey);
-		PartialFixedTurnRevealEntry& partial = found->second;
+		auto [found, inserted] = partialPartitionReveals.try_emplace(revealKey);
+		PartialPartitionRevealEntry& partial = found->second;
 		if (inserted) {
-			static constexpr std::array<int, 6> relevantIds{ 66, 305, 343, 741, 742, 743 };
-			std::array<int, relevantIds.size()> typeIndex{}; typeIndex.fill(-1);
+			std::vector<int> relevantIds = partition.visibleCardIds();
+			std::vector<int> typeIndex(relevantIds.size(), -1);
 			std::vector<int> relevantBounds(relevantIds.size(), 0);
 			std::vector<bool> relevantType(parent.exact.typeCount[player], false);
 			int totalRelevant = 0;
@@ -1709,7 +1842,7 @@ private:
 				BoundedCompositionCursor cursor; cursor.reset(relevantBounds, relevantPrizeTotal);
 				std::vector<int> relevantCounts;
 				while (cursor.next(relevantCounts)) {
-					FixedTurnRevealAllocation allocation;
+					PartitionRevealAllocation allocation;
 					allocation.prizeCounts.assign(parent.exact.typeCount[player], 0);
 					allocation.weight = chooseCount(totalIrrelevant, irrelevantPrizeTotal);
 					for (int r = 0; r < (int)relevantIds.size(); ++r) {
@@ -1729,12 +1862,12 @@ private:
 			}
 			if (generated != totalWeight) {
 				metrics.chanceMassMismatches++; metrics.probabilityExact = false;
-				partialFixedTurnReveals.erase(found); return unknown();
+				partialPartitionReveals.erase(found); return unknown();
 			}
 			partial.totalWeight = totalWeight;
-			partial.accountedBytes = revealKey.size() + sizeof(PartialFixedTurnRevealEntry);
+			partial.accountedBytes = revealKey.size() + sizeof(PartialPartitionRevealEntry);
 			for (const auto& allocation : partial.allocations)
-				partial.accountedBytes += sizeof(FixedTurnRevealAllocation) + allocation.prizeCounts.size() * sizeof(int);
+				partial.accountedBytes += sizeof(PartitionRevealAllocation) + allocation.prizeCounts.size() * sizeof(int);
 			partialBytes += partial.accountedBytes;
 		} else {
 			metrics.partialRevealHits++;
@@ -1756,25 +1889,25 @@ private:
 		std::vector<int> handCounts(parent.exact.typeCount[player], 0);
 		while (partial.index < partial.allocations.size()) {
 			if (expired()) { metrics.partialChanceNodes++; return incomplete(); }
-			const FixedTurnRevealAllocation& allocation = partial.allocations[partial.index];
+			const PartitionRevealAllocation& allocation = partial.allocations[partial.index];
 			auto world = std::make_unique<State>(parent);
 			try {
 				materializeUnknownZones(*world, player, allocation.prizeCounts, handCounts);
 				if (!advance(*world, action)) return unknown();
 			} catch (...) { return unknown(); }
 			std::string quotientKey = observationKeyFor(*world, actor, nullptr, false);
-			static constexpr std::array<int, 6> relevantIds{ 66, 305, 343, 741, 742, 743 };
-			quotientKey += "\x1f" "TURN1-SEARCH";
+			std::vector<int> relevantIds = partition.visibleCardIds();
+			quotientKey += "\x1f" "DYNAMIC-TURN-SEARCH" + partition.schemaKey();
 			for (int id : relevantIds) {
 				int count = 0;
 				for (CardRef ref : world->players[actor].deck) if (!ref.isNull() && world->getCard(ref).cardId == id) count++;
 				appendSemantic(quotientKey, count);
 			}
-			std::string sharedKey = "FIXED-TURN1-SEARCH\x1f" + quotientKey;
+			std::string sharedKey = "DYNAMIC-TURN-SEARCH\x1f" + quotientKey;
 			ExactScore score;
 			bool sharedHit = false;
-			auto local = fixedFirstTurnRevealScores.find(quotientKey);
-			bool cacheHit = local != fixedFirstTurnRevealScores.end();
+			auto local = partitionTurnRevealScores.find(quotientKey);
+			bool cacheHit = local != partitionTurnRevealScores.end();
 			if (cacheHit) score = local->second;
 			else if (usingSharedTable) cacheHit = sharedHit = transposition->find(sharedKey, score);
 			if (cacheHit) {
@@ -1800,7 +1933,7 @@ private:
 				} quantum(nodeQuantumDeadline, metrics.expanded);
 				score = solveOwned(std::move(world));
 				if (score.certified) {
-					fixedFirstTurnRevealScores.emplace(std::move(quotientKey), score);
+					partitionTurnRevealScores.emplace(std::move(quotientKey), score);
 					if (usingSharedTable) transposition->store(std::move(sharedKey), score);
 				}
 			}
@@ -1818,7 +1951,7 @@ private:
 		ExactScore result{ partial.completedLower, partial.completedUpper, {},
 			ExactCompare(partial.completedLower, partial.completedUpper) == 0 };
 		partialBytes -= std::min(partialBytes, partial.accountedBytes);
-		partialFixedTurnReveals.erase(revealKey);
+		partialPartitionReveals.erase(revealKey);
 		return result;
 	}
 
@@ -1837,8 +1970,10 @@ private:
 			chooseCount(totalHidden - prizeSize, handSize));
 		noteWeight(totalWeight);
 		if (totalWeight.zero()) return unknown();
-		if (handSize == 0 && isFixedTurnOneSearchRequest(parent, request))
-			return revealAndReplayFixedTurnOneSearch(parent, request, action, prizeSize, totalHidden, totalWeight);
+		ExactCardPartition turnPartition;
+		if (handSize == 0 && dynamicTurnSearchPartition(parent, request, turnPartition))
+			return revealAndReplayPartitionedTurnSearch(parent, request, action, prizeSize, totalHidden, totalWeight,
+				turnPartition);
 		std::string revealKey = keyFor(parent) + "\x1fR4\x1f" + actionEquivalenceKey(parent, action);
 		appendSemantic(revealKey, request.pendingDetail);
 		appendSemantic(revealKey, request.pendingEffectCardId);
@@ -1906,34 +2041,26 @@ private:
 				if (!advance(*world, action)) return unknown();
 			} catch (...) { return unknown(); }
 			ExactScore score;
-			const bool fixedTurnOneSearch = parent.turn == 1
-				&& (request.pendingEffectCardId == 1152 || request.pendingEffectCardId == 1086
-					|| request.pendingEffectCardId == 19)
-				&& isMajkelFixedProfile(actorProfileCount)
-				&& std::none_of(parent.players[actor].hand.begin(), parent.players[actor].hand.end(),
-					[&](CardRef ref) { return !ref.isNull() && parent.getCard(ref).cardId == 13; });
+			ExactCardPartition dynamicPartition;
+			const bool partitionedTurnSearch = handSize == 0
+				&& dynamicTurnSearchPartition(parent, request, dynamicPartition);
 			std::string quotientKey;
 			std::string sharedQuotientKey;
-			if (fixedTurnOneSearch) {
-				// Poké Pad can access every non-Rule-Box Pokémon and Buddy-Buddy
-				// Poffin can access the Basic subset.  The six counts below therefore
-				// determine every later turn-one deck-query result in this fixed deck.
-				// The remaining identities cannot affect a transition before the leaf,
-				// and V3's hidden features are derived from profile/public zones.
+			if (partitionedTurnSearch) {
 				quotientKey = observationKeyFor(*world, actor, nullptr, false);
-				static constexpr std::array<int, 6> relevantIds{ 66, 305, 343, 741, 742, 743 };
-				std::array<int, relevantIds.size()> deckCounts{};
+				std::vector<int> relevantIds = dynamicPartition.visibleCardIds();
+				std::vector<int> deckCounts(relevantIds.size(), 0);
 				for (CardRef ref : world->players[actor].deck) if (!ref.isNull()) {
 					int id = world->getCard(ref).cardId;
 					for (int i = 0; i < (int)relevantIds.size(); ++i)
 						if (id == relevantIds[i]) { deckCounts[i]++; break; }
 				}
-				quotientKey += "\x1f" "TURN1-SEARCH";
+				quotientKey += "\x1f" "DYNAMIC-TURN-SEARCH" + dynamicPartition.schemaKey();
 				for (int count : deckCounts) appendSemantic(quotientKey, count);
-				sharedQuotientKey = "FIXED-TURN1-SEARCH\x1f" + quotientKey;
+				sharedQuotientKey = "DYNAMIC-TURN-SEARCH\x1f" + quotientKey;
 				bool sharedHit = false;
-				auto cached = fixedFirstTurnRevealScores.find(quotientKey);
-				bool cacheHit = cached != fixedFirstTurnRevealScores.end();
+				auto cached = partitionTurnRevealScores.find(quotientKey);
+				bool cacheHit = cached != partitionTurnRevealScores.end();
 				if (cacheHit) score = cached->second;
 				else if (usingSharedTable) cacheHit = sharedHit = transposition->find(sharedQuotientKey, score);
 				if (cacheHit) {
@@ -1948,8 +2075,8 @@ private:
 					~StreamingGuard() { flag = previous; }
 				} streaming(singletonRevealStreaming);
 				score = solveOwned(std::move(world));
-				if (fixedTurnOneSearch && score.certified) {
-					fixedFirstTurnRevealScores.emplace(std::move(quotientKey), score);
+				if (partitionedTurnSearch && score.certified) {
+					partitionTurnRevealScores.emplace(std::move(quotientKey), score);
 					if (usingSharedTable) transposition->store(std::move(sharedQuotientKey), score);
 				}
 			}
@@ -2083,7 +2210,6 @@ private:
 		for (const CommonAction& common : actions) {
 			if (expired()) return unknown();
 			std::vector<BeliefWorld> children;
-			bool provisionalBeliefDeferred = false;
 			for (const BeliefWorld& world : worlds) {
 				std::vector<int> mapped;
 				if (!remapAction(*world.state, common.semantic, mapped)) {
@@ -2093,16 +2219,13 @@ private:
 				auto child = std::make_unique<State>(*world.state);
 				if (!advance(*child, mapped)) return unknown();
 				if (child->exact.pending == ExactPendingType::RevealDeck) {
-					if (child->exact.pendingEffectCardId == 1197 && pendingArea(child->exact) == AreaType::Hand) {
-						// The bootstrap policy is streamed only from a single concrete
-						// root.  Expanding it inside another belief would multiply large
-						// State sets, so retain an honest unproven interval for now.
-						provisionalBeliefDeferred = true; metrics.provisionalOpponentPolicyNodes++; break;
-					}
-					if (!expandRevealBelief(*world.state, child->exact, mapped, world.weight, world.knowledge, children)) return unknown();
+					bool expanded = pendingArea(child->exact) == AreaType::Hand
+						? expandHiddenHandBelief(*world.state, child->exact, mapped, world.weight, world.knowledge, children)
+						: expandRevealBelief(*world.state, child->exact, mapped, world.weight, world.knowledge, children);
+					if (!expanded) return unknown();
 				} else children.push_back({ std::move(child), world.weight, world.knowledge });
 			}
-			ExactScore score = provisionalBeliefDeferred ? unknown() : solveBelief(std::move(children));
+			ExactScore score = solveBelief(std::move(children));
 			if (first || (maximize ? ExactCompare(score.lower, best.lower) > 0
 				: ExactCompare(score.upper, best.upper) < 0)) {
 				best = score; best.action = common.representative; first = false;
@@ -2621,22 +2744,22 @@ private:
 			return { value, value, {}, !state.exact.provisionalOpponentPolicy };
 		}
 		// A search has made this concrete world a singleton information set, but
-		// turn-one Main states still contain many commuting action orders.  The
-		// compact fixed-deck key preserves every card count that can affect another
-		// turn-one deck query while omitting the irrelevant prize identities already
-		// quotiented by revealAndReplayFixedTurnOneSearch.
-		std::string fixedMainKey = fixedTurnOneMainKey(state);
-		if (!fixedMainKey.empty()) {
-			ExactScore fixedCached;
-			auto local = fixedFirstTurnMainScores.find(fixedMainKey);
-			bool fixedHit = local != fixedFirstTurnMainScores.end();
+		// Main states still contain many commuting action orders.  The
+		// dynamic partition key preserves every card count that can affect another
+		// turn-local deck query while omitting the irrelevant prize identities already
+		// quotiented by revealAndReplayPartitionedTurnSearch.
+		std::string partitionMainKey = partitionTurnMainKey(state);
+		if (!partitionMainKey.empty()) {
+			ExactScore partitionCached;
+			auto local = partitionTurnMainScores.find(partitionMainKey);
+			bool partitionHit = local != partitionTurnMainScores.end();
 			bool sharedHit = false;
-			if (fixedHit) fixedCached = local->second;
-			else if (usingSharedTable) fixedHit = sharedHit = transposition->find(fixedMainKey, fixedCached);
-			if (fixedHit) {
+			if (partitionHit) partitionCached = local->second;
+			else if (usingSharedTable) partitionHit = sharedHit = transposition->find(partitionMainKey, partitionCached);
+			if (partitionHit) {
 				metrics.merged++; metrics.canonicalStateMerges++;
 				if (sharedHit) metrics.rootSharedTTHits++;
-				return fixedCached;
+				return partitionCached;
 			}
 		}
 		std::string key;
@@ -2664,7 +2787,8 @@ private:
 			metrics.lastPendingNullCount = state.exact.pendingNullCount;
 			if (state.exact.pendingPlayer >= 0) metrics.lastPendingDeckUnknown = state.exact.deckUnknown[state.exact.pendingPlayer];
 			switch (state.exact.blockReason) {
-			case ExactBlockReason::UnknownOpponentList: metrics.unknownOpponentList++; break;
+			case ExactBlockReason::UnknownOpponentList:
+				metrics.unknownOpponentList++; metrics.structurallyBlocked = true; break;
 			case ExactBlockReason::InterruptedTransition: metrics.interruptedTransition++; break;
 			default: metrics.unsupportedConcreteReference++; break;
 			}
@@ -2697,9 +2821,9 @@ private:
 				}
 			}
 		}
-		if (result.certified && !fixedMainKey.empty()) {
-			fixedFirstTurnMainScores.emplace(fixedMainKey, result);
-			if (usingSharedTable) transposition->store(std::move(fixedMainKey), result);
+		if (result.certified && !partitionMainKey.empty()) {
+			partitionTurnMainScores.emplace(partitionMainKey, result);
+			if (usingSharedTable) transposition->store(std::move(partitionMainKey), result);
 		}
 		metrics.partialTableBytes = partialBytes;
 		metrics.sessionBytes = transposition->bytes() + localTranspositionBytes + policyBytes + partialBytes

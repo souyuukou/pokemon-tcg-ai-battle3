@@ -713,6 +713,10 @@ inline void TargetList(const State& state, const Target& target, std::vector<Are
 								mutableState.exact.pendingEffectCardId = state.getCard(effectCard.card).cardId;
 								mutableState.exact.pendingEffectPlayer = (signed char)state.getCard(effectCard.card).playerIndex;
 							}
+							if (state.onEffect()) {
+								mutableState.exact.pendingSkillId = state.effectState.ability.skillId;
+								mutableState.exact.pendingEffectIndex = state.effectState.effectIndex;
+							}
 							mutableState.exact.pendingNullCount = (unsigned char)std::min(nullCount, 255);
 							return true;
 						}

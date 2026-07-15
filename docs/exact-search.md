@@ -187,6 +187,21 @@ do not request card identities. Concrete searches suspend the transition,
 enumerate bounded card-count allocations with combination weights, materialize
 the selected world, and replay from the pre-transition checkpoint. Identical
 copies in an exchangeable searched deck share one semantic action.
+
+Before an own-deck search, the remaining turn's reachable Skills, attacks, and
+static target predicates are analysed into an `ExactCardPartition`. Card IDs
+that an operator can distinguish remain singleton classes; all other IDs retain
+their atoms but use one class count in the multivariate-hypergeometric reveal.
+Refinement is monotone, so a later search can split a class conditionally without
+changing total mass. Unsupported dynamic predicates conservatively expose every
+identity and fall back to the generic exact enumerator. The regression suite also
+runs this path with a non-submission deck to prevent fixed-ID specialization.
+
+An unknown opponent list is a structural absence of a probability model, not a
+slow subtree. Such a root action returns `searchStatus="blocked"` immediately;
+time-sliced but fully specified work returns `"resumable"`. Completed searches
+return `"certified"`. The production scheduler does not retry a blocked root,
+while other legal root actions continue normally.
 ## Git deck workflow
 
 `main` contains generic engine/search code. Deck/evaluator changes belong in
