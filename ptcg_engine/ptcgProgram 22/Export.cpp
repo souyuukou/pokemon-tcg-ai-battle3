@@ -67,11 +67,21 @@ extern "C" GAME_API const char8_t* ExactArithmeticDiagnostics() {
   ExactWeight product = ExactWeight::multiply(a, b);
   auto division = ExactWeight::divideRemainder(product, a);
   ExactWeight common = ExactWeight::gcd(product, a);
+  bool hashPairMatchesScalar = true;
+  for (size_t length = 0; length <= 257; ++length) {
+    std::string input(length, '\0');
+    for (size_t i = 0; i < length; ++i) input[i] = (char)((i * 131U + length * 17U) & 255U);
+    unsigned long long lo = ExactSipHash24(input, 0x7766554433221100ULL, 0xffeeddccbbaa9988ULL);
+    unsigned long long hi = ExactSipHash24(input, 0x8899aabbccddeeffULL, 0x0011223344556677ULL);
+    size_t scalar = (size_t)(lo ^ ExactRotl64(hi, 1));
+    if (ExactStringHasher{}(input) != scalar) { hashPairMatchesScalar = false; break; }
+  }
   j.append('{'); j.appendKey("product"); j.appendDoubleQuote(product.text().c_str());
   j.appendCommaKey("quotient"); j.appendDoubleQuote(division.first.text().c_str());
   j.appendCommaKey("remainder"); j.appendDoubleQuote(division.second.text().c_str());
   j.appendCommaKey("gcd"); j.appendDoubleQuote(common.text().c_str());
   j.appendCommaKeyValue("bits", (int)product.bitLength());
+  j.appendCommaKeyValue("hashPairMatchesScalar", hashPairMatchesScalar);
   j.appendCommaKeyValue("promoted", product.isLarge()); j.append('}'); return j.buf.c_str();
 }
 
@@ -357,7 +367,7 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
   JsonBuilder& j = data->jsonBuilder;
   j.clear(); j.append('{');
   j.appendKey("selected"); j.append('[');
-  for (int i : range(decision.score.action)) { j.comma(i); j.append(decision.score.action[i]); }
+  for (int i : range(decision.score.action.size())) { j.comma(i); j.append(decision.score.action[i]); }
   j.append(']');
   j.appendCommaKey("lowerNumerator"); AppendExactNumerator(j, decision.score.lower);
   j.appendCommaKey("lowerDenominator"); AppendExactDenominator(j, decision.score.lower);
@@ -370,10 +380,60 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
   j.appendCommaKeyValue("evaluatorApproximate", true);
   j.appendCommaKeyValue("transitionSufficientKey", true);
   j.appendCommaKeyValue("evaluatorProjectionLossy", true);
+	 j.appendCommaKeyValue("runtimeVersion", decision.metrics.runtimeVersion);
+	 j.appendCommaKeyValue("canonicalSchemaVersion", decision.metrics.canonicalSchemaVersion);
   j.appendCommaKeyValue("beliefScale", ExactSparseEvaluatorV3::BeliefScale);
   j.appendCommaKeyValue("evaluatorSchemaVersion", data->exactEvaluator ? data->exactEvaluator->schemaVersion() : 0);
   j.appendCommaKey("evaluatorModelHash"); AppendUnsignedLongLong(j, data->exactEvaluator ? data->exactEvaluator->modelHash() : 0);
   j.appendCommaKey("expandedNodes"); AppendUnsignedLongLong(j, decision.metrics.expanded);
+	 j.appendCommaKey("stateCopies"); AppendUnsignedLongLong(j, decision.metrics.stateCopies);
+	 j.appendCommaKey("stateCopyBytes"); AppendUnsignedLongLong(j, decision.metrics.stateCopyBytes);
+	 j.appendCommaKey("stateCopySampleNs"); AppendUnsignedLongLong(j, decision.metrics.stateCopySampleNs);
+	 j.appendCommaKey("canonicalBuilds"); AppendUnsignedLongLong(j, decision.metrics.canonicalBuilds);
+	 j.appendCommaKey("canonicalBytes"); AppendUnsignedLongLong(j, decision.metrics.canonicalBytes);
+	 j.appendCommaKey("canonicalSampleNs"); AppendUnsignedLongLong(j, decision.metrics.canonicalSampleNs);
+	 j.appendCommaKey("ttReadHits"); AppendUnsignedLongLong(j, decision.metrics.ttReadHits);
+	 j.appendCommaKey("ttReadMisses"); AppendUnsignedLongLong(j, decision.metrics.ttReadMisses);
+	 j.appendCommaKey("ttReadSampleNs"); AppendUnsignedLongLong(j, decision.metrics.ttReadSampleNs);
+	 j.appendCommaKey("ttInsertions"); AppendUnsignedLongLong(j, decision.metrics.ttInsertions);
+	 j.appendCommaKey("transitionCacheHits"); AppendUnsignedLongLong(j, decision.metrics.transitionCacheHits);
+	 j.appendCommaKey("arenaBytes"); AppendUnsignedLongLong(j, decision.metrics.arenaBytes);
+	 j.appendCommaKey("heapAllocations"); AppendUnsignedLongLong(j, decision.metrics.heapAllocations);
+	 j.appendCommaKey("statePoolReuses"); AppendUnsignedLongLong(j, decision.metrics.statePoolReuses);
+	 j.appendCommaKey("engineStepCalls"); AppendUnsignedLongLong(j, decision.metrics.engineStepCalls);
+	 j.appendCommaKey("engineStepSampleNs"); AppendUnsignedLongLong(j, decision.metrics.engineStepSampleNs);
+	 j.appendCommaKey("actionApplyCalls"); AppendUnsignedLongLong(j, decision.metrics.actionApplyCalls);
+	 j.appendCommaKey("actionApplySampleNs"); AppendUnsignedLongLong(j, decision.metrics.actionApplySampleNs);
+	 j.appendCommaKey("actionKeyCalls"); AppendUnsignedLongLong(j, decision.metrics.actionKeyCalls);
+	 j.appendCommaKey("actionKeySampleNs"); AppendUnsignedLongLong(j, decision.metrics.actionKeySampleNs);
+	 j.appendCommaKey("partitionKeyCalls"); AppendUnsignedLongLong(j, decision.metrics.partitionKeyCalls);
+	 j.appendCommaKey("partitionKeySampleNs"); AppendUnsignedLongLong(j, decision.metrics.partitionKeySampleNs);
+	 j.appendCommaKey("observationKeyCalls"); AppendUnsignedLongLong(j, decision.metrics.observationKeyCalls);
+	 j.appendCommaKey("observationKeySampleNs"); AppendUnsignedLongLong(j, decision.metrics.observationKeySampleNs);
+	 j.appendCommaKey("evaluatorCacheHits"); AppendUnsignedLongLong(j, decision.metrics.evaluatorCacheHits);
+	 j.appendCommaKey("evaluatorCalls"); AppendUnsignedLongLong(j, decision.metrics.evaluatorCalls);
+	 j.appendCommaKey("evaluatorSampleNs"); AppendUnsignedLongLong(j, decision.metrics.evaluatorSampleNs);
+	 j.appendCommaKey("evaluatorExtractSampleNs"); AppendUnsignedLongLong(j, decision.metrics.evaluatorExtractSampleNs);
+	 j.appendCommaKey("evaluatorInferenceSampleNs"); AppendUnsignedLongLong(j, decision.metrics.evaluatorInferenceSampleNs);
+	 j.appendCommaKey("evaluatorPublicSampleNs"); AppendUnsignedLongLong(j, decision.metrics.evaluatorPublicSampleNs);
+	 j.appendCommaKey("evaluatorHiddenSampleNs"); AppendUnsignedLongLong(j, decision.metrics.evaluatorHiddenSampleNs);
+	 j.appendCommaKey("evaluatorEntitySampleNs"); AppendUnsignedLongLong(j, decision.metrics.evaluatorEntitySampleNs);
+	 j.appendCommaKey("workerBusyNs"); AppendUnsignedLongLong(j, decision.metrics.workerBusyNs);
+	 j.appendCommaKey("workerWaitNs"); AppendUnsignedLongLong(j, decision.metrics.workerWaitNs);
+	 j.appendCommaKey("legacyShadowMismatches"); AppendUnsignedLongLong(j, decision.metrics.legacyShadowMismatches);
+	 j.appendCommaKey("packedObservationBuilds"); AppendUnsignedLongLong(j, decision.metrics.packedObservationBuilds);
+	 j.appendCommaKey("packedObservationBytes"); AppendUnsignedLongLong(j, decision.metrics.packedObservationBytes);
+	 j.appendCommaKey("keyArenaBytes"); AppendUnsignedLongLong(j, decision.metrics.keyArenaBytes);
+	 j.appendCommaKey("cowFullCopies"); AppendUnsignedLongLong(j, decision.metrics.cowFullCopies);
+	 j.appendCommaKey("cowPageCopies"); AppendUnsignedLongLong(j, decision.metrics.cowPageCopies);
+	 j.appendCommaKey("cowCopyBytes"); AppendUnsignedLongLong(j, decision.metrics.cowCopyBytes);
+	 j.appendCommaKey("mutationMisses"); AppendUnsignedLongLong(j, decision.metrics.mutationMisses);
+	 j.appendCommaKey("materializedSnapshots"); AppendUnsignedLongLong(j, decision.metrics.materializedSnapshots);
+	 j.appendCommaKey("inFlightWaits"); AppendUnsignedLongLong(j, decision.metrics.inFlightWaits);
+	 j.appendCommaKey("workerDuplicateClaims"); AppendUnsignedLongLong(j, decision.metrics.workerDuplicateClaims);
+	 j.appendCommaKey("exactWeightInlineOps"); AppendUnsignedLongLong(j, decision.metrics.exactWeightInlineOps);
+	 j.appendCommaKey("exactWeightSpills"); AppendUnsignedLongLong(j, decision.metrics.exactWeightSpills);
+	 j.appendCommaKey("evaluatorAccumulatorHits"); AppendUnsignedLongLong(j, decision.metrics.evaluatorAccumulatorHits);
   j.appendCommaKey("mergedNodes"); AppendUnsignedLongLong(j, decision.metrics.merged);
   j.appendCommaKeyValue("timedOut", decision.metrics.timedOut);
   j.appendCommaKeyValue("arithmeticOverflow", decision.metrics.arithmeticOverflow);
@@ -457,7 +517,10 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
 	 j.appendCommaKey("continuationDrawClasses"); AppendUnsignedLongLong(j, decision.metrics.continuationDrawClasses);
 	 j.appendCommaKey("continuationClassOutcomes"); AppendUnsignedLongLong(j, decision.metrics.continuationClassOutcomes);
 	 j.appendCommaKey("continuationConditionalSplits"); AppendUnsignedLongLong(j, decision.metrics.continuationConditionalSplits);
+	 j.appendCommaKey("continuationPreparedOutcomes"); AppendUnsignedLongLong(j, decision.metrics.continuationPreparedOutcomes);
 	 j.appendCommaKey("continuationDrawOutcomes"); AppendUnsignedLongLong(j, decision.metrics.continuationDrawOutcomes);
+	 j.appendCommaKey("continuationCompletedOutcomeNodes"); AppendUnsignedLongLong(j, decision.metrics.continuationCompletedOutcomeNodes);
+	 j.appendCommaKey("continuationMaxOutcomeNodes"); AppendUnsignedLongLong(j, decision.metrics.continuationMaxOutcomeNodes);
 	 j.appendCommaKey("continuationAtomsMerged"); AppendUnsignedLongLong(j, decision.metrics.continuationAtomsMerged);
 	 j.appendCommaKeyValue("dynamicPartitionFallbackCardId", decision.metrics.dynamicPartitionFallbackCardId);
 	 j.appendCommaKeyValue("dynamicPartitionFallbackEffectType", decision.metrics.dynamicPartitionFallbackEffectType);
@@ -484,6 +547,56 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
 }
 
 static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
+	into.stateCopies += from.stateCopies;
+	into.stateCopyBytes += from.stateCopyBytes;
+	into.stateCopySampleNs += from.stateCopySampleNs;
+	into.canonicalBuilds += from.canonicalBuilds;
+	into.canonicalBytes += from.canonicalBytes;
+	into.canonicalSampleNs += from.canonicalSampleNs;
+	into.ttReadHits += from.ttReadHits;
+	into.ttReadMisses += from.ttReadMisses;
+	into.ttReadSampleNs += from.ttReadSampleNs;
+	into.ttInsertions += from.ttInsertions;
+	into.transitionCacheHits += from.transitionCacheHits;
+	into.arenaBytes = std::max(into.arenaBytes, from.arenaBytes);
+	into.heapAllocations += from.heapAllocations;
+	into.statePoolReuses += from.statePoolReuses;
+	into.engineStepCalls += from.engineStepCalls;
+	into.engineStepSampleNs += from.engineStepSampleNs;
+	into.actionApplyCalls += from.actionApplyCalls;
+	into.actionApplySampleNs += from.actionApplySampleNs;
+	into.actionKeyCalls += from.actionKeyCalls;
+	into.actionKeySampleNs += from.actionKeySampleNs;
+	into.partitionKeyCalls += from.partitionKeyCalls;
+	into.partitionKeySampleNs += from.partitionKeySampleNs;
+	into.observationKeyCalls += from.observationKeyCalls;
+	into.observationKeySampleNs += from.observationKeySampleNs;
+	into.evaluatorCacheHits += from.evaluatorCacheHits;
+	into.evaluatorCalls += from.evaluatorCalls;
+	into.evaluatorSampleNs += from.evaluatorSampleNs;
+	into.evaluatorExtractSampleNs += from.evaluatorExtractSampleNs;
+	into.evaluatorInferenceSampleNs += from.evaluatorInferenceSampleNs;
+	into.evaluatorPublicSampleNs += from.evaluatorPublicSampleNs;
+	into.evaluatorHiddenSampleNs += from.evaluatorHiddenSampleNs;
+	into.evaluatorEntitySampleNs += from.evaluatorEntitySampleNs;
+	into.workerBusyNs += from.workerBusyNs;
+	into.workerWaitNs += from.workerWaitNs;
+	into.legacyShadowMismatches += from.legacyShadowMismatches;
+	into.packedObservationBuilds += from.packedObservationBuilds;
+	into.packedObservationBytes += from.packedObservationBytes;
+	into.keyArenaBytes += from.keyArenaBytes;
+	into.cowFullCopies += from.cowFullCopies;
+	into.cowPageCopies += from.cowPageCopies;
+	into.cowCopyBytes += from.cowCopyBytes;
+	into.mutationMisses += from.mutationMisses;
+	into.materializedSnapshots += from.materializedSnapshots;
+	into.inFlightWaits += from.inFlightWaits;
+	into.workerDuplicateClaims += from.workerDuplicateClaims;
+	into.exactWeightInlineOps += from.exactWeightInlineOps;
+	into.exactWeightSpills += from.exactWeightSpills;
+	into.evaluatorAccumulatorHits += from.evaluatorAccumulatorHits;
+	into.runtimeVersion = std::max(into.runtimeVersion, from.runtimeVersion);
+	into.canonicalSchemaVersion = std::max(into.canonicalSchemaVersion, from.canonicalSchemaVersion);
   into.expanded += from.expanded; into.merged += from.merged; into.leaves += from.leaves;
   into.opaque += from.opaque; into.exceptions += from.exceptions;
   into.unknownOpponentList += from.unknownOpponentList;
@@ -541,7 +654,10 @@ static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
 	into.continuationDrawClasses += from.continuationDrawClasses;
 	into.continuationClassOutcomes += from.continuationClassOutcomes;
 	into.continuationConditionalSplits += from.continuationConditionalSplits;
+	into.continuationPreparedOutcomes += from.continuationPreparedOutcomes;
 	into.continuationDrawOutcomes += from.continuationDrawOutcomes;
+	into.continuationCompletedOutcomeNodes += from.continuationCompletedOutcomeNodes;
+	into.continuationMaxOutcomeNodes = std::max(into.continuationMaxOutcomeNodes, from.continuationMaxOutcomeNodes);
 	into.continuationAtomsMerged += from.continuationAtomsMerged;
 	if (from.dynamicPartitionFallbackCardId != 0) {
 		into.dynamicPartitionFallbackCardId = from.dynamicPartitionFallbackCardId;
@@ -587,21 +703,45 @@ struct ExactTurnSession {
 		auto absoluteDeadline = std::chrono::steady_clock::now()
 			+ std::chrono::milliseconds(std::max(1, budgetMilliseconds));
 		std::vector<int> representative(source.options.size());
+		std::vector<unsigned long long> rootWorkEstimate(source.options.size(), 1);
 		std::unordered_map<std::string, int, ExactStringHasher> successorRepresentative;
 		for (int option = 0; option < (int)source.options.size(); ++option) {
 			Game probeGame = *source.game;
 			State probeState = source; probeState.game = &probeGame;
 			ExactPlanner probe(deck, handValues, deckCount, 1,
 				opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount, nullptr, evaluator);
-			std::string key = probe.canonicalRootSuccessor(probeState, option);
+			unsigned long long estimate = 1;
+			std::string key = probe.canonicalRootSuccessor(probeState, option, &estimate);
 			auto [found, inserted] = successorRepresentative.emplace(std::move(key), option);
 			representative[option] = inserted ? option : found->second;
+			rootWorkEstimate[representative[option]] = std::max(rootWorkEstimate[representative[option]], estimate);
 		}
 		std::vector<int> orderedOptions;
 		for (int option = 0; option < (int)source.options.size(); ++option)
 			if (representative[option] == option && source.options[option].type == SelectOptionType::End) orderedOptions.push_back(option);
 		for (int option = 0; option < (int)source.options.size(); ++option)
 			if (representative[option] == option && source.options[option].type != SelectOptionType::End) orderedOptions.push_back(option);
+		// Assign expensive symbolic successors first.  A multi-draw root must not
+		// lose half of its wall-clock budget merely because its option index has the
+		// same parity as another expensive action.  Evaluation order inside each
+		// worker remains the stable End-first order above.
+		std::vector<int> byDescendingWork = orderedOptions;
+		std::stable_sort(byDescendingWork.begin(), byDescendingWork.end(), [&](int left, int right) {
+			return rootWorkEstimate[left] > rootWorkEstimate[right];
+		});
+		std::array<std::vector<int>, 2> workerAssignments;
+		std::array<unsigned long long, 2> assignedWork{};
+		for (int option : byDescendingWork) {
+			const int worker = assignedWork[0] < assignedWork[1] ? 0 : 1;
+			workerAssignments[worker].push_back(option);
+			const unsigned long long cost = rootWorkEstimate[option];
+			assignedWork[worker] = assignedWork[worker] > std::numeric_limits<unsigned long long>::max() - cost
+				? std::numeric_limits<unsigned long long>::max() : assignedWork[worker] + cost;
+		}
+		for (auto& assigned : workerAssignments) std::stable_sort(assigned.begin(), assigned.end(), [&](int left, int right) {
+			return std::find(orderedOptions.begin(), orderedOptions.end(), left)
+				< std::find(orderedOptions.begin(), orderedOptions.end(), right);
+		});
       std::array<std::unique_ptr<Worker>, 2> workers;
       auto run = [&](int parity) {
         auto output = std::make_unique<Worker>();
@@ -611,17 +751,7 @@ struct ExactTurnSession {
 		output->planner->setConcreteWorldCaching(true);
 		output->actions.resize(source.options.size());
 		std::vector<bool> structurallyBlocked(source.options.size(), false);
-		std::vector<int> assigned;
-		for (int position = parity; position < (int)orderedOptions.size(); position += 2)
-			assigned.push_back(orderedOptions[position]);
-		// End plus one expensive representative used to leave the End worker idle
-		// for almost the entire deadline. Let that worker traverse the expensive
-		// action in reverse while the other worker traverses it normally. Completed
-		// descendants are exchanged through the collision-safe shared TT.
-		if (parity == 0 && orderedOptions.size() == 2
-			&& source.options[orderedOptions[0]].type == SelectOptionType::End
-			&& std::find(assigned.begin(), assigned.end(), orderedOptions[1]) == assigned.end())
-			assigned.push_back(orderedOptions[1]);
+		std::vector<int> assigned = workerAssignments[parity];
 		output->planner->setReverseActionOrder(parity == 0 && assigned.size() > 1);
 		for (int option : assigned) output->actions[option].action = { option };
 		if (source.options.size() <= 2) {
@@ -947,11 +1077,12 @@ extern "C" {
       const State& root = data->state;
       if (root.selectMin == 1 && root.selectMax == 1 && root.options.size() > 1) {
         struct WorkerResult { std::vector<ExactScore> actions; ExactMetrics metrics; };
+        auto sharedTable = std::make_shared<ExactSharedTransposition>();
         auto worker = [&](int parity) {
           WorkerResult output;
           Game game = data->game;
           ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds,
-            nullptr, 0, nullptr, data->exactEvaluator);
+            nullptr, 0, sharedTable, data->exactEvaluator);
           for (int option = parity; option < (int)root.options.size(); option += 2) {
             State local = root; local.game = &game;
             ExactDecision item = planner.evaluateRootAction(local, option);
@@ -1033,38 +1164,51 @@ extern "C" {
         };
         const auto absoluteDeadline = std::chrono::steady_clock::now()
           + std::chrono::milliseconds(std::max(1, budgetMilliseconds));
+        auto sharedTable = std::make_shared<ExactSharedTransposition>();
         auto worker = [&](int parity) {
           WorkerResult output;
           Game game = data->game;
           ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds,
             opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount,
-            nullptr, data->exactEvaluator);
+            sharedTable, data->exactEvaluator);
           std::vector<int> assigned;
-          for (int option = parity; option < (int)root.options.size(); option += 2)
-            if (root.options[option].type == SelectOptionType::End) assigned.push_back(option);
-          for (int option = parity; option < (int)root.options.size(); option += 2)
-            if (root.options[option].type != SelectOptionType::End) assigned.push_back(option);
-          for (int option : assigned) {
-            ExactScore saved; saved.action = { option };
-            while (!saved.certified && std::chrono::steady_clock::now() < absoluteDeadline) {
-              auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-                absoluteDeadline - std::chrono::steady_clock::now()).count();
-              if (remaining <= 0) break;
-              planner.setBudgetMilliseconds((int)std::max<long long>(1, remaining));
-              State local = root; local.game = &game;
-              unsigned long long unknownBefore = planner.currentMetrics().unknownOpponentList;
-              ExactScore fresh = planner.evaluateRootAction(local, option).score;
-              if (ExactCompare(fresh.lower, saved.lower) > 0)
-                saved.lower = fresh.lower;
-              if (ExactCompare(fresh.upper, saved.upper) < 0)
-                saved.upper = fresh.upper;
-              saved.certified = fresh.certified || ExactCompare(saved.lower, saved.upper) == 0;
-              if (planner.currentMetrics().unknownOpponentList > unknownBefore) break;
-              if (planner.resourceStopped()) break;
-            }
-            output.actions.push_back({ option, saved });
-            output.metrics = planner.currentMetrics();
-          }
+		  for (int option = parity; option < (int)root.options.size(); option += 2)
+			if (root.options[option].type == SelectOptionType::End) assigned.push_back(option);
+		  for (int option = parity; option < (int)root.options.size(); option += 2)
+			if (root.options[option].type != SelectOptionType::End) assigned.push_back(option);
+		  std::vector<ExactScore> saved(root.options.size());
+		  std::vector<bool> blocked(root.options.size(), false);
+		  for (int option : assigned) saved[option].action = { option };
+		  const int fairShare = std::max(50, budgetMilliseconds / std::max(1, (int)assigned.size()));
+		  const int steadySlice = std::min(60'000, fairShare);
+		  bool firstRound = true;
+		  while (std::chrono::steady_clock::now() < absoluteDeadline) {
+			bool pending = false, attempted = false;
+			for (int option : assigned) {
+			  if (saved[option].certified || blocked[option]) continue;
+			  pending = true;
+			  auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+				absoluteDeadline - std::chrono::steady_clock::now()).count();
+			  if (remaining <= 0) break;
+			  const int slice = (int)std::min<long long>(remaining,
+				firstRound ? std::min(1'000, fairShare) : steadySlice);
+			  planner.setBudgetMilliseconds(std::max(1, slice));
+			  State local = root; local.game = &game;
+			  unsigned long long unknownBefore = planner.currentMetrics().unknownOpponentList;
+			  ExactScore fresh = planner.evaluateRootAction(local, option).score;
+			  if (ExactCompare(fresh.lower, saved[option].lower) > 0) saved[option].lower = fresh.lower;
+			  if (ExactCompare(fresh.upper, saved[option].upper) < 0) saved[option].upper = fresh.upper;
+			  saved[option].certified = fresh.certified
+				|| ExactCompare(saved[option].lower, saved[option].upper) == 0;
+			  if (planner.currentMetrics().unknownOpponentList > unknownBefore) blocked[option] = true;
+			  attempted = true;
+			  if (planner.resourceStopped()) break;
+			}
+			firstRound = false;
+			if (!pending || !attempted || planner.resourceStopped()) break;
+		  }
+		  for (int option : assigned) output.actions.push_back({ option, saved[option] });
+		  output.metrics = planner.currentMetrics();
           return output;
         };
         auto future0 = std::async(std::launch::async, worker, 0);
@@ -1072,10 +1216,10 @@ extern "C" {
         WorkerResult results[2] = { future0.get(), future1.get() };
         bool first = true, allCertified = true;
         ExactFraction maxUpper = ExactFraction::integer(-100'000'000);
-        for (const WorkerResult& result : results) {
-          for (const auto& indexed : result.actions) {
-            ExactScore item = indexed.second;
-            item.action = { indexed.first };
+		for (const WorkerResult& result : results) {
+		  for (const auto& indexed : result.actions) {
+			ExactScore item = indexed.second;
+			item.action = { indexed.first };
             decision.rootActions.push_back({ item.action, item.lower, item.upper, item.certified });
             if (first || ExactCompare(item.lower, decision.score.lower) > 0
                 || (ExactCompare(item.lower, decision.score.lower) == 0 && item.action < decision.score.action)) {
@@ -1083,7 +1227,7 @@ extern "C" {
             }
             if (ExactCompare(item.upper, maxUpper) > 0) maxUpper = item.upper;
             allCertified = allCertified && item.certified;
-          }
+		  }
           MergeExactMetrics(decision.metrics, result.metrics);
         }
         decision.metrics.rootWorkers = 2;
@@ -1117,7 +1261,31 @@ extern "C" {
       ExactPlanner planner(deck, handValues, deckCount, budgetMilliseconds,
           opponentDeckCount == 0 ? nullptr : opponentDeck, opponentDeckCount,
           nullptr, data->exactEvaluator);
-      return ExactDecisionJson(data, planner.evaluateRootAction(data->state, optionIndex));
+      const auto absoluteDeadline = std::chrono::steady_clock::now()
+        + std::chrono::milliseconds(std::max(1, budgetMilliseconds));
+      ExactDecision accumulated;
+      bool first = true;
+      while (std::chrono::steady_clock::now() < absoluteDeadline) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+          absoluteDeadline - std::chrono::steady_clock::now()).count();
+        if (remaining <= 0) break;
+        planner.setBudgetMilliseconds((int)std::min<long long>(remaining, 60'000));
+        ExactDecision fresh = planner.evaluateRootAction(data->state, optionIndex);
+        if (first) { accumulated = fresh; first = false; }
+        else {
+          if (ExactCompare(fresh.score.lower, accumulated.score.lower) > 0)
+            accumulated.score.lower = fresh.score.lower;
+          if (ExactCompare(fresh.score.upper, accumulated.score.upper) < 0)
+            accumulated.score.upper = fresh.score.upper;
+          accumulated.score.action = { optionIndex };
+          accumulated.score.certified = ExactCompare(accumulated.score.lower, accumulated.score.upper) == 0;
+          accumulated.rootActions = fresh.rootActions;
+          accumulated.metrics = fresh.metrics;
+        }
+        if (accumulated.score.certified || planner.resourceStopped()) break;
+      }
+      if (first) accumulated = planner.evaluateRootAction(data->state, optionIndex);
+      return ExactDecisionJson(data, accumulated);
     } catch (...) {
       data->jsonBuilder.clear(); data->jsonBuilder.appendStr("{\"error\":99}");
       return data->jsonBuilder.buf.c_str();

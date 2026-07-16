@@ -20,9 +20,10 @@ public:
 	bool informationSetSafe() const { return loaded; }
 	std::uint64_t modelHash() const { return loaded ? sparseV3.modelHash() : 0; }
 	size_t residentBytes() const { return loaded ? sparseV3.residentBytes() : 0; }
-	bool evaluateV3Features(const ExactSparseEvaluatorV3::FeatureRecord& features, long long& value) const {
+	bool evaluateV3Features(const ExactSparseEvaluatorV3::FeatureRecord& features, long long& value,
+		unsigned long long* accumulatorHits = nullptr) const {
 		if (!loaded || features.overflow) return false;
-		value = sparseV3.evaluate(features); return true;
+		value = sparseV3.evaluate(features, accumulatorHits); return true;
 	}
 	std::vector<std::int16_t> cardContinuationSignature(int cardId) const {
 		return loaded ? sparseV3.cardContinuationSignature(cardId)

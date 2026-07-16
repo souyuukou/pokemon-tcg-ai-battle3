@@ -7,13 +7,19 @@
 #include "ExactCardPartition.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <numeric>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <array>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <unordered_map>
 #include <unordered_set>
+#include <thread>
+#include <emmintrin.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <psapi.h>
@@ -34,6 +40,86 @@ inline unsigned long long ExactResidentBytes() {
 	return (unsigned long long)usage.ru_maxrss * 1024ULL;
 #endif
 }
+
+enum class ExactRuntimeMode : unsigned char { Legacy, Cow, Shadow };
+
+inline ExactRuntimeMode ExactRuntimeModeFromEnvironment() {
+	std::string value;
+#ifdef _WIN32
+	char configured[32]{};
+	DWORD length = GetEnvironmentVariableA("PTCG_EXACT_RUNTIME", configured, (DWORD)std::size(configured));
+	if (length == 0 || length >= std::size(configured)) return ExactRuntimeMode::Legacy;
+	value.assign(configured, configured + length);
+#else
+	const char* configured = std::getenv("PTCG_EXACT_RUNTIME");
+	if (configured == nullptr) return ExactRuntimeMode::Legacy;
+	value.assign(configured);
+#endif
+	if (value == "cow") return ExactRuntimeMode::Cow;
+	if (value == "shadow") return ExactRuntimeMode::Shadow;
+	return ExactRuntimeMode::Legacy;
+}
+
+// Binary observation keys use an unambiguous unsigned LEB128 encoding and
+// zig-zag signed integers.  Most rule values are below 64, so fixed-width i32
+// keys wasted hundreds of bytes per TT entry.  The encoding remains injective;
+// full bytes, rather than the hash, continue to decide equality.
+struct ExactPackedKeyWriter {
+	std::string bytes;
+	void u8(unsigned char value) { bytes.push_back((char)value); }
+	void u32(std::uint32_t value) {
+		while (value >= 0x80U) { bytes.push_back((char)((value & 0x7fU) | 0x80U)); value >>= 7; }
+		bytes.push_back((char)value);
+	}
+	void i32(int value) {
+		const std::uint32_t bits = (std::uint32_t)value;
+		u32((bits << 1) ^ (std::uint32_t)-(std::int32_t)(bits >> 31));
+	}
+	void i32Span(const int* values, size_t count) {
+		for (size_t i = 0; i < count; ++i) i32(values[i]);
+	}
+	void u64(std::uint64_t value) {
+		while (value >= 0x80ULL) { bytes.push_back((char)((value & 0x7fULL) | 0x80ULL)); value >>= 7; }
+		bytes.push_back((char)value);
+	}
+	void blob(const std::string& value) {
+		u32((std::uint32_t)value.size()); bytes.append(value.data(), value.size());
+	}
+};
+
+struct ExactPackedDescriptor {
+	// One entity can reference at most the 60 physical deck cards: five scalar
+	// fields, up to 60 effective energy entries, and up to 60 attached/evolution
+	// cards. An Attach/Evolve option adds both position headers. 160 therefore
+	// retains a checked safety margin without spacing hot descriptors 1.5 KiB apart.
+	static constexpr size_t MaxValues = 160;
+	std::array<int, MaxValues> values{};
+	std::uint16_t count = 0;
+	void clear() { count = 0; }
+	void assign(const ExactPackedDescriptor& other) {
+		count = other.count;
+		std::copy_n(other.values.begin(), count, values.begin());
+	}
+	void add(int value) {
+		if (count >= MaxValues) throw std::length_error("packed exact descriptor overflow");
+		values[count++] = value;
+	}
+	void append(const ExactPackedDescriptor& other) {
+		add((int)other.count);
+		for (std::uint16_t i = 0; i < other.count; ++i) add(other.values[i]);
+	}
+	bool operator<(const ExactPackedDescriptor& other) const {
+		const auto first = values.begin(), second = other.values.begin();
+		return std::lexicographical_compare(first, first + count, second, second + other.count);
+	}
+	bool operator==(const ExactPackedDescriptor& other) const {
+		return count == other.count && std::equal(values.begin(), values.begin() + count, other.values.begin());
+	}
+	void write(ExactPackedKeyWriter& writer) const {
+		writer.u32(count);
+		writer.i32Span(values.data(), count);
+	}
+};
 
 struct ExactFraction {
 	long long numerator = 0;
@@ -153,6 +239,11 @@ inline unsigned long long ExactRotl64(unsigned long long value, int bits) {
 	return (value << bits) | (value >> (64 - bits));
 }
 
+template<int Bits>
+inline __m128i ExactRotl64x2(__m128i value) {
+	return _mm_or_si128(_mm_slli_epi64(value, Bits), _mm_srli_epi64(value, 64 - Bits));
+}
+
 inline unsigned long long ExactSipHash24(const std::string& bytes, unsigned long long k0, unsigned long long k1) {
 	unsigned long long v0 = 0x736f6d6570736575ULL ^ k0, v1 = 0x646f72616e646f6dULL ^ k1;
 	unsigned long long v2 = 0x6c7967656e657261ULL ^ k0, v3 = 0x7465646279746573ULL ^ k1;
@@ -178,16 +269,128 @@ inline unsigned long long ExactSipHash24(const std::string& bytes, unsigned long
 
 struct ExactStringHasher {
 	size_t operator()(const std::string& bytes) const noexcept {
-		unsigned long long lo = ExactSipHash24(bytes, 0x7766554433221100ULL, 0xffeeddccbbaa9988ULL);
-		unsigned long long hi = ExactSipHash24(bytes, 0x8899aabbccddeeffULL, 0x0011223344556677ULL);
+		unsigned long long a0 = 0x736f6d6570736575ULL ^ 0x7766554433221100ULL;
+		unsigned long long a1 = 0x646f72616e646f6dULL ^ 0xffeeddccbbaa9988ULL;
+		unsigned long long a2 = 0x6c7967656e657261ULL ^ 0x7766554433221100ULL;
+		unsigned long long a3 = 0x7465646279746573ULL ^ 0xffeeddccbbaa9988ULL;
+		unsigned long long b0 = 0x736f6d6570736575ULL ^ 0x8899aabbccddeeffULL;
+		unsigned long long b1 = 0x646f72616e646f6dULL ^ 0x0011223344556677ULL;
+		unsigned long long b2 = 0x6c7967656e657261ULL ^ 0x8899aabbccddeeffULL;
+		unsigned long long b3 = 0x7465646279746573ULL ^ 0x0011223344556677ULL;
+		__m128i v0 = _mm_set_epi64x((long long)b0, (long long)a0);
+		__m128i v1 = _mm_set_epi64x((long long)b1, (long long)a1);
+		__m128i v2 = _mm_set_epi64x((long long)b2, (long long)a2);
+		__m128i v3 = _mm_set_epi64x((long long)b3, (long long)a3);
+		auto roundBoth = [&] {
+			v0 = _mm_add_epi64(v0, v1); v1 = ExactRotl64x2<13>(v1); v1 = _mm_xor_si128(v1, v0);
+			v0 = ExactRotl64x2<32>(v0); v2 = _mm_add_epi64(v2, v3);
+			v3 = ExactRotl64x2<16>(v3); v3 = _mm_xor_si128(v3, v2);
+			v0 = _mm_add_epi64(v0, v3); v3 = ExactRotl64x2<21>(v3); v3 = _mm_xor_si128(v3, v0);
+			v2 = _mm_add_epi64(v2, v1); v1 = ExactRotl64x2<17>(v1); v1 = _mm_xor_si128(v1, v2);
+			v2 = ExactRotl64x2<32>(v2);
+		};
+		size_t offset = 0;
+		for (; offset + 8 <= bytes.size(); offset += 8) {
+			unsigned long long word = 0;
+			std::memcpy(&word, bytes.data() + offset, sizeof(word));
+			__m128i both = _mm_set1_epi64x((long long)word);
+			v3 = _mm_xor_si128(v3, both); roundBoth(); roundBoth(); v0 = _mm_xor_si128(v0, both);
+		}
+		unsigned long long tail = (unsigned long long)bytes.size() << 56;
+		for (size_t i = offset; i < bytes.size(); ++i)
+			tail |= (unsigned long long)(unsigned char)bytes[i] << (8 * (i - offset));
+		__m128i bothTail = _mm_set1_epi64x((long long)tail);
+		v3 = _mm_xor_si128(v3, bothTail); roundBoth(); roundBoth(); v0 = _mm_xor_si128(v0, bothTail);
+		v2 = _mm_xor_si128(v2, _mm_set1_epi64x(0xff));
+		for (int i = 0; i < 4; ++i) roundBoth();
+		alignas(16) unsigned long long lanes[2];
+		_mm_store_si128(reinterpret_cast<__m128i*>(lanes),
+			_mm_xor_si128(_mm_xor_si128(v0, v1), _mm_xor_si128(v2, v3)));
+		unsigned long long lo = lanes[0], hi = lanes[1];
 		return (size_t)(lo ^ ExactRotl64(hi, 1));
 	}
+};
+
+class ExactSmallAction {
+public:
+	static constexpr size_t InlineCount = 4;
+	ExactSmallAction() = default;
+	ExactSmallAction(std::initializer_list<int> values) { assign(values.begin(), values.end()); }
+	ExactSmallAction(const std::vector<int>& values) { assign(values.begin(), values.end()); }
+	ExactSmallAction(std::vector<int>&& values) {
+		if (values.size() <= InlineCount) assign(values.begin(), values.end());
+		else { count = values.size(); overflow = std::make_unique<std::vector<int>>(std::move(values)); }
+	}
+	ExactSmallAction(const ExactSmallAction& other) { copyFrom(other); }
+	ExactSmallAction(ExactSmallAction&&) noexcept = default;
+	ExactSmallAction& operator=(const ExactSmallAction& other) {
+		if (this != &other) copyFrom(other);
+		return *this;
+	}
+	ExactSmallAction& operator=(ExactSmallAction&&) noexcept = default;
+	ExactSmallAction& operator=(std::initializer_list<int> values) { assign(values.begin(), values.end()); return *this; }
+	ExactSmallAction& operator=(const std::vector<int>& values) { assign(values.begin(), values.end()); return *this; }
+	ExactSmallAction& operator=(std::vector<int>&& values) {
+		if (values.size() <= InlineCount) assign(values.begin(), values.end());
+		else { count = values.size(); overflow = std::make_unique<std::vector<int>>(std::move(values)); }
+		return *this;
+	}
+	template<class Iterator>
+	void assignRange(Iterator first, Iterator last) { assign(first, last); }
+	void sort() {
+		if (overflow) std::sort(overflow->begin(), overflow->end());
+		else std::sort(inlineValues.begin(), inlineValues.begin() + count);
+	}
+	void push_back(int value) {
+		if (!overflow && count < InlineCount) inlineValues[count++] = value;
+		else {
+			if (!overflow) overflow = std::make_unique<std::vector<int>>(inlineValues.begin(), inlineValues.begin() + count);
+			overflow->push_back(value); count++;
+		}
+	}
+	void pop_back() {
+		if (count == 0) return;
+		if (overflow) overflow->pop_back();
+		count--;
+	}
+	bool empty() const { return count == 0; }
+	size_t size() const { return count; }
+	int front() const { return (*this)[0]; }
+	int operator[](size_t index) const { return overflow ? (*overflow)[index] : inlineValues[index]; }
+	void clear() { count = 0; overflow.reset(); }
+	operator std::vector<int>() const {
+		if (overflow) return *overflow;
+		return std::vector<int>(inlineValues.begin(), inlineValues.begin() + count);
+	}
+	bool operator<(const ExactSmallAction& other) const {
+		const size_t common = std::min(count, other.count);
+		for (size_t i = 0; i < common; ++i) if ((*this)[i] != other[i]) return (*this)[i] < other[i];
+		return count < other.count;
+	}
+private:
+	template<class Iterator>
+	void assign(Iterator first, Iterator last) {
+		const size_t size = (size_t)std::distance(first, last);
+		count = size;
+		if (size <= InlineCount) {
+			overflow.reset();
+			std::copy(first, last, inlineValues.begin());
+		} else overflow = std::make_unique<std::vector<int>>(first, last);
+	}
+	void copyFrom(const ExactSmallAction& other) {
+		count = other.count;
+		if (other.overflow) overflow = std::make_unique<std::vector<int>>(*other.overflow);
+		else { overflow.reset(); std::copy_n(other.inlineValues.begin(), count, inlineValues.begin()); }
+	}
+	std::array<int, InlineCount> inlineValues{};
+	std::unique_ptr<std::vector<int>> overflow;
+	size_t count = 0;
 };
 
 struct ExactScore {
 	ExactFraction lower = ExactFraction::integer(-100'000'000);
 	ExactFraction upper = ExactFraction::integer(100'000'000);
-	std::vector<int> action;
+	ExactSmallAction action;
 	bool certified = false;
 };
 
@@ -203,13 +406,31 @@ struct ExactRootActionValue {
 // SipHash only chooses a bucket/shard.
 class ExactSharedTransposition {
 public:
-	bool find(const std::string& key, ExactScore& value) const {
+	struct FlightState {
+		std::string key;
+		size_t hash = 0;
+		std::thread::id owner;
+		std::mutex mutex;
+		std::condition_variable ready;
+		bool done = false, success = false;
+		ExactScore value;
+	};
+	enum class ClaimStatus { Owner, Completed, Released, TimedOut, SelfDuplicate };
+	struct ClaimResult {
+		ClaimStatus status = ClaimStatus::TimedOut;
+		std::shared_ptr<FlightState> flight;
+		ExactScore value;
+		bool waited = false;
+	};
+
+	bool find(const std::string& key, ExactScore& value, size_t* computedHash = nullptr) const {
 		size_t hash = ExactStringHasher{}(key);
+		if (computedHash != nullptr) *computedHash = hash;
 		Shard& shard = shards[hash & (ShardCount - 1)];
-		std::lock_guard<std::mutex> lock(shard.mutex);
+		std::shared_lock<std::shared_mutex> lock(shard.mutex);
 		auto found = shard.buckets.find(hash);
 		if (found == shard.buckets.end()) return false;
-		for (const Entry& entry : found->second) if (entry.key == key) {
+		for (const Entry& entry : found->second) if (shard.keyEquals(entry.key, key)) {
 			value = entry.value;
 			return true;
 		}
@@ -217,6 +438,11 @@ public:
 	}
 
 	bool store(std::string key, const ExactScore& value) {
+		const size_t hash = ExactStringHasher{}(key);
+		return storeHashed(std::move(key), value, hash);
+	}
+
+	bool storeHashed(std::string key, const ExactScore& value, size_t hash) {
 		const size_t entryBytes = key.size() + sizeof(ExactScore) + 96;
 		if (entryCount.load(std::memory_order_relaxed) >= MaxEntries) return false;
 		size_t prior = byteCount.fetch_add(entryBytes, std::memory_order_relaxed);
@@ -224,37 +450,182 @@ public:
 			byteCount.fetch_sub(entryBytes, std::memory_order_relaxed);
 			return false;
 		}
-		size_t hash = ExactStringHasher{}(key);
 		Shard& shard = shards[hash & (ShardCount - 1)];
-		std::lock_guard<std::mutex> lock(shard.mutex);
+		std::unique_lock<std::shared_mutex> lock(shard.mutex);
 		auto& bucket = shard.buckets[hash];
-		for (const Entry& entry : bucket) if (entry.key == key) {
+		for (const Entry& entry : bucket) if (shard.keyEquals(entry.key, key)) {
 			byteCount.fetch_sub(entryBytes, std::memory_order_relaxed);
 			return false;
 		}
-		bucket.push_back({ std::move(key), value });
+		KeyRef keyRef = shard.intern(key, arenaByteCount);
+		ExactScore stored = value;
+		stored.action.clear();
+		bucket.push_back({ keyRef, std::move(stored) });
 		entryCount.fetch_add(1, std::memory_order_relaxed);
 		return true;
 	}
 
+	ClaimResult claim(const std::string& key, std::chrono::steady_clock::time_point deadline) {
+		const size_t hash = ExactStringHasher{}(key);
+		Shard& shard = shards[hash & (ShardCount - 1)];
+		std::shared_ptr<FlightState> flight;
+		{
+			std::unique_lock<std::shared_mutex> lock(shard.mutex);
+			auto completed = shard.buckets.find(hash);
+			if (completed != shard.buckets.end()) for (const Entry& entry : completed->second)
+				if (shard.keyEquals(entry.key, key)) return { ClaimStatus::Completed, {}, entry.value };
+			auto& active = shard.flights[hash];
+			for (const auto& item : active) if (item->key == key) { flight = item; break; }
+			if (!flight) {
+				flight = std::make_shared<FlightState>(); flight->key = key; flight->hash = hash;
+				flight->owner = std::this_thread::get_id(); active.push_back(flight);
+				return { ClaimStatus::Owner, flight, {} };
+			}
+			if (flight->owner == std::this_thread::get_id())
+				return { ClaimStatus::SelfDuplicate, flight, {} };
+		}
+		std::unique_lock<std::mutex> waitLock(flight->mutex);
+		if (!flight->ready.wait_until(waitLock, deadline, [&] { return flight->done; }))
+			return { ClaimStatus::TimedOut, flight, {}, true };
+		if (flight->success) return { ClaimStatus::Completed, flight, flight->value, true };
+		return { ClaimStatus::Released, flight, {}, true };
+	}
+
+	void finishFlight(const std::shared_ptr<FlightState>& flight, const ExactScore* value) {
+		if (!flight) return;
+		Shard& shard = shards[flight->hash & (ShardCount - 1)];
+		{
+			std::unique_lock<std::shared_mutex> lock(shard.mutex);
+			auto found = shard.flights.find(flight->hash);
+			if (found != shard.flights.end()) {
+				auto& active = found->second;
+				active.erase(std::remove(active.begin(), active.end(), flight), active.end());
+				if (active.empty()) shard.flights.erase(found);
+			}
+		}
+		{
+			std::lock_guard<std::mutex> lock(flight->mutex);
+			if (value != nullptr) { flight->value = *value; flight->value.action.clear(); flight->success = true; }
+			flight->done = true;
+		}
+		flight->ready.notify_all();
+	}
+
 	size_t bytes() const { return byteCount.load(std::memory_order_relaxed); }
 	size_t size() const { return entryCount.load(std::memory_order_relaxed); }
+	size_t arenaBytes() const { return arenaByteCount.load(std::memory_order_relaxed); }
+	std::uint64_t internExactComponent(const std::string& value) {
+		std::lock_guard<std::mutex> lock(componentMutex);
+		auto found = componentIds.find(value);
+		if (found != componentIds.end()) return found->second;
+		const std::uint64_t id = nextComponentId++;
+		componentIds.emplace(value, id);
+		return id;
+	}
 
 private:
 	static constexpr size_t ShardCount = 64;
-	static constexpr size_t MaxEntries = 500'000;
-	static constexpr size_t MaxBytes = 400ULL * 1024ULL * 1024ULL;
-	struct Entry { std::string key; ExactScore value; };
+	// The 90-second Rich gate reaches the former 600 MiB completed-entry ceiling
+	// after roughly 35 seconds.  Completed nodes are exactly recomputable and the
+	// process-wide 2.7 GiB RSS guard remains authoritative, so retain them while
+	// there is measured headroom instead of forcing exponential re-expansion.
+	static constexpr size_t MaxEntries = 4'000'000;
+	static constexpr size_t MaxBytes = 2'560ULL * 1024ULL * 1024ULL;
+	struct KeyRef { std::uint32_t block = 0, offset = 0, length = 0; };
+	struct Entry { KeyRef key; ExactScore value; };
 	struct Shard {
-		mutable std::mutex mutex;
+		Shard() { buckets.reserve(8'192); }
+		struct ArenaBlock {
+			std::unique_ptr<unsigned char[]> data;
+			size_t capacity = 0, used = 0;
+		};
+		KeyRef intern(const std::string& key, std::atomic<size_t>& allocatedBytes) {
+			static constexpr size_t BlockBytes = 256ULL * 1024ULL;
+			if (blocks.empty() || blocks.back().capacity - blocks.back().used < key.size()) {
+				const size_t capacity = std::max(BlockBytes, key.size());
+				ArenaBlock block; block.data = std::make_unique<unsigned char[]>(capacity); block.capacity = capacity;
+				blocks.push_back(std::move(block)); allocatedBytes.fetch_add(capacity, std::memory_order_relaxed);
+			}
+			ArenaBlock& block = blocks.back();
+			if (blocks.size() > std::numeric_limits<std::uint32_t>::max()
+				|| block.used > std::numeric_limits<std::uint32_t>::max()
+				|| key.size() > std::numeric_limits<std::uint32_t>::max())
+				throw std::overflow_error("exact key arena overflow");
+			KeyRef ref{ (std::uint32_t)(blocks.size() - 1), (std::uint32_t)block.used, (std::uint32_t)key.size() };
+			std::memcpy(block.data.get() + block.used, key.data(), key.size()); block.used += key.size();
+			return ref;
+		}
+		bool keyEquals(const KeyRef& ref, const std::string& key) const {
+			return ref.length == key.size() && ref.block < blocks.size()
+				&& std::memcmp(blocks[ref.block].data.get() + ref.offset, key.data(), key.size()) == 0;
+		}
+		mutable std::shared_mutex mutex;
 		std::unordered_map<size_t, std::vector<Entry>> buckets;
+		std::unordered_map<size_t, std::vector<std::shared_ptr<FlightState>>> flights;
+		std::vector<ArenaBlock> blocks;
 	};
 	mutable std::array<Shard, ShardCount> shards;
 	std::atomic<size_t> byteCount{ 0 };
 	std::atomic<size_t> entryCount{ 0 };
+	std::atomic<size_t> arenaByteCount{ 0 };
+	std::mutex componentMutex;
+	std::unordered_map<std::string, std::uint64_t, ExactStringHasher> componentIds;
+	std::uint64_t nextComponentId = 1;
 };
 
 struct ExactMetrics {
+	// Programming-performance counters. They are observational only and must
+	// never participate in a search key, bound, or evaluator value.
+	unsigned long long stateCopies = 0;
+	unsigned long long stateCopyBytes = 0;
+	unsigned long long stateCopySampleNs = 0;
+	unsigned long long canonicalBuilds = 0;
+	unsigned long long canonicalBytes = 0;
+	unsigned long long canonicalSampleNs = 0;
+	unsigned long long ttReadHits = 0;
+	unsigned long long ttReadMisses = 0;
+	unsigned long long ttReadSampleNs = 0;
+	unsigned long long ttInsertions = 0;
+	unsigned long long transitionCacheHits = 0;
+	unsigned long long arenaBytes = 0;
+	unsigned long long heapAllocations = 0;
+	unsigned long long statePoolReuses = 0;
+	unsigned long long engineStepCalls = 0;
+	unsigned long long engineStepSampleNs = 0;
+	unsigned long long actionApplyCalls = 0;
+	unsigned long long actionApplySampleNs = 0;
+	unsigned long long actionKeyCalls = 0;
+	unsigned long long actionKeySampleNs = 0;
+	unsigned long long partitionKeyCalls = 0;
+	unsigned long long partitionKeySampleNs = 0;
+	unsigned long long observationKeyCalls = 0;
+	unsigned long long observationKeySampleNs = 0;
+	unsigned long long evaluatorCacheHits = 0;
+	unsigned long long evaluatorCalls = 0;
+	unsigned long long evaluatorSampleNs = 0;
+	unsigned long long evaluatorExtractSampleNs = 0;
+	unsigned long long evaluatorInferenceSampleNs = 0;
+	unsigned long long evaluatorPublicSampleNs = 0;
+	unsigned long long evaluatorHiddenSampleNs = 0;
+	unsigned long long evaluatorEntitySampleNs = 0;
+	unsigned long long workerBusyNs = 0;
+	unsigned long long workerWaitNs = 0;
+	unsigned long long legacyShadowMismatches = 0;
+	unsigned long long packedObservationBuilds = 0;
+	unsigned long long packedObservationBytes = 0;
+	unsigned long long keyArenaBytes = 0;
+	unsigned long long cowFullCopies = 0;
+	unsigned long long cowPageCopies = 0;
+	unsigned long long cowCopyBytes = 0;
+	unsigned long long mutationMisses = 0;
+	unsigned long long materializedSnapshots = 0;
+	unsigned long long inFlightWaits = 0;
+	unsigned long long workerDuplicateClaims = 0;
+	unsigned long long exactWeightInlineOps = 0;
+	unsigned long long exactWeightSpills = 0;
+	unsigned long long evaluatorAccumulatorHits = 0;
+	int runtimeVersion = 1;
+	int canonicalSchemaVersion = 1;
 	unsigned long long expanded = 0;
 	unsigned long long merged = 0;
 	bool timedOut = false;
@@ -333,7 +704,10 @@ struct ExactMetrics {
 	unsigned long long continuationDrawClasses = 0;
 	unsigned long long continuationClassOutcomes = 0;
 	unsigned long long continuationConditionalSplits = 0;
+	unsigned long long continuationPreparedOutcomes = 0;
 	unsigned long long continuationDrawOutcomes = 0;
+	unsigned long long continuationCompletedOutcomeNodes = 0;
+	unsigned long long continuationMaxOutcomeNodes = 0;
 	unsigned long long continuationAtomsMerged = 0;
 	int dynamicPartitionFallbackCardId = 0;
 	int dynamicPartitionFallbackEffectType = 0;
@@ -348,6 +722,166 @@ struct ExactDecision {
 	ExactMetrics metrics;
 	std::vector<ExactRootActionValue> rootActions;
 };
+
+// Search states are short-lived and are created at almost every explored edge.
+// Keep their vector capacities alive in a worker-local pool so exact search does
+// not pay the allocator cost for every mathematically distinct successor.
+class ExactStatePool {
+public:
+	struct CopyStats {
+		unsigned long long pageCopies = 0;
+		unsigned long long copiedBytes = 0;
+		bool fullCopy = false;
+		bool mismatch = false;
+	};
+	template<class T>
+	static void copyVector(std::vector<T>& destination, const std::vector<T>& source) {
+		if (destination.capacity() < source.size()) destination.reserve(source.size());
+		destination.assign(source.begin(), source.end());
+	}
+
+	// State's fixed prefix contains only byte-serializable engine data after the
+	// non-owning Game pointer.  Copy it in one operation; copy owning vectors
+	// explicitly so their allocations are reused and never aliased.
+	static void copyExactState(State& destination, const State& source) {
+		destination.game = source.game;
+		const auto* sourceBegin = reinterpret_cast<const unsigned char*>(&source.turn);
+		const auto* sourceEnd = reinterpret_cast<const unsigned char*>(&source.options);
+		auto* destinationBegin = reinterpret_cast<unsigned char*>(&destination.turn);
+		std::memcpy(destinationBegin, sourceBegin, (size_t)(sourceEnd - sourceBegin));
+		copyVector(destination.options, source.options);
+		copyVector(destination.selected, source.selected);
+		copyVector(destination.preTargetList, source.preTargetList);
+		copyVector(destination.targetList, source.targetList);
+		copyVector(destination.koList, source.koList);
+		copyVector(destination.delayTriggerStack, source.delayTriggerStack);
+		copyVector(destination.temporaryTriggerStack, source.temporaryTriggerStack);
+		copyVector(destination.triggerStack, source.triggerStack);
+		copyVector(destination.turnUsedSkill, source.turnUsedSkill);
+		copyVector(destination.turnPlay, source.turnPlay);
+		copyVector(destination.turnHeal, source.turnHeal);
+		copyVector(destination.turnEvolve, source.turnEvolve);
+		copyVector(destination.functionStack, source.functionStack);
+		copyVector(destination.logs, source.logs);
+		destination.exact = source.exact;
+	}
+
+	template<class T>
+	static void restoreVector(std::vector<T>& destination, const std::vector<T>& source, CopyStats& stats) {
+		bool equal = destination.size() == source.size();
+		if (equal && !source.empty()) {
+			if constexpr (std::is_trivially_copyable_v<T>)
+				equal = std::memcmp(destination.data(), source.data(), source.size() * sizeof(T)) == 0;
+			else equal = false;
+		}
+		if (equal) return;
+		copyVector(destination, source);
+		stats.pageCopies++;
+		stats.copiedBytes += (unsigned long long)source.size() * sizeof(T);
+	}
+
+	// Search successors are usually close relatives of the state most recently
+	// released to this thread-local pool. Compare fixed-size pages and restore
+	// only pages which differ. This is a conservative COW implementation: every
+	// byte is checked, so correctness does not rely on mutation instrumentation.
+	static void copyCowState(State& destination, const State& source, CopyStats& stats) {
+		destination.game = source.game;
+		auto restoreBytes = [&](void* destinationBytes, const void* sourceBytes, size_t length) {
+			if (std::memcmp(destinationBytes, sourceBytes, length) == 0) return;
+			std::memcpy(destinationBytes, sourceBytes, length);
+			stats.pageCopies++; stats.copiedBytes += length;
+		};
+		// Coarse logical pages reduce memcmp call overhead while retaining the
+		// conservative compare-before-copy guarantee. Mutation tracking can later
+		// replace this scan with direct dirty bits without changing semantics.
+		const auto* sourceBegin = reinterpret_cast<const unsigned char*>(&source.turn);
+		const auto* sourceEnd = reinterpret_cast<const unsigned char*>(&source.options);
+		auto* destinationBegin = reinterpret_cast<unsigned char*>(&destination.turn);
+		const size_t total = (size_t)(sourceEnd - sourceBegin);
+		static constexpr size_t PageBytes = 256;
+		for (size_t offset = 0; offset < total; offset += PageBytes)
+			restoreBytes(destinationBegin + offset, sourceBegin + offset, std::min(PageBytes, total - offset));
+		restoreVector(destination.options, source.options, stats);
+		restoreVector(destination.selected, source.selected, stats);
+		restoreVector(destination.preTargetList, source.preTargetList, stats);
+		restoreVector(destination.targetList, source.targetList, stats);
+		restoreVector(destination.koList, source.koList, stats);
+		restoreVector(destination.delayTriggerStack, source.delayTriggerStack, stats);
+		restoreVector(destination.temporaryTriggerStack, source.temporaryTriggerStack, stats);
+		restoreVector(destination.triggerStack, source.triggerStack, stats);
+		restoreVector(destination.turnUsedSkill, source.turnUsedSkill, stats);
+		restoreVector(destination.turnPlay, source.turnPlay, stats);
+		restoreVector(destination.turnHeal, source.turnHeal, stats);
+		restoreVector(destination.turnEvolve, source.turnEvolve, stats);
+		restoreVector(destination.functionStack, source.functionStack, stats);
+		restoreVector(destination.logs, source.logs, stats);
+		static_assert(std::is_trivially_copyable_v<ExactHiddenState>);
+		if (std::memcmp(&destination.exact, &source.exact, sizeof(ExactHiddenState)) != 0) {
+			std::memcpy(&destination.exact, &source.exact, sizeof(ExactHiddenState));
+			stats.pageCopies++; stats.copiedBytes += sizeof(ExactHiddenState);
+		}
+	}
+
+	static bool equalAfterCopy(const State& destination, const State& source) {
+		const auto* sourceBegin = reinterpret_cast<const unsigned char*>(&source.turn);
+		const auto* sourceEnd = reinterpret_cast<const unsigned char*>(&source.options);
+		const auto* destinationBegin = reinterpret_cast<const unsigned char*>(&destination.turn);
+		if (std::memcmp(destinationBegin, sourceBegin, (size_t)(sourceEnd - sourceBegin)) != 0) return false;
+		if (std::memcmp(&destination.exact, &source.exact, sizeof(ExactHiddenState)) != 0) return false;
+		auto same = [](const auto& left, const auto& right) {
+			using Value = typename std::decay_t<decltype(left)>::value_type;
+			if (left.size() != right.size()) return false;
+			if constexpr (std::is_trivially_copyable_v<Value>)
+				return left.empty() || std::memcmp(left.data(), right.data(), left.size() * sizeof(Value)) == 0;
+			return true; // non-trivial vectors are always assigned by restoreVector
+		};
+		return same(destination.options, source.options) && same(destination.selected, source.selected)
+			&& same(destination.preTargetList, source.preTargetList) && same(destination.targetList, source.targetList)
+			&& same(destination.koList, source.koList) && same(destination.delayTriggerStack, source.delayTriggerStack)
+			&& same(destination.temporaryTriggerStack, source.temporaryTriggerStack)
+			&& same(destination.triggerStack, source.triggerStack) && same(destination.turnUsedSkill, source.turnUsedSkill)
+			&& same(destination.turnPlay, source.turnPlay) && same(destination.turnHeal, source.turnHeal)
+			&& same(destination.turnEvolve, source.turnEvolve) && same(destination.functionStack, source.functionStack)
+			&& same(destination.logs, source.logs);
+	}
+
+	static State* acquire(const State& source, bool* allocated = nullptr,
+		bool cow = false, bool verify = false, CopyStats* copyStats = nullptr) {
+		State* result = nullptr;
+		CopyStats localStats;
+		if (!freeStates.empty()) {
+			result = freeStates.back(); freeStates.pop_back();
+			if (cow) copyCowState(*result, source, localStats);
+			else copyExactState(*result, source);
+			if (allocated != nullptr) *allocated = false;
+		} else {
+			result = new State(source);
+			localStats.fullCopy = true;
+			if (allocated != nullptr) *allocated = true;
+		}
+		// A freshly copy-constructed State is semantically exact, but C++ does not
+		// require memberwise copies to preserve padding bytes. Dirty-page auditing
+		// applies only to reused slots restored by raw page/vector copies.
+		if (verify && !localStats.fullCopy && !equalAfterCopy(*result, source)) localStats.mismatch = true;
+		if (copyStats != nullptr) *copyStats = localStats;
+		return result;
+	}
+	static void release(State* state) noexcept {
+		if (state == nullptr) return;
+		try { freeStates.push_back(state); }
+		catch (...) { delete state; }
+	}
+	static unsigned long long retainedBytes() {
+		return (unsigned long long)freeStates.capacity() * sizeof(State);
+	}
+private:
+	static inline thread_local std::vector<State*> freeStates;
+};
+
+struct ExactStatePoolDeleter {
+	void operator()(State* state) const noexcept { ExactStatePool::release(state); }
+};
+using ExactStatePtr = std::unique_ptr<State, ExactStatePoolDeleter>;
 
 // The lossless search/TT identity.  EvaluatorRecordV3 is deliberately not
 // used here because its Q8 belief projection may merge distinct beliefs.
@@ -380,6 +914,15 @@ public:
 			actorProfileCount[deck[i]]++;
 			handValue[deck[i]] = handValues == nullptr ? 100 : handValues[i];
 		}
+		std::vector<int> actorIds;
+		actorIds.reserve(actorProfileCount.size());
+		for (const auto& item : actorProfileCount) actorIds.push_back(item.first);
+		std::sort(actorIds.begin(), actorIds.end());
+		actorProfileSorted.reserve(actorIds.size());
+		for (int id : actorIds) actorProfileSorted.push_back({ id, actorProfileCount[id] });
+		if (!actorIds.empty() && actorIds.back() >= 0) actorCardIndexById.assign((size_t)actorIds.back() + 1, -1);
+		for (size_t i = 0; i < actorIds.size(); ++i) if (actorIds[i] >= 0)
+			actorCardIndexById[(size_t)actorIds[i]] = (signed char)i;
 		for (int i = 0; opponentDeck != nullptr && i < opponentDeckCount; ++i) opponentProfileCount[opponentDeck[i]]++;
 		std::vector<int> priorCards;
 		for (int i = 0; opponentDeck != nullptr && i < opponentDeckCount; ++i) priorCards.push_back(opponentDeck[i]);
@@ -387,6 +930,11 @@ public:
 		environmentPriorId = 1469598103934665603ULL;
 		for (int id : priorCards) for (int shift = 0; shift < 32; shift += 8) {
 			environmentPriorId ^= (unsigned char)((unsigned)id >> shift); environmentPriorId *= 1099511628211ULL;
+		}
+		runtimeMode = ExactRuntimeModeFromEnvironment();
+		if (runtimeMode != ExactRuntimeMode::Legacy) {
+			metrics.runtimeVersion = 3;
+			metrics.canonicalSchemaVersion = 3;
 		}
 	}
 
@@ -400,8 +948,26 @@ public:
 	// so the two cores do not spend the deadline on the same prefix.
 	void setReverseActionOrder(bool reverse) { reverseActionOrder = reverse; }
 	void setConcreteWorldCaching(bool enabled) { concreteWorldCaching = enabled; }
+	void setInFlightClaims(bool enabled) { inFlightClaimsEnabled = enabled; }
+
+	// Exact search never exposes engine logs to the caller and rule evaluation
+	// does not read them.  Run against a private Game scratch object with log
+	// recording disabled so AddLog() is a no-op and the live battle Game is not
+	// mutated by manual-coin or temporary engine buffers.
+	static void prepareExactRoot(State& root, Game& scratch) {
+		if (root.game == nullptr) return;
+		scratch = *root.game;
+		scratch.config.recordLog = false;
+		scratch.config.manualCoin = true;
+		root.game = &scratch;
+		root.logs.clear();
+		root.logIndex = {};
+	}
 
 	ExactDecision decide(State root) {
+		auto workerStarted = std::chrono::steady_clock::now();
+		Game exactGame;
+		prepareExactRoot(root, exactGame);
 		rootActionValues.clear();
 		canonicalMainEnabled = root.selectType == SelectType::Main && root.options.size() > 2;
 		nodeQuantumDeadline = std::numeric_limits<unsigned long long>::max();
@@ -411,14 +977,19 @@ public:
 		root.exact.enabled = true;
 		root.exact.actor = (signed char)actor;
 		ExactDecision result;
-		result.score = solveOwned(std::make_unique<State>(std::move(root)));
+		result.score = solveOwned(cloneState(root));
 		result.rootActions = rootActionValues;
 		applyEvaluatorSafety(result);
+		metrics.workerBusyNs += (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now() - workerStarted).count();
 		result.metrics = metrics;
 		return result;
 	}
 
 	ExactDecision evaluateRootAction(State root, int optionIndex) {
+		auto workerStarted = std::chrono::steady_clock::now();
+		Game exactGame;
+		prepareExactRoot(root, exactGame);
 		rootActionValues.clear();
 		canonicalMainEnabled = root.selectType == SelectType::Main && root.options.size() > 2;
 		nodeQuantumDeadline = canonicalMainEnabled ? metrics.expanded + 20'000ULL
@@ -442,22 +1013,63 @@ public:
 			else if (prior->second == retryKey) metrics.rootRetryKeyMatches++;
 			else metrics.rootRetryKeyMismatches++;
 			result.score = child.exact.pending == ExactPendingType::RevealDeck
-				? revealAndReplay(root, child.exact, { optionIndex }) : solveOwned(std::make_unique<State>(std::move(child)));
+				? revealAndReplay(root, child.exact, { optionIndex }) : solveOwned(cloneState(child));
 			result.score.action = { optionIndex };
 		}
 		applyEvaluatorSafety(result);
+		metrics.workerBusyNs += (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now() - workerStarted).count();
 		result.metrics = metrics;
 		result.rootActions.push_back({ { optionIndex }, result.score.lower, result.score.upper, result.score.certified });
 		return result;
 	}
 
-	std::string canonicalRootSuccessor(State root, int optionIndex) {
+	std::string canonicalRootSuccessor(State root, int optionIndex,
+		unsigned long long* workEstimate = nullptr) {
+		Game exactGame;
+		prepareExactRoot(root, exactGame);
 		actor = root.selectPlayer;
 		initializeHidden(root);
 		root.game->config.manualCoin = true;
 		root.exact.enabled = true;
 		root.exact.actor = (signed char)actor;
 		if (optionIndex < 0 || optionIndex >= (int)root.options.size() || !advance(root, { optionIndex })) return {};
+		if (workEstimate != nullptr) {
+			auto saturatedChoose = [](int n, int k) {
+				if (k < 0 || k > n) return 0ULL;
+				k = std::min(k, n - k);
+				unsigned long long value = 1;
+				for (int i = 1; i <= k; ++i) {
+					const unsigned long long numerator = (unsigned long long)(n - k + i);
+					const unsigned long long divisor = (unsigned long long)i;
+					const unsigned long long common0 = std::gcd(numerator, divisor);
+					const unsigned long long reducedNumerator = numerator / common0;
+					const unsigned long long reducedDivisor = divisor / common0;
+					const unsigned long long common1 = std::gcd(value, reducedDivisor);
+					value /= common1;
+					const unsigned long long tailDivisor = reducedDivisor / common1;
+					if (value > std::numeric_limits<unsigned long long>::max() / reducedNumerator)
+						return std::numeric_limits<unsigned long long>::max();
+					value *= reducedNumerator;
+					value /= tailDivisor;
+				}
+				return value;
+			};
+			unsigned long long estimate = 1;
+			if (root.exact.pending == ExactPendingType::Draw && root.exact.pendingCount > 1) {
+				const int player = root.exact.pendingPlayer;
+				const int available = player >= 0 && player < 2 ? (int)root.players[player].deck.size() : 0;
+				estimate = saturatedChoose(available, root.exact.pendingCount);
+				// Keep an immediate multi-draw strictly ahead of ordinary Main
+				// successors even for a nearly empty deck.
+				if (estimate < 1'000'000ULL) estimate += 1'000'000ULL;
+			} else if (root.exact.pending != ExactPendingType::None) {
+				estimate = 100'000ULL + (unsigned long long)root.exact.pendingCount;
+			} else if (root.selectType == SelectType::Main) {
+				estimate = 1ULL + (unsigned long long)root.options.size();
+			}
+			*workEstimate = estimate;
+		}
 		return keyFor(root);
 	}
 
@@ -518,7 +1130,7 @@ private:
 		std::uint64_t observationSequence = 0;
 	};
 	struct BeliefWorld {
-		std::unique_ptr<State> state;
+		ExactStatePtr state;
 		ExactWeight weight;
 		std::array<ExactKnowledgeState, 2> knowledge;
 	};
@@ -647,15 +1259,18 @@ private:
 		ExactFraction completedUpper = ExactFraction::integer(0);
 		ExactWeight totalWeight, processedWeight, pendingWeight;
 		bool initialized = false, pending = false;
+		unsigned long long pendingExpandedNodes = 0;
 		size_t accountedBytes = 0;
 	};
 	std::unordered_map<int, int> actorProfileCount;
+	std::vector<std::pair<int, int>> actorProfileSorted;
+	std::vector<signed char> actorCardIndexById;
 	std::unordered_map<int, int> opponentProfileCount;
 	std::unordered_map<int, int> handValue;
 	std::uint64_t environmentPriorId = 0;
 	std::shared_ptr<const ExactCpuEvaluator> evaluator;
 	std::chrono::steady_clock::time_point deadline;
-	ExactMetrics metrics;
+	mutable ExactMetrics metrics;
 	int actor = 0;
 	// Two fixed SipHash-2-4 digests index the table; std::string equality still
 	// compares every canonical byte, so a digest collision cannot merge states.
@@ -674,16 +1289,77 @@ private:
 	std::map<std::string, PartialPartitionRevealEntry> partialPartitionReveals;
 	std::map<std::string, PartialMultiDrawEntry> partialMultiDraws;
 	std::unordered_map<std::string, ExactScore, ExactStringHasher> beliefTransposition;
+	// A completed (state, semantic-action) transition is reusable even when the
+	// parent decision node itself was only reached through a different path.
+	// Only certified values enter this cache; partial bounds remain in the
+	// resumable per-node table and can never be mistaken for a complete result.
+	std::unordered_map<std::string, ExactScore, ExactStringHasher> transitionScoreCache;
 	mutable std::unordered_map<std::string, long long, ExactStringHasher> evaluationCache;
 	// Dynamic turn search quotient.  The key retains the complete public
 	// state, semantic search options, and every deck count that can affect a later
 	// query before the turn leaf, while omitting identities proven irrelevant.
 	std::unordered_map<std::string, ExactScore, ExactStringHasher> partitionTurnRevealScores;
 	std::unordered_map<std::string, ExactScore, ExactStringHasher> partitionTurnMainScores;
-	std::unordered_map<std::string, ExactCardPartition, ExactStringHasher> partitionAnalysisCache;
+	struct PartitionDependencyKey {
+		std::array<int, DECK_SIZE> populationId{};
+		std::array<int, DECK_SIZE> populationCount{};
+		std::array<int, DECK_SIZE> reachable{};
+		unsigned char populationSize = 0;
+		unsigned char reachableSize = 0;
+		bool drawContinuationOnly = false;
+		bool earlyTurn = false;
+		bool hasPending = false;
+		int pendingPlayer = 0, pendingSkillId = 0, pendingEffectIndex = 0, pendingDetail = 0;
+		bool operator==(const PartitionDependencyKey& other) const {
+			return populationSize == other.populationSize && reachableSize == other.reachableSize
+				&& drawContinuationOnly == other.drawContinuationOnly && earlyTurn == other.earlyTurn
+				&& hasPending == other.hasPending && pendingPlayer == other.pendingPlayer
+				&& pendingSkillId == other.pendingSkillId && pendingEffectIndex == other.pendingEffectIndex
+				&& pendingDetail == other.pendingDetail
+				&& std::equal(populationId.begin(), populationId.begin() + populationSize, other.populationId.begin())
+				&& std::equal(populationCount.begin(), populationCount.begin() + populationSize, other.populationCount.begin())
+				&& std::equal(reachable.begin(), reachable.begin() + reachableSize, other.reachable.begin());
+		}
+	};
+	struct PartitionDependencyHasher {
+		size_t operator()(const PartitionDependencyKey& key) const noexcept {
+			std::uint64_t hash = 1469598103934665603ULL;
+			auto add = [&](std::uint64_t value) { hash ^= value; hash *= 1099511628211ULL; };
+			add(key.populationSize); add(key.reachableSize); add(key.drawContinuationOnly);
+			add(key.earlyTurn); add(key.hasPending);
+			for (size_t i = 0; i < key.populationSize; ++i) { add((std::uint32_t)key.populationId[i]); add((std::uint32_t)key.populationCount[i]); }
+			for (size_t i = 0; i < key.reachableSize; ++i) add((std::uint32_t)key.reachable[i]);
+			if (key.hasPending) { add((std::uint32_t)key.pendingPlayer); add((std::uint32_t)key.pendingSkillId);
+				add((std::uint32_t)key.pendingEffectIndex); add((std::uint32_t)key.pendingDetail); }
+			return (size_t)hash;
+		}
+	};
+	struct PartitionAnalysis {
+		ExactCardPartition partition;
+		std::string schema;
+		std::vector<int> visibleIds;
+		std::array<signed char, DECK_SIZE> visiblePositionByProfile{};
+		bool compressed = false;
+		PartitionAnalysis() { visiblePositionByProfile.fill(-1); }
+	};
+	std::unordered_map<PartitionDependencyKey, PartitionAnalysis, PartitionDependencyHasher> partitionAnalysisCache;
+	PartitionAnalysis uncachedPartitionAnalysis;
 	std::unordered_map<int, std::vector<long long>> continuationIdentityCache;
+	ExactRuntimeMode runtimeMode = ExactRuntimeMode::Legacy;
+	static constexpr size_t PackedScratchCapacity = 512;
+	mutable std::array<ExactPackedDescriptor, PackedScratchCapacity> packedDescriptors;
+	mutable std::array<std::uint16_t, PackedScratchCapacity> packedOrder{};
+	mutable std::array<ExactPackedDescriptor, 256> packedCardCache;
+	mutable std::array<std::uint64_t, 256> packedCardCacheGeneration{};
+	mutable std::uint64_t packedObservationGeneration = 1;
+	// Index 0 is unused by solveOwned's depth guard. Each active frame owns its
+	// key until it returns; later siblings reuse the retained string capacity.
+	mutable std::array<std::string, 386> partitionKeyScratch;
+	mutable std::unordered_map<std::string, std::string, ExactStringHasher> shadowLegacyToPacked;
+	mutable std::unordered_map<std::string, std::string, ExactStringHasher> shadowPackedToLegacy;
 	size_t beliefTranspositionBytes = 0;
 	static constexpr size_t MaxPolicyEntries = 100'000;
+	static constexpr size_t MaxTransitionCacheEntries = 200'000;
 	static constexpr size_t MaxPolicyBytes = 64ULL * 1024ULL * 1024ULL;
 	static constexpr size_t MaxLocalTranspositionEntries = 250'000;
 	static constexpr size_t MaxLocalTranspositionBytes = 200ULL * 1024ULL * 1024ULL;
@@ -696,6 +1372,10 @@ private:
 	bool canonicalMainEnabled = false;
 	bool reverseActionOrder = false;
 	bool concreteWorldCaching = false;
+	// Enabled only by a future shared-frontier scheduler. Root-parity profiling
+	// showed no simultaneous claims, so allocating a flight record per node is
+	// deliberately not part of the standard cow path yet.
+	bool inFlightClaimsEnabled = false;
 	// Full own-deck reveals produce singleton information sets. Turn sessions may
 	// opt into concreteWorldCaching for large later-turn DAGs; one-shot calls keep
 	// the lower-overhead streaming path.
@@ -721,8 +1401,128 @@ private:
 		return true;
 	}
 
+	static unsigned long long stateDynamicBytes(const State& state) {
+		unsigned long long bytes = sizeof(State);
+		auto add = [&](const auto& list) {
+			bytes += (unsigned long long)list.size()
+				* sizeof(typename std::decay_t<decltype(list)>::value_type);
+		};
+		add(state.options); add(state.selected); add(state.preTargetList); add(state.targetList);
+		add(state.koList); add(state.delayTriggerStack); add(state.temporaryTriggerStack);
+		add(state.triggerStack); add(state.turnUsedSkill); add(state.turnPlay); add(state.turnHeal);
+		add(state.turnEvolve); add(state.functionStack); add(state.logs);
+		return bytes;
+	}
+
+	void stepExact(State& state) {
+		const bool sample = (metrics.engineStepCalls & 1023ULL) == 0;
+		auto started = sample ? std::chrono::steady_clock::now()
+			: std::chrono::steady_clock::time_point{};
+		state.step();
+		metrics.engineStepCalls++;
+		if (sample) metrics.engineStepSampleNs += (unsigned long long)
+			std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now() - started).count();
+	}
+
+	struct HotTimer {
+		unsigned long long& calls;
+		unsigned long long& sampleNs;
+		bool sample;
+		std::chrono::steady_clock::time_point started;
+		HotTimer(unsigned long long& callCounter, unsigned long long& samples)
+			: calls(callCounter), sampleNs(samples), sample((callCounter & 1023ULL) == 0),
+			started(sample ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+		~HotTimer() {
+			calls++;
+			if (sample) sampleNs += (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now() - started).count();
+		}
+	};
+
+	ExactStatePtr cloneState(const State& source) {
+		const bool sample = (metrics.stateCopies & 1023ULL) == 0;
+		auto started = sample ? std::chrono::steady_clock::now()
+			: std::chrono::steady_clock::time_point{};
+		bool allocated = false;
+		ExactStatePool::CopyStats copyStats;
+		// Packed production search uses the pooled bulk restore. On the measured
+		// 24 KiB State prefix it is faster than issuing roughly ninety 256-byte
+		// memcmp calls per edge, despite copying more bytes. Keep conservative
+		// page-COW in shadow mode as an independent restoration audit.
+		const bool packedBulkRestore = runtimeMode == ExactRuntimeMode::Cow;
+		const bool useCow = runtimeMode == ExactRuntimeMode::Shadow;
+		ExactStatePtr result(ExactStatePool::acquire(source, &allocated, useCow,
+			runtimeMode == ExactRuntimeMode::Shadow, &copyStats));
+		metrics.stateCopies++;
+		if (useCow) {
+			metrics.cowPageCopies += copyStats.pageCopies;
+			metrics.cowCopyBytes += copyStats.copiedBytes;
+			if (copyStats.fullCopy) {
+				metrics.cowFullCopies++; metrics.materializedSnapshots++;
+				metrics.cowCopyBytes += stateDynamicBytes(source);
+			}
+			if (copyStats.mismatch) {
+				metrics.mutationMisses++; metrics.informationSetSafe = false;
+			}
+		}
+		if (packedBulkRestore) metrics.cowFullCopies++;
+		// This is an observational counter.  Sample the dynamic-size walk with
+		// the same cadence as the copy timer; search semantics never depend on it.
+		if (sample) {
+			const unsigned long long bytes = stateDynamicBytes(source);
+			if (bytes <= std::numeric_limits<unsigned long long>::max() / 1024ULL
+				&& metrics.stateCopyBytes <= std::numeric_limits<unsigned long long>::max() - bytes * 1024ULL)
+				metrics.stateCopyBytes += bytes * 1024ULL;
+			else metrics.stateCopyBytes = std::numeric_limits<unsigned long long>::max();
+			if (packedBulkRestore) {
+				if (bytes <= std::numeric_limits<unsigned long long>::max() / 1024ULL
+					&& metrics.cowCopyBytes <= std::numeric_limits<unsigned long long>::max() - bytes * 1024ULL)
+					metrics.cowCopyBytes += bytes * 1024ULL;
+				else metrics.cowCopyBytes = std::numeric_limits<unsigned long long>::max();
+			}
+		}
+		if (allocated) metrics.heapAllocations++; else metrics.statePoolReuses++;
+		if (sample) metrics.stateCopySampleNs += (unsigned long long)
+			std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now() - started).count();
+		return result;
+	}
+
+	bool sharedFind(const std::string& key, ExactScore& value, size_t* computedHash = nullptr) {
+		const bool sample = ((metrics.ttReadHits + metrics.ttReadMisses) & 1023ULL) == 0;
+		auto started = sample ? std::chrono::steady_clock::now()
+			: std::chrono::steady_clock::time_point{};
+		bool found = transposition != nullptr && transposition->find(key, value, computedHash);
+		if (sample) metrics.ttReadSampleNs += (unsigned long long)
+			std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now() - started).count();
+		if (transposition != nullptr) metrics.arenaBytes = transposition->arenaBytes();
+		if (found) metrics.ttReadHits++; else metrics.ttReadMisses++;
+		return found;
+	}
+
+	bool sharedStore(std::string key, const ExactScore& value, const size_t* computedHash = nullptr) {
+		if (transposition == nullptr) return false;
+		bool inserted = computedHash == nullptr
+			? transposition->store(std::move(key), value)
+			: transposition->storeHashed(std::move(key), value, *computedHash);
+		metrics.arenaBytes = transposition->arenaBytes();
+		if (inserted) metrics.ttInsertions++;
+		return inserted;
+	}
+
 	std::string keyFor(const State& input) const {
-		return ExactCanonicalState::Build(input);
+		const bool sample = (metrics.canonicalBuilds & 1023ULL) == 0;
+		auto started = sample ? std::chrono::steady_clock::now()
+			: std::chrono::steady_clock::time_point{};
+		std::string result = ExactCanonicalState::Build(input);
+		metrics.canonicalBuilds++;
+		metrics.canonicalBytes += result.size();
+		if (sample) metrics.canonicalSampleNs += (unsigned long long)
+			std::chrono::duration_cast<std::chrono::nanoseconds>(
+				std::chrono::steady_clock::now() - started).count();
+		return result;
 	}
 
 	static bool targetIncludesDeck(const Target& target) {
@@ -769,9 +1569,9 @@ private:
 			key.reserve(model.size() + 96);
 			for (std::int16_t value : model) key.push_back(value);
 		} else key.push_back(cardId);
-		auto found = CardTable.find(cardId);
-		if (found == CardTable.end()) { key.push_back(cardId); continuationIdentityCache[cardId] = key; return key; }
-		const CardMaster& card = found->second;
+		const CardMaster* found = FindCardMaster(cardId);
+		if (found == nullptr) { key.push_back(cardId); continuationIdentityCache[cardId] = key; return key; }
+		const CardMaster& card = *found;
 		key.push_back((int)card.cardType); key.push_back((int)card.pokemonType);
 		key.push_back((int)card.evolutionType); key.push_back((int)card.energyType);
 		key.push_back(card.energyCount); key.push_back(card.hp);
@@ -793,18 +1593,36 @@ private:
 		continuationIdentityCache[cardId] = key; return key;
 	}
 
-	ExactCardPartition turnDependencyPartition(const State& state,
+	const PartitionAnalysis& turnDependencyPartition(const State& state,
 		const ExactHiddenState* pending = nullptr, bool drawContinuationOnly = false) {
-		std::vector<ExactCardAtom> population;
-		for (int i = 0; i < state.exact.typeCount[actor]; ++i)
-			if (state.exact.cardCount[actor][i] > 0)
-				population.push_back({ state.exact.cardId[actor][i], state.exact.cardCount[actor][i] });
-		ExactCardPartition partition(population);
-		std::set<int> reachable;
+		PartitionDependencyKey dependencyKey;
+		dependencyKey.drawContinuationOnly = drawContinuationOnly;
+		dependencyKey.earlyTurn = state.turn <= 2;
+		for (int i = 0; i < state.exact.typeCount[actor]; ++i) {
+			if (state.exact.cardCount[actor][i] <= 0) continue;
+			if (dependencyKey.populationSize >= DECK_SIZE) throw std::length_error("partition population overflow");
+			const size_t index = dependencyKey.populationSize++;
+			dependencyKey.populationId[index] = state.exact.cardId[actor][i];
+			dependencyKey.populationCount[index] = state.exact.cardCount[actor][i];
+		}
+		// The dependency set is tiny (bounded by the fixed deck).  A sorted flat
+		// array avoids allocations while preserving the exact lexical order.
+		auto addReachable = [&](int id) {
+			auto begin = dependencyKey.reachable.begin();
+			auto end = begin + dependencyKey.reachableSize;
+			auto pos = std::lower_bound(begin, end, id);
+			if (pos != end && *pos == id) return;
+			if (dependencyKey.reachableSize >= DECK_SIZE) throw std::length_error("partition reachable overflow");
+			std::move_backward(pos, end, end + 1); *pos = id; dependencyKey.reachableSize++;
+		};
+		auto hasReachable = [&](int id) {
+			return std::binary_search(dependencyKey.reachable.begin(),
+				dependencyKey.reachable.begin() + dependencyKey.reachableSize, id);
+		};
 		auto addRef = [&](AreaType area, int index) {
 			try {
 				CardRef ref = state.getCardRef(area, index, actor);
-				if (!ref.isNull()) reachable.insert(state.getCard(ref).cardId);
+				if (!ref.isNull()) addReachable(state.getCard(ref).cardId);
 			} catch (...) {}
 		};
 		// Seed from every owned card that can already act or can become playable
@@ -818,7 +1636,7 @@ private:
 			case SelectOptionType::Ability: addRef((AreaType)option.param0, option.param1); break;
 			case SelectOptionType::Skill: {
 				auto skill = SkillTable.find(option.param0);
-				if (skill != SkillTable.end()) reachable.insert(skill->second.cardId);
+				if (skill != SkillTable.end()) addReachable(skill->second.cardId);
 				break;
 			}
 			default: break;
@@ -826,25 +1644,25 @@ private:
 		}
 		for (CardRef ref : state.players[actor].hand) if (!ref.isNull()) {
 			int cardId = state.getCard(ref).cardId;
-			auto master = CardTable.find(cardId);
-			if (master == CardTable.end()) { reachable.insert(cardId); continue; }
+			const CardMaster* master = FindCardMaster(cardId);
+			if (master == nullptr) { addReachable(cardId); continue; }
 			// Once the once-per-turn attachment has been consumed, an Energy
 			// subsequently exposed by a search/draw cannot become an operator this
 			// turn. Treating Enriching Energy as reachable here forced every deck
 			// identity to split solely because its attach effect draws four cards.
-			if (state.energyPlayed && IsEnergy(master->second.cardType)) continue;
-			if (state.stadiumPlayed && master->second.cardType == CardType::Stadium) continue;
+			if (state.energyPlayed && IsEnergy(master->cardType)) continue;
+			if (state.stadiumPlayed && master->cardType == CardType::Stadium) continue;
 			// A Supporter absent from the legal option list cannot become legal
 			// later in the same turn (first-turn prohibition or already used).
 			// Evolution cards are likewise unreachable during either player's
 			// first turn unless the engine already exposed a legal effect option.
 			bool firstTurnEvolution = state.turn <= 2
-				&& (master->second.evolutionType == EvolutionType::Stage1
-					|| master->second.evolutionType == EvolutionType::Stage2);
+				&& (master->evolutionType == EvolutionType::Stage1
+					|| master->evolutionType == EvolutionType::Stage2);
 			// Other cards may become legal after a bench/target/stadium change.
-			if ((!firstTurnEvolution && master->second.cardType != CardType::Supporter)
-				|| reachable.contains(cardId))
-				reachable.insert(cardId);
+			if ((!firstTurnEvolution && master->cardType != CardType::Supporter)
+				|| hasReachable(cardId))
+				addReachable(cardId);
 		}
 		// A draw reveals the concrete card to its owner. Any card which could become
 		// a legal operator later in this turn must therefore be an identity-visible
@@ -853,10 +1671,11 @@ private:
 		// offered different actions after being drawn.
 		if (drawContinuationOnly) {
 			const PlayerState& player = state.players[actor];
-			for (const ExactCardAtom& atom : population) {
-				auto found = CardTable.find(atom.cardId);
-				if (found == CardTable.end()) { reachable.insert(atom.cardId); continue; }
-				const CardMaster& card = found->second;
+			for (size_t atomIndex = 0; atomIndex < dependencyKey.populationSize; ++atomIndex) {
+				const int atomCardId = dependencyKey.populationId[atomIndex];
+				const CardMaster* found = FindCardMaster(atomCardId);
+				if (found == nullptr) { addReachable(atomCardId); continue; }
+				const CardMaster& card = *found;
 				bool exhausted = IsEnergy(card.cardType) && state.energyPlayed;
 				exhausted = exhausted || (card.cardType == CardType::Supporter
 					&& (state.supporterPlayed || player.thisTurn.cannotPlaySupporter
@@ -864,38 +1683,42 @@ private:
 				exhausted = exhausted || (card.cardType == CardType::Stadium
 					&& (state.stadiumPlayed || player.cannotPlayStadium
 						|| player.thisTurn.cannotPlayStadium));
-				if (!exhausted) reachable.insert(atom.cardId);
+				if (!exhausted) addReachable(atomCardId);
 			}
 		}
-		std::string dependencyKey = "TURN-DEPENDENCY-V1|";
-		appendSemantic(dependencyKey, drawContinuationOnly ? 1 : 0);
-		appendSemantic(dependencyKey, state.turn <= 2 ? 1 : 0);
-		for (const ExactCardAtom& atom : population) {
-			appendSemantic(dependencyKey, atom.cardId); appendSemantic(dependencyKey, atom.count);
-		}
-		for (int id : reachable) appendSemantic(dependencyKey, id);
+		dependencyKey.hasPending = pending != nullptr;
 		if (pending != nullptr) {
-			appendSemantic(dependencyKey, pending->pendingPlayer);
-			appendSemantic(dependencyKey, pending->pendingSkillId);
-			appendSemantic(dependencyKey, pending->pendingEffectIndex);
-			appendSemantic(dependencyKey, pending->pendingDetail);
+			dependencyKey.pendingPlayer = pending->pendingPlayer;
+			dependencyKey.pendingSkillId = pending->pendingSkillId;
+			dependencyKey.pendingEffectIndex = pending->pendingEffectIndex;
+			dependencyKey.pendingDetail = pending->pendingDetail;
 		}
-		auto cachedPartition = partitionAnalysisCache.find(dependencyKey);
+		PartitionDependencyKey cacheKey = dependencyKey;
+		auto cachedPartition = partitionAnalysisCache.find(cacheKey);
 		if (cachedPartition != partitionAnalysisCache.end()) {
 			metrics.dynamicPartitionCacheHits++;
 			return cachedPartition->second;
 		}
+		std::vector<ExactCardAtom> population;
+		population.reserve(dependencyKey.populationSize);
+		for (size_t i = 0; i < dependencyKey.populationSize; ++i)
+			population.push_back({ dependencyKey.populationId[i], dependencyKey.populationCount[i] });
+		ExactCardPartition partition(population);
 
 		bool exposeAll = false;
 		int dependencyCardId = 0;
 		int dependencyEffectType = 0;
 		auto applyTarget = [&](const Target& target) {
 			if (!targetIncludesDeck(target)) return;
-			std::set<int> matching;
+			std::vector<int> matching;
+			auto addMatching = [&](int id) {
+				auto pos = std::lower_bound(matching.begin(), matching.end(), id);
+				if (pos == matching.end() || *pos != id) matching.insert(pos, id);
+			};
 			for (const ExactCardAtom& atom : population) {
-				auto master = CardTable.find(atom.cardId);
-				if (master == CardTable.end()) { exposeAll = true; return; }
-				ExactStaticTargetResult result = ExactStaticTargetMatches(master->second, target);
+				const CardMaster* master = FindCardMaster(atom.cardId);
+				if (master == nullptr) { exposeAll = true; return; }
+				ExactStaticTargetResult result = ExactStaticTargetMatches(*master, target);
 				if (!result.supported) {
 					exposeAll = true;
 					metrics.dynamicPartitionFallbackCardId = dependencyCardId;
@@ -903,18 +1726,18 @@ private:
 					metrics.dynamicPartitionFallbackTargetType = (int)target.conditions.front().targetType;
 					return;
 				}
-				if (result.matches) matching.insert(atom.cardId);
+				if (result.matches) addMatching(atom.cardId);
 			}
-			partition.refineVisible([&](int cardId) { return matching.contains(cardId); });
+			partition.refineVisible([&](int cardId) { return std::binary_search(matching.begin(), matching.end(), cardId); });
 			for (int cardId : matching) {
-				auto master = CardTable.find(cardId);
-				if (master == CardTable.end()) { exposeAll = true; return; }
+				const CardMaster* master = FindCardMaster(cardId);
+				if (master == nullptr) { exposeAll = true; return; }
 				// Neither player can evolve during their first turn.  A searched
 				// evolution card is observable (and remains a singleton class), but
 				// its evolve-time Skill is not a reachable operator this turn.
-				if (state.turn <= 2 && (master->second.evolutionType == EvolutionType::Stage1
-					|| master->second.evolutionType == EvolutionType::Stage2)) continue;
-				reachable.insert(cardId);
+				if (state.turn <= 2 && (master->evolutionType == EvolutionType::Stage1
+					|| master->evolutionType == EvolutionType::Stage2)) continue;
+				addReachable(cardId);
 			}
 		};
 
@@ -928,15 +1751,22 @@ private:
 			}
 		}
 
-		std::set<int> scanned;
+		std::vector<int> scanned;
 		while (!exposeAll) {
-			auto next = std::find_if(reachable.begin(), reachable.end(), [&](int id) { return !scanned.contains(id); });
-			if (next == reachable.end()) break;
-			int id = *next; scanned.insert(id);
+			auto reachableBegin = dependencyKey.reachable.begin();
+			auto reachableEnd = reachableBegin + dependencyKey.reachableSize;
+			auto next = std::find_if(reachableBegin, reachableEnd, [&](int id) {
+				return !std::binary_search(scanned.begin(), scanned.end(), id);
+			});
+			if (next == reachableEnd) break;
+			int id = *next;
+			if (!std::binary_search(scanned.begin(), scanned.end(), id)) {
+				scanned.insert(std::lower_bound(scanned.begin(), scanned.end(), id), id);
+			}
 			dependencyCardId = id;
-			auto master = CardTable.find(id);
-			if (master == CardTable.end()) { exposeAll = true; break; }
-			for (const Skill* skill : master->second.getSkills()) if (skill != nullptr) {
+			const CardMaster* master = FindCardMaster(id);
+			if (master == nullptr) { exposeAll = true; break; }
+			for (const Skill* skill : master->getSkills()) if (skill != nullptr) {
 				for (const Effect& effect : skill->effects) {
 					dependencyEffectType = (int)effect.effectType;
 					bool arbitraryIdentity = exposesArbitraryDeckIdentity(effect.effectType);
@@ -961,7 +1791,7 @@ private:
 		}
 		if (exposeAll) partition.exposeAllIdentities();
 		else if (drawContinuationOnly) {
-			partition.refineVisible([&](int cardId) { return reachable.contains(cardId); });
+			partition.refineVisible([&](int cardId) { return hasReachable(cardId); });
 			partition.refineEquivalent([&](int cardId) {
 				// With no model loaded, retain card identity. Structural zero-evaluator
 				// tests are not allowed to weaken the certified model equivalence rule.
@@ -973,26 +1803,81 @@ private:
 			metrics.dynamicPartitionMaxClasses, partition.classes().size());
 		metrics.dynamicPartitionMaxVisibleIdentities = std::max<unsigned long long>(
 			metrics.dynamicPartitionMaxVisibleIdentities, partition.visibleCardIds().size());
-		if (!partition.hasCompressedClass()) metrics.dynamicPartitionFallbacks++;
-		if (partitionAnalysisCache.size() < 16'384)
-			partitionAnalysisCache.emplace(std::move(dependencyKey), partition);
-		return partition;
+		PartitionAnalysis analysis;
+		analysis.compressed = partition.hasCompressedClass();
+		if (!analysis.compressed) metrics.dynamicPartitionFallbacks++;
+		analysis.schema = partition.schemaKey();
+		analysis.visibleIds = partition.visibleCardIds();
+		for (size_t visibleIndex = 0; visibleIndex < analysis.visibleIds.size(); ++visibleIndex) {
+			const int id = analysis.visibleIds[visibleIndex];
+			if (id < 0 || (size_t)id >= actorCardIndexById.size()) continue;
+			const int profileIndex = actorCardIndexById[(size_t)id];
+			if (profileIndex >= 0) analysis.visiblePositionByProfile[(size_t)profileIndex] = (signed char)visibleIndex;
+		}
+		analysis.partition = std::move(partition);
+		if (partitionAnalysisCache.size() < 16'384) {
+			auto inserted = partitionAnalysisCache.emplace(std::move(cacheKey), std::move(analysis));
+			return inserted.first->second;
+		}
+		uncachedPartitionAnalysis = std::move(analysis);
+		return uncachedPartitionAnalysis;
 	}
 
-	std::string partitionTurnMainKey(const State& state) {
+	// The dynamic-turn key is built at virtually every Rich continuation node.
+	// Keep one owning buffer per active recursion depth: a parent key must remain
+	// stable while its children run, but siblings at the same depth can reuse the
+	// same allocation. This removes a heap allocation/copy on every TT probe
+	// without changing a single key byte or the collision-safe equality check.
+	const std::string* partitionTurnMainKey(const State& state) {
+		HotTimer timer(metrics.partitionKeyCalls, metrics.partitionKeySampleNs);
 		if (!singletonRevealStreaming || state.selectPlayer != actor
-			|| state.selectType != SelectType::Main || state.exact.deckUnknown[actor]) return {};
-		ExactCardPartition partition = turnDependencyPartition(state);
-		if (!partition.hasCompressedClass()) return {};
-		std::string key = "DYNAMIC-TURN-MAIN\x1f" + partition.schemaKey();
-		key += observationKeyFor(state, actor, nullptr, false);
-		for (int id : partition.visibleCardIds()) {
-			int count = 0;
-			for (CardRef ref : state.players[actor].deck)
-				if (!ref.isNull() && state.getCard(ref).cardId == id) count++;
-			appendSemantic(key, id); appendSemantic(key, count);
+			|| state.selectType != SelectType::Main || state.exact.deckUnknown[actor]) return nullptr;
+		const PartitionAnalysis& analysis = turnDependencyPartition(state);
+		if (!analysis.compressed) return nullptr;
+		// Count the concrete deck once.  The old implementation rescanned all
+		// deck cards for every visible class, which was measurable on the Rich
+		// Energy continuation (hundreds of thousands of calls).  The fixed array
+		// is stack-only and the sorted visible IDs preserve the exact key order.
+		const auto& visible = analysis.visibleIds;
+		std::array<int, DECK_SIZE> visibleCounts{};
+		for (CardRef ref : state.players[actor].deck) {
+			if (ref.isNull()) continue;
+			int id = state.getCard(ref).cardId;
+			if (id < 0 || (size_t)id >= actorCardIndexById.size()) continue;
+			const int profileIndex = actorCardIndexById[(size_t)id];
+			if (profileIndex < 0) continue;
+			const int visibleIndex = analysis.visiblePositionByProfile[(size_t)profileIndex];
+			if (visibleIndex >= 0) visibleCounts[(size_t)visibleIndex]++;
 		}
-		return key;
+		if ((size_t)recursionDepth >= partitionKeyScratch.size())
+			throw std::length_error("partition key recursion depth overflow");
+		std::string& key = partitionKeyScratch[(size_t)recursionDepth];
+		if (runtimeMode == ExactRuntimeMode::Cow) {
+			ExactPackedKeyWriter writer;
+			writer.bytes.swap(key);
+			writer.bytes.clear();
+			writer.bytes.reserve(64 + analysis.schema.size() + 512 + visible.size() * 8);
+			writer.bytes.append("PTM3", 4);
+			writer.u64(transposition->internExactComponent(analysis.schema));
+			{
+				HotTimer observationTimer(metrics.observationKeyCalls, metrics.observationKeySampleNs);
+				appendPackedObservationKey(writer, state, actor, nullptr, false);
+			}
+			writer.u32((std::uint32_t)visible.size());
+			for (size_t i = 0; i < visible.size(); ++i) {
+				writer.i32(visible[i]); writer.i32(visibleCounts[i]);
+			}
+			key.swap(writer.bytes);
+			return &key;
+		}
+		key.clear();
+		key.reserve(64 + analysis.schema.size() + 512 + visible.size() * 16);
+		key = "DYNAMIC-TURN-MAIN\x1f"; key += analysis.schema;
+		key += observationKeyFor(state, actor, nullptr, false);
+		for (size_t i = 0; i < visible.size(); ++i) {
+			appendSemantic(key, visible[i]); appendSemantic(key, visibleCounts[i]);
+		}
+		return &key;
 	}
 
 	PartialDecisionEntry* partialDecisionFor(const std::string& key) {
@@ -1071,6 +1956,7 @@ private:
 		appendSemantic(out, list.size());
 		if (hidden) return;
 		std::vector<std::string> tokens;
+		tokens.reserve(list.size());
 		for (CardRef ref : list) tokens.push_back(cardToken(state, ref, pokemon));
 		if (unordered) std::sort(tokens.begin(), tokens.end());
 		for (const std::string& token : tokens) {
@@ -1115,7 +2001,7 @@ private:
 		return token;
 	}
 
-	std::string observationKeyFor(const State& state, int requestedObserver = -1,
+	std::string legacyObservationKeyFor(const State& state, int requestedObserver = -1,
 		const ExactKnowledgeState* knowledge = nullptr, bool includeKnownDeck = true) const {
 		const int observer = requestedObserver >= 0 ? requestedObserver : state.selectPlayer;
 		std::string key;
@@ -1143,6 +2029,7 @@ private:
 			appendSemantic(key, ps.burned ? 1 : 0);
 		}
 		std::vector<std::string> options;
+		options.reserve(state.options.size());
 		for (const SelectOption& option : state.options) options.push_back(optionSemanticToken(state, option));
 		std::sort(options.begin(), options.end());
 		for (const std::string& option : options) { appendSemantic(key, (long long)option.size()); key += option; }
@@ -1152,9 +2039,241 @@ private:
 		return key;
 	}
 
-	std::vector<std::string> semanticAction(const State& state, const std::vector<int>& action) const {
+	static void appendPackedKnowledge(ExactPackedKeyWriter& writer, const ExactKnowledgeState& knowledge) {
+		for (bool known : knowledge.deckKnown) writer.u8(known ? 1 : 0);
+		writer.u64(knowledge.observationSequence);
+		writer.blob(knowledge.publicFacts);
+		auto appendSequence = [&](const auto& lists) {
+			for (const auto& list : lists) {
+				writer.u32((std::uint32_t)list.size());
+				for (int id : list) writer.i32(id);
+			}
+		};
+		auto appendMapArray = [&](const auto& maps) {
+			for (const auto& values : maps) {
+				writer.u32((std::uint32_t)values.size());
+				for (const auto& item : values) {
+					writer.i32(item.first);
+					if constexpr (std::is_same_v<std::decay_t<decltype(item.second)>, std::pair<int, int>>) {
+						writer.i32(item.second.first); writer.i32(item.second.second);
+					} else writer.i32(item.second);
+				}
+			}
+		};
+		appendSequence(knowledge.knownTop); appendSequence(knowledge.knownBottom);
+		appendMapArray(knowledge.knownDeckCounts); appendMapArray(knowledge.knownPrizeCounts);
+		appendMapArray(knowledge.countBounds);
+	}
+
+	void packedCardDescriptor(const State& state, CardRef ref, bool pokemon,
+		ExactPackedDescriptor& descriptor) const {
+		descriptor.clear();
+		if (ref.isNull()) { descriptor.add(-1); return; }
+		const size_t cacheIndex = (size_t)ref.cardIndex + (pokemon ? 128ULL : 0ULL);
+		if (packedCardCacheGeneration[cacheIndex] == packedObservationGeneration) {
+			descriptor.assign(packedCardCache[cacheIndex]); return;
+		}
+		ExactPackedDescriptor& cached = packedCardCache[cacheIndex];
+		cached.clear();
+		const Card& card = state.getCard(ref);
+		cached.add(card.cardId); cached.add(card.playerIndex);
+		if (!pokemon) {
+			packedCardCacheGeneration[cacheIndex] = packedObservationGeneration;
+			descriptor.assign(cached); return;
+		}
+		cached.add(state.getHp(card)); cached.add(state.getMaxHp(card));
+		cached.add(card.appear ? 1 : 0);
+
+		auto& energyTypes = state.game->energyList;
+		state.getEnergies(card.playerIndex, ref, energyTypes);
+		std::array<int, DECK_SIZE * 2> types{};
+		if (energyTypes.size() > types.size()) throw std::length_error("packed energy type overflow");
+		size_t typeCount = 0;
+		for (EnergyType type : energyTypes) types[typeCount++] = EnergyTypeIndex(type);
+		std::sort(types.begin(), types.begin() + typeCount);
+		cached.add((int)typeCount);
+		for (size_t i = 0; i < typeCount; ++i) cached.add(types[i]);
+
+		std::array<int, DECK_SIZE * 3> attachments{};
+		size_t attachmentCount = 0;
+		auto appendAttachment = [&](int id) {
+			if (attachmentCount >= attachments.size()) throw std::length_error("packed attachment overflow");
+			attachments[attachmentCount++] = id;
+		};
+		auto& cards = state.game->cardList;
+		state.getEnergyCards(ref, cards);
+		for (CardRef child : cards) appendAttachment(state.getCard(child).cardId);
+		for (CardRef child : state.getAttachedToolRef(card)) appendAttachment(state.getCard(child).cardId + 100000);
+		for (CardRef child : state.getPreEvolutions(card)) appendAttachment(state.getCard(child).cardId + 200000);
+		std::sort(attachments.begin(), attachments.begin() + attachmentCount);
+		cached.add((int)attachmentCount);
+		for (size_t i = 0; i < attachmentCount; ++i) cached.add(attachments[i]);
+		packedCardCacheGeneration[cacheIndex] = packedObservationGeneration;
+		descriptor.assign(cached);
+	}
+
+	template<class List>
+	void appendPackedCardList(ExactPackedKeyWriter& writer, const State& state, const List& list,
+		bool pokemon, bool unordered, bool hidden) const {
+		writer.u32((std::uint32_t)list.size());
+		if (hidden) return;
+		if (list.size() > PackedScratchCapacity) throw std::length_error("packed card list overflow");
+		if (!pokemon) {
+			struct CompactCardToken {
+				int marker, cardId, player;
+				bool operator<(const CompactCardToken& other) const {
+					if (marker != other.marker) return marker < other.marker;
+					if (cardId != other.cardId) return cardId < other.cardId;
+					return player < other.player;
+				}
+			};
+			std::array<CompactCardToken, PackedScratchCapacity> tokens;
+			size_t count = 0;
+			for (CardRef ref : list) {
+				CompactCardToken& token = tokens[count++];
+				if (ref.isNull()) { token.marker = token.cardId = token.player = 0; continue; }
+				const Card& card = state.getCard(ref);
+				token.marker = 1; token.cardId = card.cardId; token.player = card.playerIndex;
+			}
+			if (unordered) std::sort(tokens.begin(), tokens.begin() + count);
+			for (size_t i = 0; i < count; ++i) {
+				writer.u8((unsigned char)tokens[i].marker);
+				if (tokens[i].marker) { writer.i32(tokens[i].cardId); writer.i32(tokens[i].player); }
+			}
+			return;
+		}
+		size_t count = 0;
+		for (CardRef ref : list) {
+			packedCardDescriptor(state, ref, pokemon, packedDescriptors[count]);
+			packedOrder[count] = (std::uint16_t)count; count++;
+		}
+		if (unordered) std::sort(packedOrder.begin(), packedOrder.begin() + count,
+			[&](std::uint16_t lhs, std::uint16_t rhs) { return packedDescriptors[lhs] < packedDescriptors[rhs]; });
+		for (size_t i = 0; i < count; ++i) packedDescriptors[packedOrder[i]].write(writer);
+	}
+
+	void packedOptionDescriptor(const State& state, const SelectOption& option,
+		ExactPackedDescriptor& descriptor) const {
+		descriptor.clear(); descriptor.add((int)option.type);
+		auto appendPosition = [&](AreaType area, int index, int player) {
+			descriptor.add((int)area); descriptor.add(player);
+			try {
+				ExactPackedDescriptor card;
+				packedCardDescriptor(state, state.getCardRef(area, index, player),
+					area == AreaType::Active || area == AreaType::Bench, card);
+				descriptor.append(card);
+			} catch (...) { descriptor.add(index); }
+		};
+		switch (option.type) {
+		case SelectOptionType::Card:
+		case SelectOptionType::ToolCard:
+		case SelectOptionType::EnergyCard:
+		case SelectOptionType::Energy:
+			appendPosition((AreaType)option.param0, option.param1, option.param2);
+			descriptor.add(option.param3); descriptor.add(option.param4); break;
+		case SelectOptionType::Play:
+			appendPosition(AreaType::Hand, option.param0, state.selectPlayer); break;
+		case SelectOptionType::Attach:
+		case SelectOptionType::Evolve:
+			appendPosition((AreaType)option.param0, option.param1, state.selectPlayer);
+			appendPosition((AreaType)option.param2, option.param3, state.selectPlayer); break;
+		case SelectOptionType::Ability:
+		case SelectOptionType::Discard:
+			appendPosition((AreaType)option.param0, option.param1, state.selectPlayer); break;
+		case SelectOptionType::Skill:
+			descriptor.add(option.param0); break;
+		default:
+			descriptor.add(option.param0); descriptor.add(option.param1); descriptor.add(option.param2);
+			descriptor.add(option.param3); descriptor.add(option.param4); break;
+		}
+	}
+
+	void appendPackedObservationKey(ExactPackedKeyWriter& writer, const State& state, int requestedObserver,
+		const ExactKnowledgeState* knowledge, bool includeKnownDeck) const {
+		const int observer = requestedObserver >= 0 ? requestedObserver : state.selectPlayer;
+		if (++packedObservationGeneration == 0) {
+			packedCardCacheGeneration.fill(0); packedObservationGeneration = 1;
+		}
+		const size_t observationBegin = writer.bytes.size();
+		writer.bytes.append("OBS3", 4);
+		writer.i32(state.turn); writer.i32(state.turnActionCount);
+		writer.i32((int)state.phase); writer.i32((int)state.gameResult);
+		writer.i32(state.firstPlayer); writer.i32(state.turnState);
+		writer.i32((int)state.selectType); writer.i32((int)state.selectContext);
+		writer.i32(state.selectPlayer); writer.i32(state.selectMin); writer.i32(state.selectMax);
+		writer.i32(state.remainDamageCounter); writer.i32(state.remainEnergyCost);
+		appendPackedCardList(writer, state, state.stadium, false, true, false);
+		for (int player = 0; player < 2; ++player) {
+			const PlayerState& ps = state.players[player];
+			appendPackedCardList(writer, state, ps.active, true, false, false);
+			appendPackedCardList(writer, state, ps.bench, true, true, false);
+			writer.i32(state.benchCapacity(player));
+			appendPackedCardList(writer, state, ps.trash, false, true, false);
+			appendPackedCardList(writer, state, ps.prize, false, true, true);
+			appendPackedCardList(writer, state, ps.hand, false, true, player != observer);
+			writer.u32((std::uint32_t)ps.deck.size());
+			if (includeKnownDeck && ((state.selectDeck && state.selectPlayer == observer && player == observer)
+				|| (knowledge != nullptr && knowledge->deckKnown[player])))
+				appendPackedCardList(writer, state, ps.deck, false, true, false);
+			writer.i32(ps.poisonDamageCounter); writer.i32((int)ps.badStatus); writer.u8(ps.burned ? 1 : 0);
+		}
+		if (state.options.size() > PackedScratchCapacity) throw std::length_error("packed option list overflow");
+		writer.u32((std::uint32_t)state.options.size());
+		for (size_t i = 0; i < state.options.size(); ++i) {
+			packedOptionDescriptor(state, state.options[i], packedDescriptors[i]);
+			packedOrder[i] = (std::uint16_t)i;
+		}
+		std::sort(packedOrder.begin(), packedOrder.begin() + state.options.size(),
+			[&](std::uint16_t lhs, std::uint16_t rhs) { return packedDescriptors[lhs] < packedDescriptors[rhs]; });
+		for (size_t i = 0; i < state.options.size(); ++i) packedDescriptors[packedOrder[i]].write(writer);
+		writer.u8(state.contextCard.isNull() ? 0 : 1);
+		if (!state.contextCard.isNull()) { ExactPackedDescriptor card; packedCardDescriptor(state, state.contextCard, false, card); card.write(writer); }
+		writer.u8(state.onEffect() ? 1 : 0);
+		if (state.onEffect()) { ExactPackedDescriptor card; packedCardDescriptor(state, state.getEffectCard().card, false, card); card.write(writer); }
+		writer.u8(knowledge == nullptr ? 0 : 1);
+		if (knowledge != nullptr) appendPackedKnowledge(writer, *knowledge);
+		metrics.packedObservationBuilds++;
+		metrics.packedObservationBytes += writer.bytes.size() - observationBegin;
+	}
+
+	std::string packedObservationKeyFor(const State& state, int requestedObserver,
+		const ExactKnowledgeState* knowledge, bool includeKnownDeck) const {
+		ExactPackedKeyWriter writer;
+		appendPackedObservationKey(writer, state, requestedObserver, knowledge, includeKnownDeck);
+		return std::move(writer.bytes);
+	}
+
+	void auditObservationKeyPair(const std::string& legacy, const std::string& packed) const {
+		static constexpr size_t ShadowPairLimit = 100'000;
+		auto audit = [&](auto& table, const std::string& first, const std::string& second) {
+			auto found = table.find(first);
+			if (found != table.end()) {
+				if (found->second != second) {
+					metrics.legacyShadowMismatches++; metrics.informationSetSafe = false;
+				}
+			} else if (table.size() < ShadowPairLimit) table.emplace(first, second);
+		};
+		audit(shadowLegacyToPacked, legacy, packed);
+		audit(shadowPackedToLegacy, packed, legacy);
+	}
+
+	std::string observationKeyFor(const State& state, int requestedObserver = -1,
+		const ExactKnowledgeState* knowledge = nullptr, bool includeKnownDeck = true) const {
+		HotTimer timer(metrics.observationKeyCalls, metrics.observationKeySampleNs);
+		if (runtimeMode == ExactRuntimeMode::Legacy)
+			return legacyObservationKeyFor(state, requestedObserver, knowledge, includeKnownDeck);
+		std::string packed = packedObservationKeyFor(state, requestedObserver, knowledge, includeKnownDeck);
+		if (runtimeMode == ExactRuntimeMode::Cow) return packed;
+		std::string legacy = legacyObservationKeyFor(state, requestedObserver, knowledge, includeKnownDeck);
+		auditObservationKeyPair(legacy, packed);
+		return legacy;
+	}
+
+	template<class Action>
+	std::vector<std::string> semanticAction(const State& state, const Action& action) const {
 		std::vector<std::string> tokens;
-		for (int index : action) tokens.push_back(optionSemanticToken(state, state.options.at(index)));
+		for (size_t i = 0; i < action.size(); ++i)
+			tokens.push_back(optionSemanticToken(state, state.options.at(action[i])));
 		std::sort(tokens.begin(), tokens.end());
 		return tokens;
 	}
@@ -1188,7 +2307,8 @@ private:
 		}
 		policyBytes += bytes; bucket.push_back(std::move(entry));
 		metrics.policyNodes++; metrics.sessionBytes = transposition->bytes() + localTranspositionBytes
-			+ policyBytes + partialBytes + beliefTranspositionBytes + evaluationCache.size() * 128ULL;
+			+ policyBytes + partialBytes + beliefTranspositionBytes + evaluationCache.size() * 128ULL
+			+ transitionScoreCache.size() * 128ULL;
 	}
 
 	void initializeHidden(State& state) {
@@ -1219,16 +2339,46 @@ private:
 	}
 
 	long long evaluate(const State& state) {
+		HotTimer timer(metrics.evaluatorCalls, metrics.evaluatorSampleNs);
 		if (state.isFinish()) {
 			int winner = state.winPlayer();
 			return winner == actor ? 100'000'000 : (winner == 2 ? 0 : -100'000'000);
 		}
 		if (evaluator && evaluator->isLoaded()) {
-			auto features = ExactSparseEvaluatorV3::extractFeatures(state, actor, &actorProfileCount);
+			auto extractStarted = timer.sample ? std::chrono::steady_clock::now()
+				: std::chrono::steady_clock::time_point{};
+			ExactSparseEvaluatorV3::ExtractTiming extractTiming;
+			static thread_local ExactSparseEvaluatorV3::FeatureRecord features;
+			ExactSparseEvaluatorV3::extractFeaturesInto(features, state, actor, &actorProfileCount,
+				nullptr, &metrics.evaluatorCacheHits, timer.sample ? &extractTiming : nullptr,
+				&actorProfileSorted, false);
+			if (timer.sample) {
+				metrics.evaluatorPublicSampleNs += extractTiming.publicNs;
+				metrics.evaluatorHiddenSampleNs += extractTiming.hiddenNs;
+				metrics.evaluatorEntitySampleNs += extractTiming.entityNs;
+			}
+			if (timer.sample) metrics.evaluatorExtractSampleNs += (unsigned long long)
+				std::chrono::duration_cast<std::chrono::nanoseconds>(
+					std::chrono::steady_clock::now() - extractStarted).count();
 			long long result = 0;
-			if (!evaluator->evaluateV3Features(features, result)) {
+			auto inferenceStarted = timer.sample ? std::chrono::steady_clock::now()
+				: std::chrono::steady_clock::time_point{};
+			if (!evaluator->evaluateV3Features(features, result, &metrics.evaluatorAccumulatorHits)) {
 				metrics.informationSetSafe = false; return 0;
 			}
+			if (runtimeMode == ExactRuntimeMode::Shadow) {
+				static thread_local ExactSparseEvaluatorV3::FeatureRecord canonicalFeatures;
+				ExactSparseEvaluatorV3::extractFeaturesInto(canonicalFeatures, state, actor,
+					&actorProfileCount, nullptr, nullptr, nullptr, &actorProfileSorted, true);
+				long long canonicalResult = 0;
+				if (!evaluator->evaluateV3Features(canonicalFeatures, canonicalResult)
+					|| canonicalResult != result) {
+					metrics.legacyShadowMismatches++; metrics.informationSetSafe = false;
+				}
+			}
+			if (timer.sample) metrics.evaluatorInferenceSampleNs += (unsigned long long)
+				std::chrono::duration_cast<std::chrono::nanoseconds>(
+					std::chrono::steady_clock::now() - inferenceStarted).count();
 			return result;
 		}
 		// A missing model is not silently replaced by the retired V1 heuristic.
@@ -1267,26 +2417,26 @@ private:
 			for (const auto& item : prizeCount) if (item.second > 0) prizeExistsMass[item.first] += world.weight;
 			// Evolution correlations are exact events over this concrete world.
 			for (const auto& profile : actorProfileCount) {
-				auto foundMaster = CardTable.find(profile.first);
-				if (foundMaster == CardTable.end() || foundMaster->second.evolutionType == EvolutionType::Basic
-					|| foundMaster->second.evolutionType == EvolutionType::NoEvolutionType
+				const CardMaster* foundMaster = FindCardMaster(profile.first);
+				if (foundMaster == nullptr || foundMaster->evolutionType == EvolutionType::Basic
+					|| foundMaster->evolutionType == EvolutionType::NoEvolutionType
 					|| deckCount[profile.first] <= 0) continue;
 				bool hasPre = false;
 				for (const auto& candidate : actorProfileCount) {
-					auto preMaster = CardTable.find(candidate.first);
-					if (preMaster != CardTable.end() && deckCount[candidate.first] > 0
-						&& (preMaster->second.name == foundMaster->second.evolvesFrom
-							|| preMaster->second.nameEn == foundMaster->second.evolvesFrom)) { hasPre = true; break; }
+					const CardMaster* preMaster = FindCardMaster(candidate.first);
+					if (preMaster != nullptr && deckCount[candidate.first] > 0
+						&& (preMaster->name == foundMaster->evolvesFrom
+							|| preMaster->nameEn == foundMaster->evolvesFrom)) { hasPre = true; break; }
 				}
 				if (hasPre) worldCombos.insert(ExactSparseEvaluatorV3::ComboTokenBase + profile.first);
-				if (hasPre && foundMaster->second.evolutionType == EvolutionType::Stage2) {
+				if (hasPre && foundMaster->evolutionType == EvolutionType::Stage2) {
 					bool hasBasic = false;
-					for (const auto& stageCandidate : actorProfileCount) { auto stage = CardTable.find(stageCandidate.first);
-						if (stage == CardTable.end() || deckCount[stageCandidate.first] <= 0
-							|| !(stage->second.name == foundMaster->second.evolvesFrom || stage->second.nameEn == foundMaster->second.evolvesFrom)) continue;
-						for (const auto& basicCandidate : actorProfileCount) { auto basic = CardTable.find(basicCandidate.first);
-							if (basic != CardTable.end() && deckCount[basicCandidate.first] > 0
-								&& (basic->second.name == stage->second.evolvesFrom || basic->second.nameEn == stage->second.evolvesFrom)) {
+					for (const auto& stageCandidate : actorProfileCount) { const CardMaster* stage = FindCardMaster(stageCandidate.first);
+						if (stage == nullptr || deckCount[stageCandidate.first] <= 0
+							|| !(stage->name == foundMaster->evolvesFrom || stage->nameEn == foundMaster->evolvesFrom)) continue;
+						for (const auto& basicCandidate : actorProfileCount) { const CardMaster* basic = FindCardMaster(basicCandidate.first);
+							if (basic != nullptr && deckCount[basicCandidate.first] > 0
+								&& (basic->name == stage->evolvesFrom || basic->nameEn == stage->evolvesFrom)) {
 								hasBasic = true; break;
 							}
 						}
@@ -1355,6 +2505,51 @@ private:
 
 	ExactScore unknown() const { return {}; }
 
+	struct SemanticOptionId {
+		std::array<int, 7> values{};
+		unsigned char count = 0;
+		void add(int value) { values[count++] = value; }
+		bool operator==(const SemanticOptionId& other) const {
+			return count == other.count && std::equal(values.begin(), values.begin() + count, other.values.begin());
+		}
+		bool operator<(const SemanticOptionId& other) const {
+			return std::lexicographical_compare(values.begin(), values.begin() + count,
+				other.values.begin(), other.values.begin() + other.count);
+		}
+		void write(ExactPackedKeyWriter& writer) const {
+			writer.u8(count);
+			for (unsigned char i = 0; i < count; ++i) writer.i32(values[i]);
+		}
+	};
+
+	SemanticOptionId semanticOptionId(const State& state, int selectedIndex) const {
+		const SelectOption& option = state.options[selectedIndex];
+		SemanticOptionId id;
+		if (option.type == SelectOptionType::Play) {
+			CardRef ref = state.getCardRef(AreaType::Hand, option.param0, state.selectPlayer);
+			if (!ref.isNull()) { id.add(0); id.add(state.getCard(ref).cardId); return id; }
+		} else if (option.type == SelectOptionType::Attach || option.type == SelectOptionType::Evolve) {
+			CardRef ref = state.getCardRef((AreaType)option.param0, option.param1, state.selectPlayer);
+			if (!ref.isNull()) {
+				id.add(option.type == SelectOptionType::Attach ? 1 : 2);
+				id.add(state.getCard(ref).cardId); id.add(option.param2); id.add(option.param3); return id;
+			}
+		}
+		if (option.type == SelectOptionType::Card) {
+			CardPosition pos = option.getCardPosition();
+			bool exchangeable = (pos.area == AreaType::Deck && state.exact.deckExchangeable[pos.playerIndex])
+				|| (pos.area == AreaType::Prize && state.exact.prizeExchangeable[pos.playerIndex]);
+			if (exchangeable) {
+				CardRef ref = state.getCardRef(pos);
+				id.add(pos.area == AreaType::Deck ? 3 : 4); id.add(pos.playerIndex);
+				id.add(ref.isNull() ? 0 : state.getCard(ref).cardId); return id;
+			}
+		}
+		id.add(5); id.add((int)option.type); id.add(option.param0); id.add(option.param1);
+		id.add(option.param2); id.add(option.param3); id.add(option.param4);
+		return id;
+	}
+
 	template<class Callback>
 	bool forEachLegalAction(const State& state, Callback&& callback) {
 		// Evaluate End first so an interrupted main node always has a real leaf
@@ -1365,36 +2560,69 @@ private:
 				if (state.options[i].type == SelectOptionType::End) { endIndex = i; break; }
 			}
 			if (!reverseActionOrder && endIndex >= 0
-				&& !callback(std::vector<int>{ endIndex })) return false;
+				&& !callback(ExactSmallAction{ endIndex })) return false;
 		}
-		struct OptionGroup { std::string key; std::vector<int> index; };
-		std::vector<OptionGroup> groups;
-		std::unordered_map<std::string, size_t, ExactStringHasher> groupByKey;
+		struct OptionGroup {
+			enum : size_t { InlineCount = 8 };
+			SemanticOptionId key;
+			std::array<int, InlineCount> inlineIndex{};
+			std::vector<int> overflow;
+			size_t count = 0;
+			OptionGroup() = default;
+			explicit OptionGroup(const SemanticOptionId& value) : key(value) {}
+			void reset(const SemanticOptionId& value) { key = value; count = 0; overflow.clear(); }
+			void push(int value) {
+				if (count < InlineCount) inlineIndex[count] = value;
+				else overflow.push_back(value);
+				count++;
+			}
+			int at(size_t position) const {
+				return position < InlineCount ? inlineIndex[position] : overflow[position - InlineCount];
+			}
+		};
+		static constexpr size_t InlineGroups = 8;
+		std::array<OptionGroup, InlineGroups> inlineGroups;
+		std::vector<OptionGroup> overflowGroups;
+		size_t groupCount = 0;
+		auto groupAt = [&](size_t position) -> OptionGroup& {
+			return position < InlineGroups ? inlineGroups[position] : overflowGroups[position - InlineGroups];
+		};
 		for (int i = 0; i < (int)state.options.size(); ++i) {
-			std::string key = actionEquivalenceKey(state, { i });
-			auto [found, inserted] = groupByKey.emplace(key, groups.size());
-			if (inserted) groups.push_back({ std::move(key), {} });
-			groups[found->second].index.push_back(i);
+			HotTimer actionTimer(metrics.actionKeyCalls, metrics.actionKeySampleNs);
+			SemanticOptionId key = semanticOptionId(state, i);
+			size_t found = 0;
+			while (found < groupCount && !(groupAt(found).key == key)) ++found;
+			if (found == groupCount) {
+				if (groupCount < InlineGroups) inlineGroups[groupCount].reset(key);
+				else overflowGroups.emplace_back(key);
+				groupCount++;
+			}
+			groupAt(found).push(i);
 		}
-		if (reverseActionOrder) std::reverse(groups.begin(), groups.end());
-		std::vector<int> current;
-		std::function<bool(int, int)> choose = [&](int group, int left) {
+		auto orderedGroup = [&](size_t position) -> OptionGroup& {
+			return groupAt(reverseActionOrder ? groupCount - 1 - position : position);
+		};
+		ExactSmallAction current;
+		ExactSmallAction actionScratch;
+		auto choose = [&](auto&& self, int group, int left) -> bool {
 			if (expired()) return false;
 			if (left == 0) {
-				std::vector<int> action = current; std::sort(action.begin(), action.end());
-				if (!reverseActionOrder && action.size() == 1 && action[0] == endIndex) return true;
-				return callback(action);
+				actionScratch = current;
+				actionScratch.sort();
+				if (!reverseActionOrder && actionScratch.size() == 1 && actionScratch[0] == endIndex) return true;
+				return callback(actionScratch);
 			}
-			if (group >= (int)groups.size()) return true;
+			if (group >= (int)groupCount) return true;
 			int remainingCapacity = 0;
-			for (int i = group; i < (int)groups.size(); ++i) remainingCapacity += (int)groups[i].index.size();
+			for (int i = group; i < (int)groupCount; ++i) remainingCapacity += (int)orderedGroup((size_t)i).count;
 			if (remainingCapacity < left) return true;
-			int maximum = std::min(left, (int)groups[group].index.size());
+			OptionGroup& selectedGroup = orderedGroup((size_t)group);
+			int maximum = std::min(left, (int)selectedGroup.count);
 			int take = reverseActionOrder ? maximum : 0;
 			for (; reverseActionOrder ? take >= 0 : take <= maximum;
 				take += reverseActionOrder ? -1 : 1) {
-				for (int i = 0; i < take; ++i) current.push_back(groups[group].index[i]);
-				if (!choose(group + 1, left - take)) return false;
+				for (int i = 0; i < take; ++i) current.push_back(selectedGroup.at((size_t)i));
+				if (!self(self, group + 1, left - take)) return false;
 				for (int i = 0; i < take; ++i) current.pop_back();
 			}
 			return true;
@@ -1402,19 +2630,26 @@ private:
 		int count = reverseActionOrder ? state.selectMax : state.selectMin;
 		for (; reverseActionOrder ? count >= state.selectMin : count <= state.selectMax;
 			count += reverseActionOrder ? -1 : 1) {
-			if (!choose(0, count)) return false;
+			if (!choose(choose, 0, count)) return false;
 		}
 		return true;
 	}
 
-	bool advance(State& state, const std::vector<int>& action) {
+	bool advance(State& state, std::initializer_list<int> action) {
+		return advance(state, ExactSmallAction(action));
+	}
+
+	template<class Action>
+	bool advance(State& state, const Action& action) {
+		HotTimer timer(metrics.actionApplyCalls, metrics.actionApplySampleNs);
 		try {
-			state.selected = action;
+			state.selected.resize(action.size());
+			for (size_t i = 0; i < action.size(); ++i) state.selected[i] = action[i];
 			if (state.checkPlayerSelect() != 0) return false;
-			state.step();
+			stepExact(state);
 			while (!state.isFinish() && !IsExactTurnLeaf(state)
 				&& state.exact.pending == ExactPendingType::None && state.selectType == SelectType::None) {
-				state.selected.clear(); state.step();
+				state.selected.clear(); stepExact(state);
 			}
 			return true;
 		} catch (const std::exception& error) {
@@ -1448,46 +2683,21 @@ private:
 		return ref;
 	}
 
-	std::string actionEquivalenceKey(const State& state, const std::vector<int>& action) const {
-		std::vector<std::string> tokens;
-		tokens.reserve(action.size());
-		for (int selectedIndex : action) {
-			const SelectOption& option = state.options[selectedIndex];
-			std::string token;
-			// Copies of the same card in hand are exchangeable for play, attach,
-			// and evolve. Physical hand indices caused factorial duplicate action
-			// prefixes before canonical successors had a chance to merge them.
-			if (option.type == SelectOptionType::Play) {
-				CardRef ref = state.getCardRef(AreaType::Hand, option.param0, state.selectPlayer);
-				if (!ref.isNull()) token = "PLAY:" + std::to_string(state.getCard(ref).cardId);
-			} else if (option.type == SelectOptionType::Attach || option.type == SelectOptionType::Evolve) {
-				CardRef ref = state.getCardRef((AreaType)option.param0, option.param1, state.selectPlayer);
-				if (!ref.isNull()) token = (option.type == SelectOptionType::Attach ? "ATTACH:" : "EVOLVE:")
-					+ std::to_string(state.getCard(ref).cardId) + ":" + std::to_string(option.param2)
-					+ ":" + std::to_string(option.param3);
-			}
-			if (option.type == SelectOptionType::Card) {
-				CardPosition pos = option.getCardPosition();
-				bool exchangeable = (pos.area == AreaType::Deck && state.exact.deckExchangeable[pos.playerIndex])
-					|| (pos.area == AreaType::Prize && state.exact.prizeExchangeable[pos.playerIndex]);
-				if (exchangeable) {
-					CardRef ref = state.getCardRef(pos);
-					int id = ref.isNull() ? 0 : state.getCard(ref).cardId;
-					token = (pos.area == AreaType::Deck ? "D:" : "P:")
-						+ std::to_string(pos.playerIndex) + ":" + std::to_string(id);
-				}
-			}
-			if (token.empty()) {
-				token = "O:" + std::to_string((int)option.type) + ":" + std::to_string(option.param0)
-					+ ":" + std::to_string(option.param1) + ":" + std::to_string(option.param2)
-					+ ":" + std::to_string(option.param3) + ":" + std::to_string(option.param4);
-			}
-			tokens.push_back(std::move(token));
+	template<class Action>
+	std::string actionEquivalenceKey(const State& state, const Action& action) const {
+		HotTimer timer(metrics.actionKeyCalls, metrics.actionKeySampleNs);
+		ExactPackedKeyWriter writer;
+		writer.u32((std::uint32_t)action.size());
+		if (action.size() == 1) {
+			semanticOptionId(state, action.front()).write(writer);
+			return std::move(writer.bytes);
 		}
+		std::vector<SemanticOptionId> tokens;
+		tokens.reserve(action.size());
+		for (size_t i = 0; i < action.size(); ++i) tokens.push_back(semanticOptionId(state, action[i]));
 		std::sort(tokens.begin(), tokens.end());
-		std::string result;
-		for (const std::string& token : tokens) { result += std::to_string(token.size()); result += ':'; result += token; }
-		return result;
+		for (const SemanticOptionId& token : tokens) token.write(writer);
+		return std::move(writer.bytes);
 	}
 
 	void decrementPool(State& state, int player, int cardId) {
@@ -1514,8 +2724,8 @@ private:
 
 	void noteWeight(const ExactWeight& value, bool operation = true) {
 		if (operation) {
-			if (value.isLarge()) metrics.bigWeightPromotions++;
-			else metrics.smallWeightOps++;
+			if (value.isLarge()) { metrics.bigWeightPromotions++; metrics.exactWeightSpills++; }
+			else { metrics.smallWeightOps++; metrics.exactWeightInlineOps++; }
 		}
 		metrics.maxWeightBits = std::max(metrics.maxWeightBits, value.bitLength());
 	}
@@ -1606,7 +2816,7 @@ private:
 				allocation = ExactWeight::multiply(allocation, chooseCount(bounds[i], handCounts[i]));
 			if (allocation.zero()) continue;
 			ExactWeight weight = ExactWeight::multiply(baseWeight, allocation);
-			auto child = std::make_unique<State>(parent);
+			auto child = cloneState(parent);
 			auto knowledge = baseKnowledge;
 			try {
 				materializeUnknownHandFromPool(*child, player, handCounts);
@@ -1645,21 +2855,21 @@ private:
 	}
 
 	bool canForgetOpponentHandAfterForcedDiscard(const ExactHiddenState& request) const {
-		auto effectCard = CardTable.find(request.pendingEffectCardId);
+		const CardMaster* effectCard = FindCardMaster(request.pendingEffectCardId);
 		// The proof below relies on the once-per-turn Supporter rule: after this
 		// effect resolves, every other Supporter is unreachable until the leaf.
-		if (effectCard == CardTable.end() || effectCard->second.cardType != CardType::Supporter)
+		if (effectCard == nullptr || effectCard->cardType != CardType::Supporter)
 			return false;
 		for (const auto& profile : actorProfileCount) {
-			auto card = CardTable.find(profile.first);
-			if (card == CardTable.end()) return false;
-			if (card->second.cardType == CardType::Supporter) continue;
+			const CardMaster* card = FindCardMaster(profile.first);
+			if (card == nullptr) return false;
+			if (card->cardType == CardType::Supporter) continue;
 			auto reads = [](const Effect& effect) { return targetReadsEnemyHand(effect.target); };
-			for (const Skill* skill : card->second.getSkills()) {
+			for (const Skill* skill : card->getSkills()) {
 				if (skill == nullptr) continue;
 				for (const Effect& effect : skill->effects) if (reads(effect)) return false;
 			}
-			for (const Attack* attack : card->second.attacks) {
+			for (const Attack* attack : card->attacks) {
 				if (attack == nullptr) continue;
 				for (const Effect& effect : attack->preEffects) if (reads(effect)) return false;
 				for (const Effect& effect : attack->postEffects) if (reads(effect)) return false;
@@ -1776,7 +2986,7 @@ private:
 						representative[i] += take; left -= take;
 					}
 					if (left != 0) return unknown();
-					auto child = std::make_unique<State>(parent);
+					auto child = cloneState(parent);
 					try {
 						materializeUnknownHand(*child, player, representative);
 						if (!advance(*child, action)) return unknown();
@@ -1862,7 +3072,7 @@ private:
 				}
 				ExactWeight worldWeight = ExactWeight::multiply(baseWeight, allocation);
 				noteWeight(worldWeight);
-				auto child = std::make_unique<State>(parent);
+				auto child = cloneState(parent);
 				try {
 					materializeUnknownZones(*child, player, partial.prizeCounts, partial.handCounts);
 				} catch (...) { return false; }
@@ -1890,7 +3100,7 @@ private:
 		}
 		output.reserve(output.size() + partial.worlds.size());
 		for (const BeliefWorld& world : partial.worlds)
-			output.push_back({ std::make_unique<State>(*world.state), world.weight, world.knowledge });
+			output.push_back({ cloneState(*world.state), world.weight, world.knowledge });
 		return true;
 	}
 
@@ -1928,7 +3138,7 @@ private:
 		ExactCardPartition& partition) {
 		if (request.pending != ExactPendingType::RevealDeck
 			|| request.pendingPlayer != actor || pendingArea(request) != AreaType::Deck) return false;
-		partition = turnDependencyPartition(parent, &request);
+		partition = turnDependencyPartition(parent, &request).partition;
 		return partition.hasCompressedClass();
 	}
 
@@ -2012,7 +3222,7 @@ private:
 		while (partial.index < partial.allocations.size()) {
 			if (expired()) { metrics.partialChanceNodes++; return incomplete(); }
 			const PartitionRevealAllocation& allocation = partial.allocations[partial.index];
-			auto world = std::make_unique<State>(parent);
+			auto world = cloneState(parent);
 			try {
 				materializeUnknownZones(*world, player, allocation.prizeCounts, handCounts);
 				if (!advance(*world, action)) return unknown();
@@ -2031,7 +3241,7 @@ private:
 			auto local = partitionTurnRevealScores.find(quotientKey);
 			bool cacheHit = local != partitionTurnRevealScores.end();
 			if (cacheHit) score = local->second;
-			else if (usingSharedTable) cacheHit = sharedHit = transposition->find(sharedKey, score);
+			else if (usingSharedTable) cacheHit = sharedHit = sharedFind(sharedKey, score);
 			if (cacheHit) {
 				metrics.successorMerges++; metrics.merged++;
 				if (sharedHit) metrics.rootSharedTTHits++;
@@ -2054,7 +3264,7 @@ private:
 				score = solveOwned(std::move(world));
 				if (score.certified) {
 					partitionTurnRevealScores.emplace(std::move(quotientKey), score);
-					if (usingSharedTable) transposition->store(std::move(sharedKey), score);
+					if (usingSharedTable) sharedStore(std::move(sharedKey), score);
 				}
 			}
 			if (!score.certified) return incomplete(&score, allocation.weight);
@@ -2155,7 +3365,7 @@ private:
 				noteWeight(weight);
 				partial->pendingWeight = weight; partial->pendingWorld = true;
 			}
-			auto world = std::make_unique<State>(parent);
+			auto world = cloneState(parent);
 			try {
 				materializeUnknownZones(*world, player, partial->prizeCounts, partial->handCounts);
 				if (!advance(*world, action)) return unknown();
@@ -2182,7 +3392,7 @@ private:
 				auto cached = partitionTurnRevealScores.find(quotientKey);
 				bool cacheHit = cached != partitionTurnRevealScores.end();
 				if (cacheHit) score = cached->second;
-				else if (usingSharedTable) cacheHit = sharedHit = transposition->find(sharedQuotientKey, score);
+				else if (usingSharedTable) cacheHit = sharedHit = sharedFind(sharedQuotientKey, score);
 				if (cacheHit) {
 					metrics.successorMerges++; metrics.merged++;
 					if (sharedHit) metrics.rootSharedTTHits++;
@@ -2197,7 +3407,7 @@ private:
 				score = solveOwned(std::move(world));
 				if (partitionedTurnSearch && score.certified) {
 					partitionTurnRevealScores.emplace(std::move(quotientKey), score);
-					if (usingSharedTable) transposition->store(std::move(sharedQuotientKey), score);
+					if (usingSharedTable) sharedStore(std::move(sharedQuotientKey), score);
 				}
 			}
 			if (!score.certified) return incomplete(&score, partial->pendingWeight);
@@ -2273,7 +3483,7 @@ private:
 		try {
 			while (!state.isFinish() && !IsExactTurnLeaf(state)
 				&& state.exact.pending == ExactPendingType::None && state.selectType == SelectType::None) {
-				state.step(); metrics.expanded++;
+				stepExact(state); metrics.expanded++;
 				if (expired()) return false;
 			}
 			return true;
@@ -2336,7 +3546,7 @@ private:
 					metrics.illegalInformationSetSplits++; metrics.informationSetSafe = false;
 					metrics.hiddenInformationLeakDetected = true; return unknown();
 				}
-				auto child = std::make_unique<State>(*world.state);
+				auto child = cloneState(*world.state);
 				if (!advance(*child, mapped)) return unknown();
 				if (child->exact.pending == ExactPendingType::RevealDeck) {
 					bool expanded = pendingArea(child->exact) == AreaType::Hand
@@ -2415,7 +3625,7 @@ private:
 				for (const std::string& token : beliefTokens) { appendSemantic(cacheKey, token.size()); cacheKey += token; }
 				auto cached = evaluationCache.find(cacheKey);
 				long long value;
-				if (cached != evaluationCache.end()) value = cached->second;
+				if (cached != evaluationCache.end()) { value = cached->second; metrics.evaluatorCacheHits++; }
 				else { value = evaluateBeliefInformationState(item.second, mass); evaluationCache.emplace(std::move(cacheKey), value); }
 				scores.push_back({ { ExactFraction::integer(value), ExactFraction::integer(value), {}, policyCertified }, mass });
 				metrics.leaves++;
@@ -2436,7 +3646,7 @@ private:
 				ExactWeight localTotal; for (const auto& type : types) localTotal += type.second;
 				expected += ExactWeight::multiply(world.weight, localTotal);
 				for (const auto& type : types) {
-					auto child = std::make_unique<State>(*world.state);
+					auto child = cloneState(*world.state);
 					try {
 					if (world.state->exact.pending == ExactPendingType::Draw) resolveDraw(*child, type.first);
 					else resolvePrize(*child, type.first);
@@ -2476,7 +3686,7 @@ private:
 		if (representative.selectType == SelectType::YesNo && representative.selectContext == SelectContext::CoinHead) {
 			std::vector<BeliefWorld> children;
 			for (BeliefWorld& world : worlds) for (int option = 0; option < 2; ++option) {
-				auto child = std::make_unique<State>(*world.state);
+					auto child = cloneState(*world.state);
 				if (!advance(*child, { option })) return unknown();
 				auto knowledge = world.knowledge;
 				appendKnowledgeFact(knowledge[0], 'C', option); appendKnowledgeFact(knowledge[1], 'C', option);
@@ -2571,7 +3781,7 @@ private:
 				|| item.second.unsignedLongLong() > (unsigned long long)DECK_SIZE) return {};
 			available[item.first] = (int)item.second.unsignedLongLong();
 		}
-		ExactCardPartition partition = turnDependencyPartition(state, nullptr, true);
+		const ExactCardPartition& partition = turnDependencyPartition(state, nullptr, true).partition;
 		std::set<int> assigned;
 		std::vector<DrawContinuationClass> result;
 		for (const ExactCardClass& source : partition.classes()) {
@@ -2727,6 +3937,7 @@ private:
 			std::sort(partial.outcomes.begin(), partial.outcomes.end(), [](const auto& left, const auto& right) {
 				return left.continuationKey < right.continuationKey;
 			});
+			metrics.continuationPreparedOutcomes += partial.outcomes.size();
 			metrics.groupedOutcomes += rawDrawOutcomes >= partial.outcomes.size()
 				? rawDrawOutcomes - partial.outcomes.size() : 0;
 			partial.initialized = true;
@@ -2740,9 +3951,10 @@ private:
 			metrics.continuationDrawClasses += classes.size();
 			for (const auto& group : classes) if (group.atoms.size() > 1)
 				metrics.continuationAtomsMerged += group.atoms.size() - 1;
-		} else if (partial.bounds != bounds || partial.continuationSchema != continuationSchema
-			|| partial.totalWeight != chooseCount(available, drawCount)) {
-			return unknown();
+		} else {
+			metrics.partialChanceHits++;
+			if (partial.bounds != bounds || partial.continuationSchema != continuationSchema
+				|| partial.totalWeight != chooseCount(available, drawCount)) return unknown();
 		}
 		const ExactWeight& total = partial.totalWeight;
 		noteWeight(total);
@@ -2772,17 +3984,24 @@ private:
 		} quantum(nodeQuantumDeadline, metrics.expanded);
 		while (partial.outcomeIndex < partial.outcomes.size()) {
 			const MultiDrawOutcome& outcome = partial.outcomes[partial.outcomeIndex];
-			partial.pendingWeight = outcome.weight; partial.pending = true;
+			if (!partial.pending) {
+				partial.pendingWeight = outcome.weight;
+				partial.pendingExpandedNodes = 0;
+				partial.pending = true;
+			}
 			if (expired()) {
 				metrics.partialChanceNodes++;
 				return incomplete();
 			}
-			auto child = std::make_unique<State>(state);
+			auto child = cloneState(state);
 			try {
 				for (int i = 0; i < (int)outcome.atomCounts.size(); ++i)
 					for (int n = 0; n < outcome.atomCounts[i]; ++n) resolveDraw(*child, types[i].first);
 			} catch (...) { return unknown(); }
+			const unsigned long long expandedBeforeOutcomeSlice = metrics.expanded;
 			ExactScore score = solveOwned(std::move(child));
+			if (metrics.expanded >= expandedBeforeOutcomeSlice)
+				partial.pendingExpandedNodes += metrics.expanded - expandedBeforeOutcomeSlice;
 			if (!score.certified) { metrics.partialChanceNodes++; return incomplete(&score); }
 			partial.completedLower = ExactFraction::add(partial.completedLower,
 				score.lower.scaled(partial.pendingWeight, total));
@@ -2792,9 +4011,12 @@ private:
 				metrics.arithmeticOverflow = true; return unknown();
 			}
 			partial.processedWeight += partial.pendingWeight; noteWeight(partial.processedWeight);
+			const unsigned long long outcomeNodes = partial.pendingExpandedNodes;
+			metrics.continuationCompletedOutcomeNodes += outcomeNodes;
+			metrics.continuationMaxOutcomeNodes = std::max(metrics.continuationMaxOutcomeNodes, outcomeNodes);
 			metrics.enumeratedHiddenWorlds++; metrics.continuationDrawOutcomes++;
 			partial.outcomeIndex++;
-			partial.pendingWeight = ExactWeight(); partial.pending = false;
+			partial.pendingWeight = ExactWeight(); partial.pending = false; partial.pendingExpandedNodes = 0;
 		}
 		if (partial.processedWeight != total) {
 			metrics.chanceMassMismatches++; metrics.probabilityExact = false; return unknown();
@@ -2813,8 +4035,10 @@ private:
 			return multiDrawChance(state, nodeKey);
 		auto types = chanceCardTypes(state);
 		if (types.empty()) return unknown();
+		const bool continuationKey = nodeKey.size() >= 4 && std::memcmp(nodeKey.data(), "PDC2", 4) == 0;
 		PartialChanceEntry* partial = (!nodeKey.empty()
-			&& (!singletonRevealStreaming || (canonicalMainEnabled && concreteWorldCaching)))
+			&& (!singletonRevealStreaming || continuationKey
+				|| (canonicalMainEnabled && concreteWorldCaching)))
 			? partialChanceFor(nodeKey) : nullptr;
 		ExactWeight total; for (const auto& item : types) total += item.second;
 		noteWeight(total);
@@ -2842,7 +4066,7 @@ private:
 					metrics.resumedChanceMass += weight.unsignedLongLong();
 				else metrics.resumedChanceMass = std::numeric_limits<unsigned long long>::max();
 			} else {
-				auto child = std::make_unique<State>(state);
+				auto child = cloneState(state);
 				try {
 					if (state.exact.pending == ExactPendingType::Draw) resolveDraw(*child, id); else resolvePrize(*child, id);
 				} catch (...) { return unknown(); }
@@ -2861,12 +4085,12 @@ private:
 
 	ExactScore coinChance(const State& state, const std::string& nodeKey) {
 		(void)nodeKey;
-		struct CoinOutcome { std::unique_ptr<State> state; ExactWeight weight; };
+		struct CoinOutcome { ExactStatePtr state; ExactWeight weight; };
 		std::vector<CoinOutcome> outcomes;
 		std::unordered_map<std::string, size_t, ExactStringHasher> bySuccessor;
 		for (int option = 0; option < 2; ++option) {
 			if (expired()) { metrics.partialChanceNodes++; return unknown(); }
-			auto child = std::make_unique<State>(state);
+				auto child = cloneState(state);
 			if (!advance(*child, { option })) return unknown();
 			std::string key = keyFor(*child);
 			auto [found, inserted] = bySuccessor.emplace(std::move(key), outcomes.size());
@@ -2892,17 +4116,26 @@ private:
 		bool first = true;
 		ExactFraction aggregate = maximize ? ExactFraction::integer(-100'000'000) : ExactFraction::integer(100'000'000);
 		bool allCertified = true;
-		std::unordered_set<std::string> equivalentActions;
-		std::unordered_map<std::string, std::pair<ExactScore, unsigned long long>, ExactStringHasher> successorScores;
+		struct SuccessorScoreEntry {
+			std::string key;
+			ExactScore score;
+			unsigned long long count = 1;
+		};
+		std::vector<SuccessorScoreEntry> successorScores;
+		successorScores.reserve(std::min<size_t>(32, std::max<size_t>(1, state.options.size())));
 		PartialDecisionEntry* partial = (!nodeKey.empty()
 			&& (!singletonRevealStreaming || (canonicalMainEnabled && concreteWorldCaching)))
 			? partialDecisionFor(nodeKey) : nullptr;
 		size_t actionOrdinal = 0;
-		bool completed = forEachLegalAction(state, [&](const std::vector<int>& action) {
+		bool completed = forEachLegalAction(state, [&](const ExactSmallAction& action) {
 			metrics.rawOutcomes++;
-			std::string actionKey = actionEquivalenceKey(state, action);
-			if (!equivalentActions.insert(actionKey).second) { metrics.groupedOutcomes++; return true; }
-			const size_t thisOrdinal = actionOrdinal++;
+			// forEachLegalAction already groups physical options by this exact
+			// semantic key. Build it again only when a persistent partial/transition
+			// table needs a stable identifier; the Rich streaming path needs neither.
+			const bool needActionKey = partial != nullptr || (!singletonRevealStreaming && !nodeKey.empty());
+			std::string actionKey;
+			if (needActionKey) actionKey = actionEquivalenceKey(state, action);
+		const size_t thisOrdinal = actionOrdinal++;
 			ExactScore* savedAction = nullptr;
 			if (partial != nullptr) {
 				auto found = partial->actionBounds.find(actionKey);
@@ -2921,26 +4154,72 @@ private:
 					rootActionValues.push_back({ action, score.lower, score.upper, score.certified });
 				return true;
 			}
-			auto child = std::make_unique<State>(state);
-			if (!advance(*child, action)) return true;
+			std::string transitionKey;
+			// Streaming hidden-world searches almost never revisit the exact same
+			// (node, action) pair before StateId interning. Building and hashing the
+			// composite string at every edge was pure overhead on Rich Energy (zero
+			// hits in the 30-second gate). Keep the cache for ordinary canonical DAGs.
+			const bool useTransitionCache = !singletonRevealStreaming && !nodeKey.empty();
+			if (useTransitionCache) {
+				transitionKey.reserve(nodeKey.size() + actionKey.size() + 16);
+				transitionKey.append(nodeKey);
+				transitionKey.push_back('\0');
+				transitionKey.append(std::to_string(actionKey.size()));
+				transitionKey.push_back(':');
+				transitionKey.append(actionKey);
+			}
 			ExactScore score;
-			if (canonicalMainEnabled && (!singletonRevealStreaming || concreteWorldCaching)
-				&& child->selectType == SelectType::Main
-				&& child->exact.pending == ExactPendingType::None) {
-				std::string successorKey = keyFor(*child);
-				auto successor = successorScores.find(successorKey);
-				if (successor != successorScores.end()) {
-					score = successor->second.first;
-					successor->second.second++;
-					metrics.successorMerges++; metrics.groupedOutcomes++;
-					metrics.largestEquivalenceClass = std::max(metrics.largestEquivalenceClass, successor->second.second);
-				} else {
-					score = solveOwned(std::move(child));
-					successorScores.emplace(std::move(successorKey), std::make_pair(score, 1ULL));
+			bool haveScore = false;
+			if (!transitionKey.empty()) {
+				auto cachedTransition = transitionScoreCache.find(transitionKey);
+				if (cachedTransition != transitionScoreCache.end()) {
+					score = cachedTransition->second;
+					score.action = action;
+					metrics.transitionCacheHits++;
+					haveScore = true;
 				}
-			} else {
-				score = child->exact.pending == ExactPendingType::RevealDeck
-					? revealAndReplay(state, child->exact, action) : solveOwned(std::move(child));
+			}
+			if (!haveScore) {
+				auto child = cloneState(state);
+				if (!advance(*child, action)) return true;
+				if (canonicalMainEnabled && (!singletonRevealStreaming || concreteWorldCaching)
+					&& child->selectType == SelectType::Main
+					&& child->exact.pending == ExactPendingType::None) {
+					std::string successorKey = keyFor(*child);
+					auto successor = std::find_if(successorScores.begin(), successorScores.end(),
+						[&](const SuccessorScoreEntry& entry) { return entry.key == successorKey; });
+					if (successor != successorScores.end()) {
+						score = successor->score;
+						successor->count++;
+						metrics.successorMerges++; metrics.groupedOutcomes++;
+						metrics.largestEquivalenceClass = std::max(metrics.largestEquivalenceClass, successor->count);
+					} else {
+						// The successor key was built for the grouping lookup immediately
+						// above.  Carry it into solveOwned so the same canonical bytes are
+						// not rebuilt at the child entry point.
+						score = solveOwned(std::move(child), successorKey);
+						successorScores.push_back({ std::move(successorKey), score, 1ULL });
+					}
+				} else {
+					if (child->exact.pending == ExactPendingType::RevealDeck) {
+						score = revealAndReplay(state, child->exact, action);
+					} else if ((child->exact.pending == ExactPendingType::Draw
+						|| child->exact.pending == ExactPendingType::TakePrize) && !nodeKey.empty()) {
+						// The pending state itself has no Main observation key. Derive a
+						// collision-free continuation identity from the lossless parent PTM3
+						// key and semantic action, so unrelated Rich draws cannot share one
+						// resumable cursor.
+						std::string semantic = actionKey.empty() ? actionEquivalenceKey(state, action) : actionKey;
+						ExactPackedKeyWriter pendingKey;
+						pendingKey.bytes.append("PDC2", 4); pendingKey.blob(nodeKey); pendingKey.blob(semantic);
+						pendingKey.i32((int)child->exact.pending); pendingKey.i32(child->exact.pendingPlayer);
+						pendingKey.i32(child->exact.pendingCount);
+						score = solveOwned(std::move(child), std::move(pendingKey.bytes));
+					} else score = solveOwned(std::move(child));
+				}
+				if (score.certified && useTransitionCache && !transitionKey.empty()
+					&& transitionScoreCache.size() < MaxTransitionCacheEntries)
+					transitionScoreCache.emplace(std::move(transitionKey), score);
 			}
 			if (partial != nullptr) {
 				auto found = partial->actionBounds.find(actionKey);
@@ -2986,9 +4265,9 @@ private:
 		return result;
 	}
 
-	ExactScore solve(const State& input) { return solveOwned(std::make_unique<State>(input)); }
+	ExactScore solve(const State& input) { return solveOwned(cloneState(input)); }
 
-	ExactScore solveOwned(std::unique_ptr<State> owned) {
+	ExactScore solveOwned(ExactStatePtr owned, std::string keyHint = {}) {
 		struct DepthGuard { int& depth; DepthGuard(int& value) : depth(value) { depth++; } ~DepthGuard() { depth--; } } guard(recursionDepth);
 		metrics.maxDepth = std::max(metrics.maxDepth, recursionDepth);
 		if (recursionDepth > 384) {
@@ -3006,7 +4285,7 @@ private:
 		try {
 			while (!state.isFinish() && !IsExactTurnLeaf(state)
 				&& state.exact.pending == ExactPendingType::None && state.selectType == SelectType::None) {
-				state.step();
+				stepExact(state);
 				metrics.expanded++;
 				if (expired()) return unknown();
 			}
@@ -3028,14 +4307,23 @@ private:
 		// dynamic partition key preserves every card count that can affect another
 		// turn-local deck query while omitting the irrelevant prize identities already
 		// quotiented by revealAndReplayPartitionedTurnSearch.
-		std::string partitionMainKey = partitionTurnMainKey(state);
-		if (!partitionMainKey.empty()) {
+		const std::string* partitionMainKeyPtr = partitionTurnMainKey(state);
+		const bool partitionLookupDone = partitionMainKeyPtr != nullptr;
+		size_t partitionMainHash = 0;
+		bool partitionMainHashKnown = false;
+		if (partitionMainKeyPtr != nullptr) {
+			const std::string& partitionMainKey = *partitionMainKeyPtr;
 			ExactScore partitionCached;
-			auto local = partitionTurnMainScores.find(partitionMainKey);
-			bool partitionHit = local != partitionTurnMainScores.end();
-			bool sharedHit = false;
-			if (partitionHit) partitionCached = local->second;
-			else if (usingSharedTable) partitionHit = sharedHit = transposition->find(partitionMainKey, partitionCached);
+			bool partitionHit = false, sharedHit = false;
+			if (usingSharedTable) {
+				partitionHit = sharedHit = sharedFind(partitionMainKey, partitionCached, &partitionMainHash);
+				partitionMainHashKnown = true;
+			}
+			else {
+				auto local = partitionTurnMainScores.find(partitionMainKey);
+				partitionHit = local != partitionTurnMainScores.end();
+				if (partitionHit) partitionCached = local->second;
+			}
 			if (partitionHit) {
 				metrics.merged++; metrics.canonicalStateMerges++;
 				if (sharedHit) metrics.rootSharedTTHits++;
@@ -3052,21 +4340,71 @@ private:
 				|| state.exact.pending == ExactPendingType::Draw
 				|| state.exact.pending == ExactPendingType::TakePrize);
 		std::string key;
-		if (!partitionMainKey.empty()) key = partitionMainKey;
-		else if (!singletonRevealStreaming || cacheConcreteWorld) key = keyFor(state);
+		if (partitionMainKeyPtr == nullptr) {
+			if (!keyHint.empty()) key = std::move(keyHint);
+			else if (!singletonRevealStreaming || cacheConcreteWorld) key = keyFor(state);
+		}
+		const std::string& nodeKey = partitionMainKeyPtr != nullptr ? *partitionMainKeyPtr : key;
 		const bool shareable = usingSharedTable && (!singletonRevealStreaming || cacheConcreteWorld);
 		ExactScore cached;
 		bool cacheHit = false;
-		if (shareable) cacheHit = transposition->find(key, cached);
-		else if (!singletonRevealStreaming || cacheConcreteWorld) {
-			auto found = localTransposition.find(key);
-			if (found != localTransposition.end()) { cached = found->second; cacheHit = true; }
+		size_t nodeHash = 0;
+		bool nodeHashKnown = false;
+		// partitionMainKey was already queried above.  It is also the primary TT
+		// key for this node; hashing and probing the same bytes a second time made
+		// every Main miss pay for two TT lookups.
+		if (shareable && !partitionLookupDone) {
+			cacheHit = sharedFind(nodeKey, cached, &nodeHash);
+			nodeHashKnown = true;
+		}
+		else if (!shareable && !partitionLookupDone && (!singletonRevealStreaming || cacheConcreteWorld)) {
+			auto found = localTransposition.find(nodeKey);
+			if (found != localTransposition.end()) {
+				cached = found->second; cacheHit = true; metrics.ttReadHits++;
+			} else metrics.ttReadMisses++;
 		}
 		if (cacheHit) {
 			metrics.merged++;
 			if (shareable) metrics.canonicalStateMerges++;
 			if (shareable && usingSharedTable) metrics.rootSharedTTHits++;
 			return cached;
+		}
+		struct FlightGuard {
+			ExactSharedTransposition* table = nullptr;
+			std::shared_ptr<ExactSharedTransposition::FlightState> flight;
+			bool finished = false;
+			~FlightGuard() { if (!finished && table != nullptr && flight) table->finishFlight(flight, nullptr); }
+			void finish(const ExactScore* value) {
+				if (!finished && table != nullptr && flight) table->finishFlight(flight, value);
+				finished = true;
+			}
+		} flightGuard;
+		if (shareable && runtimeMode != ExactRuntimeMode::Legacy && inFlightClaimsEnabled) {
+			while (true) {
+				auto waitStarted = std::chrono::steady_clock::now();
+				auto claim = transposition->claim(nodeKey, deadline);
+				if (claim.waited) {
+					metrics.inFlightWaits++;
+					metrics.workerWaitNs += (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+						std::chrono::steady_clock::now() - waitStarted).count();
+				}
+				if (claim.status == ExactSharedTransposition::ClaimStatus::Released) {
+					if (std::chrono::steady_clock::now() >= deadline) { metrics.timedOut = true; return unknown(); }
+					continue;
+				}
+				if (claim.status == ExactSharedTransposition::ClaimStatus::TimedOut) {
+					metrics.timedOut = true; return unknown();
+				}
+				if (claim.status == ExactSharedTransposition::ClaimStatus::SelfDuplicate) {
+					metrics.workerDuplicateClaims++; break;
+				}
+				if (claim.status == ExactSharedTransposition::ClaimStatus::Completed) {
+					metrics.ttReadHits++; metrics.rootSharedTTHits++; metrics.merged++; metrics.canonicalStateMerges++;
+					return claim.value;
+				}
+				flightGuard.table = transposition.get(); flightGuard.flight = std::move(claim.flight);
+				break;
+			}
 		}
 		ExactScore result;
 		if (state.exact.pending == ExactPendingType::Opaque || state.exact.pending == ExactPendingType::RevealDeck) {
@@ -3084,40 +4422,51 @@ private:
 			}
 			result = unknown();
 		} else if (state.exact.pending == ExactPendingType::Draw || state.exact.pending == ExactPendingType::TakePrize) {
-			result = chance(state, key);
+			result = chance(state, nodeKey);
 		} else if (state.selectType == SelectType::YesNo && state.selectContext == SelectContext::CoinHead) {
-			result = coinChance(state, key);
+			result = coinChance(state, nodeKey);
 		} else {
-			result = decision(state, state.selectPlayer == actor, key);
+			result = decision(state, state.selectPlayer == actor, nodeKey);
 		}
 		if (result.certified && (!singletonRevealStreaming || cacheConcreteWorld)) {
-			auto partialDecision = partialDecisions.find(key);
+			auto partialDecision = partialDecisions.find(nodeKey);
 			if (partialDecision != partialDecisions.end()) {
 				partialBytes -= std::min(partialBytes, partialDecision->second.accountedBytes);
 				partialDecisions.erase(partialDecision);
 			}
-			auto partialChance = partialChances.find(key);
+			auto partialChance = partialChances.find(nodeKey);
 			if (partialChance != partialChances.end()) {
 				partialBytes -= std::min(partialBytes, partialChance->second.accountedBytes);
 				partialChances.erase(partialChance);
 			}
-			if (shareable) transposition->store(std::move(key), result);
-			else {
+			if (partitionMainKeyPtr == nullptr && shareable)
+				sharedStore(std::move(key), result, nodeHashKnown ? &nodeHash : nullptr);
+			else if (partitionMainKeyPtr == nullptr) {
 				size_t bytes = key.size() + sizeof(ExactScore) + 96;
 				if (localTransposition.size() < MaxLocalTranspositionEntries
 					&& localTranspositionBytes + bytes <= MaxLocalTranspositionBytes) {
 					localTranspositionBytes += bytes;
 					localTransposition.emplace(std::move(key), result);
+					metrics.ttInsertions++;
 				}
 			}
 		}
-		if (result.certified && !partitionMainKey.empty()) {
-			partitionTurnMainScores.emplace(partitionMainKey, result);
-			if (usingSharedTable) transposition->store(std::move(partitionMainKey), result);
+		// Partition Main entries remain valid even while a singleton reveal is in
+		// streaming mode.  This store is intentionally outside the generic-world
+		// cache condition above.
+		if (result.certified && partitionMainKeyPtr != nullptr) {
+			if (usingSharedTable) sharedStore(*partitionMainKeyPtr, result,
+				partitionMainHashKnown ? &partitionMainHash : nullptr);
+			else {
+				partitionTurnMainScores.emplace(*partitionMainKeyPtr, result);
+				metrics.ttInsertions++;
+			}
 		}
+		flightGuard.finish(result.certified ? &result : nullptr);
 		metrics.partialTableBytes = partialBytes;
 		metrics.sessionBytes = transposition->bytes() + localTranspositionBytes + policyBytes + partialBytes
-			+ beliefTranspositionBytes + evaluationCache.size() * 128ULL;
+			+ beliefTranspositionBytes + evaluationCache.size() * 128ULL
+			+ transitionScoreCache.size() * 128ULL;
 		return result;
 	}
 };

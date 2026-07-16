@@ -6,11 +6,12 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $PSScriptRoot
 $Source = Join-Path $Root "ptcg_engine/ptcgProgram 22/Export.cpp"
+$AvxSource = Join-Path $Root "ptcg_engine/ptcgProgram 22/ExactEvaluatorAvx2.cpp"
 $Output = Join-Path $Root "sample_submission/sample_submission/cg/libcg.so"
 if (-not (Test-Path -LiteralPath $Zig)) { throw "zig executable not found: $Zig" }
 
-& $Zig c++ -target x86_64-linux-gnu.2.17 -std=c++20 -O3 -DNDEBUG -fPIC -shared `
-    $Source -o $Output -pthread
+& $Zig c++ -target x86_64-linux-gnu.2.17 -std=c++20 -O3 -flto -fvisibility=hidden -DNDEBUG -fPIC -shared `
+    $Source $AvxSource -o $Output -pthread
 if ($LASTEXITCODE) { throw "Linux cross-build failed ($LASTEXITCODE)" }
 
 # GNU strip is available in the supported WSL build environment.  Stripping is

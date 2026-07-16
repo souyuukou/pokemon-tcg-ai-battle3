@@ -20,4 +20,5 @@ inline void InitializeAll() {
 
   CardImpl();
 	InitializeCard();
+	InitializeCardMasterIndex();
 }

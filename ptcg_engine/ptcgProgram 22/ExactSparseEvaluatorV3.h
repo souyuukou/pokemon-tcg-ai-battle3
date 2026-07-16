@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -11,6 +12,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include "ExactEvaluatorAvx2.h"
 
 // V3 keeps the rule-observable record structured.  In particular, attached
 // cards and effects live inside their Pokemon entity; they are never reduced
@@ -61,6 +64,11 @@ public:
 		std::int16_t relation = 0;
 		std::int16_t reserved = 0;
 		std::int32_t value = 0;
+	};
+	struct ExtractTiming {
+		std::uint64_t publicNs = 0;
+		std::uint64_t hiddenNs = 0;
+		std::uint64_t entityNs = 0;
 	};
 	template<size_t Capacity>
 	struct FixedSparseList {
@@ -122,9 +130,17 @@ public:
 	};
 
 	bool load(const std::string& path, std::string& error) {
-		std::ifstream stream(path, std::ios::binary);
+		std::ifstream stream(path, std::ios::binary | std::ios::ate);
 		if (!stream) { error = "cannot open evaluator model"; return false; }
-		std::vector<std::uint8_t> raw((std::istreambuf_iterator<char>(stream)), {});
+		const std::streamoff length = stream.tellg();
+		if (length < 0 || (std::uint64_t)length > std::numeric_limits<size_t>::max()) {
+			error = "invalid evaluator V3 length"; return false;
+		}
+		std::vector<std::uint8_t> raw((size_t)length);
+		stream.seekg(0, std::ios::beg);
+		if (!raw.empty() && !stream.read(reinterpret_cast<char*>(raw.data()), length)) {
+			error = "cannot read evaluator model"; return false;
+		}
 		if (raw.size() < sizeof(Header)) { error = "invalid evaluator V3 length"; return false; }
 		Header header{}; std::memcpy(&header, raw.data(), sizeof(header));
 		if (std::memcmp(header.magic, "PTCGEV3", 7) != 0 || header.version != 3
@@ -169,9 +185,33 @@ public:
 		read(globalBias, GlobalHiddenCount); read(outputWeight, GlobalHiddenCount);
 		std::memcpy(&outputBias, raw.data() + offset, sizeof(outputBias));
 		if (!accumulatorBoundsSafe()) { error = "evaluator V3 accumulator bound exceeds int32"; return false; }
+		entityDenseByInput.resize((size_t)EntityDenseCount * EntityHiddenCount);
+		for (int input = 0; input < EntityDenseCount; ++input) for (int hidden = 0; hidden < EntityHiddenCount; ++hidden)
+			entityDenseByInput[(size_t)input * EntityHiddenCount + hidden]
+				= entityDenseWeight[(size_t)hidden * EntityDenseCount + input];
+		globalDenseByInput.resize((size_t)GlobalDenseCount * GlobalHiddenCount);
+		for (int input = 0; input < GlobalDenseCount; ++input) for (int hidden = 0; hidden < GlobalHiddenCount; ++hidden)
+			globalDenseByInput[(size_t)input * GlobalHiddenCount + hidden]
+				= globalDenseWeight[(size_t)hidden * GlobalDenseCount + input];
 		int maximum = tokens.back(); tokenIndex.assign((size_t)std::max(0, maximum) + 1, 0);
 		for (int i = 1; i < (int)tokens.size(); ++i) if (tokens[i] >= 0) tokenIndex[tokens[i]] = i;
-		modelHashValue = checksum(raw.data(), raw.size()); loaded = true; modelPath = path; return true;
+		modelHashValue = checksum(raw.data(), raw.size());
+		avx2Enabled = ExactCpuSupportsAvx2();
+#if defined(_MSC_VER)
+		char* simdMode = nullptr; size_t simdModeLength = 0;
+		_dupenv_s(&simdMode, &simdModeLength, "PTCG_EVALUATOR_SIMD");
+		if (simdMode != nullptr) {
+			if (std::strcmp(simdMode, "scalar") == 0) avx2Enabled = false;
+			else if (std::strcmp(simdMode, "avx2") == 0) avx2Enabled = ExactCpuSupportsAvx2();
+			std::free(simdMode);
+		}
+#else
+		if (const char* simdMode = std::getenv("PTCG_EVALUATOR_SIMD")) {
+			if (std::strcmp(simdMode, "scalar") == 0) avx2Enabled = false;
+			else if (std::strcmp(simdMode, "avx2") == 0) avx2Enabled = ExactCpuSupportsAvx2();
+		}
+#endif
+		loaded = true; modelPath = path; return true;
 	}
 
 	bool isLoaded() const { return loaded; }
@@ -206,9 +246,17 @@ public:
 		return result;
 	}
 
-	static FeatureRecord extractFeatures(const State& state, int actor,
-		const std::unordered_map<int, int>* actorProfile = nullptr, const BeliefInput* belief = nullptr) {
-		FeatureRecord out;
+	static void extractFeaturesInto(FeatureRecord& out, const State& state, int actor,
+		const std::unordered_map<int, int>* actorProfile, const BeliefInput* belief,
+		unsigned long long* hiddenFeatureCacheHits, ExtractTiming* timing,
+		const std::vector<std::pair<int, int>>* sortedActorProfile,
+		bool canonicalizeOutput = true) {
+		auto stageStarted = timing != nullptr ? std::chrono::steady_clock::now()
+			: std::chrono::steady_clock::time_point{};
+		out.globalSparse.count = 0;
+		out.entityCount = 0;
+		out.opponentInferenceVersion = 0;
+		out.overflow = false;
 		if (state.phase == GamePhase::PokemonCheckupEnd) {
 			if (state.turnState != 0) out.overflow = true;
 			for (const PlayerState& player : state.players)
@@ -245,12 +293,102 @@ public:
 		for (CardRef ref : state.stadium) if (!ref.isNull()) addGlobal(state.getCard(ref).cardId, Stadium, BeliefScale);
 		appendPlayerEffects(me, OwnPlayerEffect, addGlobal); appendPlayerEffects(opp, OppPlayerEffect, addGlobal);
 		appendGlobalEffects(state, addGlobal);
+		if (timing != nullptr) {
+			auto now = std::chrono::steady_clock::now();
+			timing->publicNs += (std::uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(now - stageStarted).count();
+			stageStarted = now;
+		}
 		if (actorProfile != nullptr) {
+			// Remaining hidden counts are used by every belief and combo feature.
+			// Build them once; the former implementation rescanned allCard for every
+			// card ID and again inside every evolution-combo query.
+			static thread_local std::vector<int> remainingById;
+			static thread_local std::vector<std::uint32_t> remainingGeneration;
+			static thread_local std::uint32_t generation = 0;
+			if (++generation == 0) { std::fill(remainingGeneration.begin(), remainingGeneration.end(), 0); generation = 1; }
+			static thread_local std::vector<std::pair<int, int>> profileScratch;
+			if (sortedActorProfile == nullptr) {
+				profileScratch.clear(); profileScratch.reserve(actorProfile->size());
+				for (const auto& item : *actorProfile) profileScratch.push_back(item);
+				std::sort(profileScratch.begin(), profileScratch.end());
+			}
+			const auto& profile = sortedActorProfile != nullptr ? *sortedActorProfile : profileScratch;
+			int maximumId = profile.empty() ? 0 : profile.back().first;
+			if (maximumId >= 0 && (size_t)maximumId >= remainingById.size()) {
+				remainingById.resize((size_t)maximumId + 1);
+				remainingGeneration.resize((size_t)maximumId + 1);
+			}
+			for (const auto& item : profile) if (item.first >= 0) {
+				remainingById[(size_t)item.first] = 0;
+				remainingGeneration[(size_t)item.first] = generation;
+			}
+			bool concreteHiddenPool = true;
+			auto addHidden = [&](const auto& zone) {
+				for (CardRef ref : zone) {
+					if (ref.isNull()) { concreteHiddenPool = false; continue; }
+					const Card& card = state.getCard(ref);
+					if (card.cardId >= 0 && card.playerIndex == actor
+						&& (size_t)card.cardId < remainingGeneration.size()
+						&& remainingGeneration[(size_t)card.cardId] == generation)
+						++remainingById[(size_t)card.cardId];
+				}
+			};
+			addHidden(me.deck); addHidden(me.prize);
+			if (!concreteHiddenPool) {
+				for (const auto& item : profile) if (item.first >= 0)
+					remainingById[(size_t)item.first] = item.second;
+				for (const Card& card : state.allCard) if (card.cardId >= 0 && card.playerIndex == actor
+					&& card.area != AreaType::Deck && card.area != AreaType::Prize
+					&& (size_t)card.cardId < remainingGeneration.size()
+					&& remainingGeneration[(size_t)card.cardId] == generation)
+					--remainingById[(size_t)card.cardId];
+			}
+			auto remainingCount = [&](int id) {
+				return id >= 0 && (size_t)id < remainingGeneration.size()
+					&& remainingGeneration[(size_t)id] == generation
+					? std::max(0, remainingById[(size_t)id]) : 0;
+			};
+			struct HiddenFeatureCacheEntry {
+				bool valid = false;
+				std::uint64_t hash = 0;
+				std::uint8_t count = 0, deckSize = 0, prizeSize = 0;
+				std::array<int, DECK_SIZE> ids{};
+				std::array<std::uint8_t, DECK_SIZE> remaining{};
+				FixedSparseList<192> features;
+			};
+			static thread_local std::array<HiddenFeatureCacheEntry, 4096> hiddenFeatureCache;
+			HiddenFeatureCacheEntry* hiddenCacheSlot = nullptr;
+			bool hiddenCacheHit = false;
+			if (belief == nullptr && profile.size() <= DECK_SIZE) {
+				std::uint64_t hash = 1469598103934665603ULL;
+				auto mix = [&](std::uint32_t value) {
+					for (int byte = 0; byte < 4; ++byte) {
+						hash ^= (std::uint8_t)(value >> (byte * 8));
+						hash *= 1099511628211ULL;
+					}
+				};
+				mix((std::uint32_t)me.deck.size()); mix((std::uint32_t)me.prize.size());
+				for (const auto& item : profile) { mix((std::uint32_t)item.first); mix((std::uint32_t)remainingCount(item.first)); }
+				hiddenCacheSlot = &hiddenFeatureCache[hash & (hiddenFeatureCache.size() - 1)];
+				hiddenCacheHit = hiddenCacheSlot->valid && hiddenCacheSlot->hash == hash
+					&& hiddenCacheSlot->count == profile.size()
+					&& hiddenCacheSlot->deckSize == me.deck.size() && hiddenCacheSlot->prizeSize == me.prize.size();
+				if (hiddenCacheHit) for (size_t i = 0; i < profile.size(); ++i)
+					hiddenCacheHit = hiddenCacheHit && hiddenCacheSlot->ids[i] == profile[i].first
+						&& hiddenCacheSlot->remaining[i] == remainingCount(profile[i].first);
+				if (hiddenCacheHit) {
+					for (int i = 0; i < hiddenCacheSlot->features.count; ++i) {
+						const SparseInput& cached = hiddenCacheSlot->features.values[i];
+						addGlobal(cached.token, cached.relation, cached.value);
+					}
+					if (hiddenFeatureCacheHits != nullptr) (*hiddenFeatureCacheHits)++;
+				}
+			}
+			const std::uint16_t hiddenFeatureStart = out.globalSparse.count;
+			if (!hiddenCacheHit) {
 			int hiddenTotal = (int)me.deck.size() + (int)me.prize.size();
-			for (const auto& item : *actorProfile) {
-				int remaining = item.second;
-				for (const Card& card : state.allCard) if (card.cardId == item.first && card.playerIndex == actor
-					&& card.area != AreaType::Deck && card.area != AreaType::Prize) --remaining;
+			for (const auto& item : profile) {
+				int remaining = remainingCount(item.first);
 				if (remaining > 0) {
 					addGlobal(item.first, OwnHiddenPool, remaining * BeliefScale);
 					if (belief == nullptr && hiddenTotal > 0) {
@@ -268,52 +406,90 @@ public:
 				}
 			}
 			if (belief == nullptr && hiddenTotal > 0) {
-				auto remainingCount = [&](int id) {
-					auto profile = actorProfile->find(id); int count = profile == actorProfile->end() ? 0 : profile->second;
-					for (const Card& card : state.allCard) if (card.cardId == id && card.playerIndex == actor
-						&& card.area != AreaType::Deck && card.area != AreaType::Prize) --count;
-					return std::max(0, count);
+				struct EvolutionRelation {
+					int evolvedId = 0;
+					EvolutionType type = EvolutionType::NoEvolutionType;
+					std::vector<int> preIds, basicIds;
 				};
+				struct EvolutionProfileCache {
+					std::vector<std::pair<int, int>> profile;
+					std::vector<EvolutionRelation> relations;
+				};
+				static thread_local EvolutionProfileCache evolutionCache;
+				if (profile != evolutionCache.profile) {
+					evolutionCache.profile = profile; evolutionCache.relations.clear();
+					for (const auto& item : evolutionCache.profile) {
+						const CardMaster* evolved = FindCardMaster(item.first);
+						if (evolved == nullptr || evolved->evolutionType == EvolutionType::Basic
+							|| evolved->evolutionType == EvolutionType::NoEvolutionType) continue;
+						EvolutionRelation relation; relation.evolvedId = item.first; relation.type = evolved->evolutionType;
+						for (const auto& candidate : evolutionCache.profile) {
+							const CardMaster* pre = FindCardMaster(candidate.first);
+							if (pre != nullptr && (pre->name == evolved->evolvesFrom
+								|| pre->nameEn == evolved->evolvesFrom)) relation.preIds.push_back(candidate.first);
+						}
+						if (relation.type == EvolutionType::Stage2) for (const auto& basicCandidate : evolutionCache.profile) {
+							const CardMaster* basic = FindCardMaster(basicCandidate.first); if (basic == nullptr) continue;
+							bool required = false;
+							for (const auto& stageCandidate : evolutionCache.profile) {
+								const CardMaster* stage = FindCardMaster(stageCandidate.first);
+								if (stage != nullptr && stage->evolutionType == EvolutionType::Stage1
+									&& (stage->name == evolved->evolvesFrom || stage->nameEn == evolved->evolvesFrom)
+									&& (basic->name == stage->evolvesFrom || basic->nameEn == stage->evolvesFrom)) {
+									required = true; break;
+								}
+							}
+							if (required) relation.basicIds.push_back(basicCandidate.first);
+						}
+						evolutionCache.relations.push_back(std::move(relation));
+					}
+				}
 				unsigned long long denominator = choose64(hiddenTotal, (int)me.deck.size());
-				for (const auto& item : *actorProfile) {
-					auto evolved = CardTable.find(item.first);
-					if (evolved == CardTable.end() || evolved->second.evolutionType == EvolutionType::Basic
-						|| evolved->second.evolutionType == EvolutionType::NoEvolutionType || remainingCount(item.first) <= 0) continue;
-					int preCount = 0;
-					for (const auto& candidate : *actorProfile) { auto pre = CardTable.find(candidate.first);
-						if (pre != CardTable.end() && (pre->second.name == evolved->second.evolvesFrom
-							|| pre->second.nameEn == evolved->second.evolvesFrom)) preCount += remainingCount(candidate.first); }
+				for (const EvolutionRelation& relation : evolutionCache.relations) {
+					if (remainingCount(relation.evolvedId) <= 0) continue;
+					int preCount = 0; for (int id : relation.preIds) preCount += remainingCount(id);
 					if (preCount <= 0 || denominator == 0) continue;
-					int evoCount = remainingCount(item.first), size = (int)me.deck.size();
+					int evoCount = remainingCount(relation.evolvedId), size = (int)me.deck.size();
 					unsigned long long neitherEvo = choose64(hiddenTotal - evoCount, size);
 					unsigned long long neitherPre = choose64(hiddenTotal - preCount, size);
 					unsigned long long neitherBoth = choose64(hiddenTotal - evoCount - preCount, size);
 					long long favorable = (long long)denominator - (long long)neitherEvo - (long long)neitherPre + (long long)neitherBoth;
-					addGlobal(ComboTokenBase + item.first, ComboProbability,
+					addGlobal(ComboTokenBase + relation.evolvedId, ComboProbability,
 						ratioQ8((unsigned long long)std::max<long long>(0, favorable), denominator));
-					if (evolved->second.evolutionType == EvolutionType::Stage2) {
-						int basicCount = 0;
-						for (const auto& basicCandidate : *actorProfile) {
-							auto basic = CardTable.find(basicCandidate.first); if (basic == CardTable.end()) continue;
-							bool required = false;
-							for (const auto& stageCandidate : *actorProfile) { auto stage = CardTable.find(stageCandidate.first);
-								if (stage != CardTable.end() && stage->second.evolutionType == EvolutionType::Stage1
-									&& (stage->second.name == evolved->second.evolvesFrom || stage->second.nameEn == evolved->second.evolvesFrom)
-									&& (basic->second.name == stage->second.evolvesFrom || basic->second.nameEn == stage->second.evolvesFrom)) {
-									required = true; break;
-								}
-							}
-							if (required) basicCount += remainingCount(basicCandidate.first);
-						}
+					if (relation.type == EvolutionType::Stage2) {
+						int basicCount = 0; for (int id : relation.basicIds) basicCount += remainingCount(id);
 						if (basicCount > 0) {
 							auto absent = [&](int count) { return choose64(hiddenTotal - count, size); };
 							long long all = (long long)denominator - (long long)absent(evoCount) - (long long)absent(preCount) - (long long)absent(basicCount)
 								+ (long long)absent(evoCount + preCount) + (long long)absent(evoCount + basicCount)
 								+ (long long)absent(preCount + basicCount) - (long long)absent(evoCount + preCount + basicCount);
-							addGlobal(ComboTokenBase + 250'000 + item.first, ComboProbability,
+							addGlobal(ComboTokenBase + 250'000 + relation.evolvedId, ComboProbability,
 								ratioQ8((unsigned long long)std::max<long long>(0, all), denominator));
 						}
 					}
+				}
+			}
+				if (belief == nullptr && hiddenCacheSlot != nullptr
+					&& out.globalSparse.count - hiddenFeatureStart <= hiddenCacheSlot->features.values.size()) {
+					hiddenCacheSlot->valid = true;
+					hiddenCacheSlot->hash = 1469598103934665603ULL;
+					auto mix = [&](std::uint32_t value) {
+						for (int byte = 0; byte < 4; ++byte) {
+							hiddenCacheSlot->hash ^= (std::uint8_t)(value >> (byte * 8));
+							hiddenCacheSlot->hash *= 1099511628211ULL;
+						}
+					};
+					mix((std::uint32_t)me.deck.size()); mix((std::uint32_t)me.prize.size());
+					hiddenCacheSlot->count = (std::uint8_t)profile.size();
+					hiddenCacheSlot->deckSize = (std::uint8_t)me.deck.size(); hiddenCacheSlot->prizeSize = (std::uint8_t)me.prize.size();
+					for (size_t i = 0; i < profile.size(); ++i) {
+						hiddenCacheSlot->ids[i] = profile[i].first;
+						hiddenCacheSlot->remaining[i] = (std::uint8_t)remainingCount(profile[i].first);
+						mix((std::uint32_t)profile[i].first); mix(hiddenCacheSlot->remaining[i]);
+					}
+					hiddenCacheSlot->features.count = out.globalSparse.count - hiddenFeatureStart;
+					for (int i = 0; i < hiddenCacheSlot->features.count; ++i)
+						hiddenCacheSlot->features.values[i] = out.globalSparse.values[hiddenFeatureStart + i];
 				}
 			}
 		}
@@ -330,9 +506,15 @@ public:
 			if (belief->knownBottom != nullptr) for (int i = 0; i < std::min(4, (int)(*belief->knownBottom)[actor].size()); ++i)
 				addGlobal((*belief->knownBottom)[actor][i], OwnKnownBottom0 + i, BeliefScale);
 		}
+		if (timing != nullptr) {
+			auto now = std::chrono::steady_clock::now();
+			timing->hiddenNs += (std::uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(now - stageStarted).count();
+			stageStarted = now;
+		}
 		auto entity = [&](CardRef ref, int owner, bool active) {
 			if (ref.isNull() || out.entityCount >= MaxEntities) { if (!ref.isNull()) out.overflow = true; return; }
 			EntityRecord& e = out.entities[out.entityCount++]; const Card& card = state.getCard(ref);
+			e.sparse.count = 0;
 			e.pool = owner == actor ? (active ? OwnActivePool : OwnBenchPool) : (active ? OppActivePool : OppBenchPool);
 			e.dense[0] = owner == actor ? 1 : -1; e.dense[1] = active ? 1 : 0;
 			e.dense[2] = card.damage; e.dense[3] = state.getHp(card); e.dense[4] = state.retreatCost(card);
@@ -369,39 +551,90 @@ public:
 					if (preview.prizes) add(token, AttackPrize, preview.prizes * BeliefScale);
 				} else add(token, AttackUnavailable, std::max(1, preview.unavailableReason) * BeliefScale);
 			}
-			e.sparse.canonicalize();
+			if (canonicalizeOutput) e.sparse.canonicalize();
 		};
 		for (CardRef ref : me.active) entity(ref, actor, true); for (CardRef ref : opp.active) entity(ref, enemy, true);
 		for (CardRef ref : me.bench) entity(ref, actor, false); for (CardRef ref : opp.bench) entity(ref, enemy, false);
-		std::sort(out.entities.begin(), out.entities.begin() + out.entityCount, [](const EntityRecord& a, const EntityRecord& b) {
-			if (a.pool != b.pool) return a.pool < b.pool;
-			if (a.dense != b.dense) return a.dense < b.dense;
-			return std::lexicographical_compare(a.sparse.values.begin(), a.sparse.values.begin() + a.sparse.count,
-				b.sparse.values.begin(), b.sparse.values.begin() + b.sparse.count, [](const SparseInput& x, const SparseInput& y) {
-					if (x.relation != y.relation) return x.relation < y.relation;
-					if (x.token != y.token) return x.token < y.token; return x.value < y.value;
-				});
-		});
-		out.globalSparse.canonicalize(); return out;
+		if (canonicalizeOutput) {
+			std::sort(out.entities.begin(), out.entities.begin() + out.entityCount, [](const EntityRecord& a, const EntityRecord& b) {
+				if (a.pool != b.pool) return a.pool < b.pool;
+				if (a.dense != b.dense) return a.dense < b.dense;
+				return std::lexicographical_compare(a.sparse.values.begin(), a.sparse.values.begin() + a.sparse.count,
+					b.sparse.values.begin(), b.sparse.values.begin() + b.sparse.count, [](const SparseInput& x, const SparseInput& y) {
+						if (x.relation != y.relation) return x.relation < y.relation;
+						if (x.token != y.token) return x.token < y.token; return x.value < y.value;
+					});
+			});
+			out.globalSparse.canonicalize();
+		}
+		if (timing != nullptr) timing->entityNs += (std::uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now() - stageStarted).count();
+	}
+
+	static FeatureRecord extractFeatures(const State& state, int actor,
+		const std::unordered_map<int, int>* actorProfile = nullptr, const BeliefInput* belief = nullptr,
+		unsigned long long* hiddenFeatureCacheHits = nullptr, ExtractTiming* timing = nullptr,
+		const std::vector<std::pair<int, int>>* sortedActorProfile = nullptr) {
+		FeatureRecord out;
+		extractFeaturesInto(out, state, actor, actorProfile, belief, hiddenFeatureCacheHits, timing,
+			sortedActorProfile, true);
+		return out;
 	}
 
 	long long evaluate(const State& state, int actor,
 		const std::unordered_map<int, int>* actorProfile = nullptr, const BeliefInput* belief = nullptr) const {
 		return evaluate(extractFeatures(state, actor, actorProfile, belief));
 	}
-	long long evaluate(const FeatureRecord& feature) const {
-		std::array<std::int64_t, GlobalHiddenCount> global{};
+	long long evaluate(const FeatureRecord& feature, unsigned long long* accumulatorHits = nullptr) const {
+		std::array<std::int32_t, GlobalHiddenCount> global{};
 		for (int h = 0; h < GlobalHiddenCount; ++h) global[h] = globalBias[h];
-		for (int d = 0; d < GlobalDenseCount; ++d) for (int h = 0; h < GlobalHiddenCount; ++h)
-			global[h] += (long long)globalDenseWeight[(size_t)h * GlobalDenseCount + d] * feature.globalDense[d];
-		for (int i = 0; i < feature.globalSparse.count; ++i) addGlobalSparse(feature.globalSparse.values[i], global);
+		if (avx2Enabled) ExactAddDenseI16ToI32Avx2(globalDenseByInput.data(), feature.globalDense.data(),
+			global.data(), GlobalDenseCount, GlobalHiddenCount);
+		else for (int d = 0; d < GlobalDenseCount; ++d) for (int h = 0; h < GlobalHiddenCount; ++h)
+			global[h] += (std::int32_t)globalDenseWeight[(size_t)h * GlobalDenseCount + d] * feature.globalDense[d];
+		for (int i = 0; i < feature.globalSparse.count; ++i)
+			addGlobalSparse(feature.globalSparse.values[i], global);
+		struct EntityCacheEntry {
+			std::uint64_t model = 0, hash = 0;
+			bool valid = false;
+			EntityRecord record;
+			std::array<std::int32_t, GlobalHiddenCount> projection{};
+		};
+		static thread_local std::array<EntityCacheEntry, 2048> entityCache;
+		auto entityHash = [](const EntityRecord& entity) {
+			std::uint64_t hash = 1469598103934665603ULL;
+			auto bytes = [&](const void* data, size_t count) {
+				const auto* input = static_cast<const std::uint8_t*>(data);
+				for (size_t i = 0; i < count; ++i) { hash ^= input[i]; hash *= 1099511628211ULL; }
+			};
+			bytes(&entity.pool, sizeof(entity.pool)); bytes(entity.dense.data(), sizeof(entity.dense));
+			bytes(&entity.sparse.count, sizeof(entity.sparse.count));
+			bytes(entity.sparse.values.data(), (size_t)entity.sparse.count * sizeof(SparseInput));
+			return hash;
+		};
+		auto sameEntity = [](const EntityRecord& left, const EntityRecord& right) {
+			return left.pool == right.pool && left.dense == right.dense
+				&& left.sparse.count == right.sparse.count
+				&& (left.sparse.count == 0 || std::memcmp(left.sparse.values.data(), right.sparse.values.data(),
+					(size_t)left.sparse.count * sizeof(SparseInput)) == 0);
+		};
 		for (int ei = 0; ei < feature.entityCount; ++ei) {
 			const EntityRecord& entity = feature.entities[ei];
-			std::array<std::int64_t, EntityHiddenCount> acc{};
+			const std::uint64_t hash = entityHash(entity);
+			EntityCacheEntry& cached = entityCache[hash & (entityCache.size() - 1)];
+			if (cached.valid && cached.model == modelHashValue && cached.hash == hash && sameEntity(cached.record, entity)) {
+				for (int gh = 0; gh < GlobalHiddenCount; ++gh) global[gh] += cached.projection[gh];
+				if (accumulatorHits != nullptr) (*accumulatorHits)++;
+				continue;
+			}
+			std::array<std::int32_t, EntityHiddenCount> acc{};
 			for (int h = 0; h < EntityHiddenCount; ++h) acc[h] = entityBias[h];
-			for (int d = 0; d < EntityDenseCount; ++d) for (int h = 0; h < EntityHiddenCount; ++h)
-				acc[h] += (long long)entityDenseWeight[(size_t)h * EntityDenseCount + d] * entity.dense[d];
+			if (avx2Enabled) ExactAddDenseI16ToI32Avx2(entityDenseByInput.data(), entity.dense.data(),
+				acc.data(), EntityDenseCount, EntityHiddenCount);
+			else for (int d = 0; d < EntityDenseCount; ++d) for (int h = 0; h < EntityHiddenCount; ++h)
+				acc[h] += (std::int32_t)entityDenseWeight[(size_t)h * EntityDenseCount + d] * entity.dense[d];
 			for (int i = 0; i < entity.sparse.count; ++i) addEntitySparse(entity.sparse.values[i], acc);
+			cached.projection.fill(0);
 			for (int gh = 0; gh < GlobalHiddenCount; ++gh) {
 				long long projection = 0;
 				for (int eh = 0; eh < EntityHiddenCount; ++eh) {
@@ -409,8 +642,10 @@ public:
 					size_t at = ((size_t)entity.pool * EntityHiddenCount + eh) * GlobalHiddenCount + gh;
 					projection += (long long)poolWeight[at] * activation;
 				}
-				global[gh] += roundedDivide(projection, WeightScale);
+				cached.projection[gh] = (std::int32_t)roundedDivide(projection, WeightScale);
+				global[gh] += cached.projection[gh];
 			}
+			cached.model = modelHashValue; cached.hash = hash; cached.record = entity; cached.valid = true;
 		}
 		long long output = outputBias;
 		for (int h = 0; h < GlobalHiddenCount; ++h) {
@@ -460,12 +695,13 @@ private:
 #pragma pack(pop)
 	std::vector<std::int32_t> tokens;
 	std::vector<int> tokenIndex;
-	std::vector<std::int16_t> entityDenseWeight, entitySparseWeight, globalDenseWeight;
+	std::vector<std::int16_t> entityDenseWeight, entityDenseByInput, entitySparseWeight, globalDenseWeight, globalDenseByInput;
 	std::vector<std::int16_t> globalSparseWeight, poolWeight, outputWeight;
 	std::vector<std::int32_t> entityBias, globalBias;
 	std::int64_t outputBias = 0;
 	std::uint64_t modelHashValue = 0;
 	bool loaded = false;
+	bool avx2Enabled = false;
 	std::string modelPath;
 
 	bool accumulatorBoundsSafe() const {
@@ -540,15 +776,23 @@ private:
 	static long long roundedDivide(long long value, long long divisor) {
 		return value >= 0 ? (value + divisor / 2) / divisor : -((-value + divisor / 2) / divisor);
 	}
-	void addEntitySparse(const SparseInput& in, std::array<std::int64_t, EntityHiddenCount>& acc) const {
+	void addEntitySparse(const SparseInput& in, std::array<std::int32_t, EntityHiddenCount>& acc) const {
 		if (in.relation < 0 || in.relation >= EntityRelationCount) return;
 		size_t base = ((size_t)in.relation * tokens.size() + indexFor(in.token)) * EntityHiddenCount;
-		for (int h = 0; h < EntityHiddenCount; ++h) acc[h] += (long long)entitySparseWeight[base + h] * in.value;
+		if (avx2Enabled) {
+			ExactAddScaledI16ToI32Avx2(entitySparseWeight.data() + base, in.value, acc.data(), EntityHiddenCount);
+			return;
+		}
+		for (int h = 0; h < EntityHiddenCount; ++h) acc[h] += (std::int32_t)entitySparseWeight[base + h] * in.value;
 	}
-	void addGlobalSparse(const SparseInput& in, std::array<std::int64_t, GlobalHiddenCount>& acc) const {
+	void addGlobalSparse(const SparseInput& in, std::array<std::int32_t, GlobalHiddenCount>& acc) const {
 		if (in.relation < 0 || in.relation >= GlobalRelationCount) return;
 		size_t base = ((size_t)in.relation * tokens.size() + indexFor(in.token)) * GlobalHiddenCount;
-		for (int h = 0; h < GlobalHiddenCount; ++h) acc[h] += (long long)globalSparseWeight[base + h] * in.value;
+		if (avx2Enabled) {
+			ExactAddScaledI16ToI32Avx2(globalSparseWeight.data() + base, in.value, acc.data(), GlobalHiddenCount);
+			return;
+		}
+		for (int h = 0; h < GlobalHiddenCount; ++h) acc[h] += (std::int32_t)globalSparseWeight[base + h] * in.value;
 	}
 	template<class Map, class Callback>
 	static void appendMap(const Map* source, int relation, Callback&& add, int scale = 1) {

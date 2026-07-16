@@ -83,6 +83,38 @@ def test_python_integer_reference_matches_native_bit_for_bit(tmp_path: Path):
         exact_unload_evaluator_model()
 
 
+def test_native_scalar_and_avx2_dispatch_are_bit_exact(tmp_path: Path, monkeypatch):
+    from cg.api import (exact_evaluate_features_v3, exact_load_evaluator_model,
+                        exact_unload_evaluator_model)
+    path = tmp_path / "evaluator-v3.bin"; model = _model(); export_quantized(path, model)
+    records = []
+    for index in range(64):
+        dense = [((index + column * 3) % 11) - 5 for column in range(GLOBAL_DENSE)]
+        sparse = [[index % GLOBAL_RELATIONS, 1 + index % 2, 32 + index * 3],
+                  [(index + 7) % GLOBAL_RELATIONS, 42, 256]]
+        entity = EntityFeatures(index % POOLS,
+            [((index * 5 + column) % 9) - 4 for column in range(ENTITY_DENSE)],
+            [[index % ENTITY_RELATIONS, 1 + index % 2, 64], [5, 42, 256]])
+        records.append(FeatureRecord(dense, sparse, [entity]))
+
+    def native(mode):
+        monkeypatch.setenv("PTCG_EVALUATOR_SIMD", mode)
+        exact_load_evaluator_model(str(path))
+        try:
+            return [exact_evaluate_features_v3(
+                list(record.global_dense), [list(item) for item in record.global_sparse],
+                [{"pool": entity.pool, "dense": list(entity.dense),
+                  "sparse": [list(item) for item in entity.sparse]}
+                 for entity in record.entities]) for record in records]
+        finally:
+            exact_unload_evaluator_model()
+
+    scalar = native("scalar")
+    avx2 = native("avx2")
+    assert scalar == avx2
+    assert scalar == [predict_integer(model, record) for record in records]
+
+
 def test_entity_attachment_relation_changes_value():
     model = _model()
     first = _record()
@@ -98,6 +130,7 @@ def test_exact_weight_promotes_and_divides_without_loss():
     assert diagnostics["product"] == str(expected)
     assert diagnostics["quotient"] == str(math.comb(54, 20))
     assert diagnostics["remainder"] == "0"
+    assert diagnostics["hashPairMatchesScalar"] is True
 
 
 def test_native_entity_and_hidden_information_invariants():
