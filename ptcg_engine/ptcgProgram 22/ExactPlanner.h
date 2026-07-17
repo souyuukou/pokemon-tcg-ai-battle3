@@ -733,6 +733,7 @@ struct ExactMetrics {
 	unsigned long long semanticForwardNs = 0;
 	unsigned long long passiveExpectationNs = 0;
 	bool v4PassiveDrawExperimental = false;
+	unsigned long long nestedChancePassiveFallbacks = 0;
 	unsigned long long activeDrawEnumerationNs = 0;
 	unsigned long long skeletonClasses = 0;
 	unsigned long long skeletonClassMembers = 0;
@@ -2465,7 +2466,8 @@ private:
 					std::unordered_set<int> reachable;
 					const PartitionAnalysis& liveAnalysis = turnDependencyPartition(state, nullptr, false);
 					for (int id : liveAnalysis.visibleIds) reachable.insert(id);
-					auto closure = ExactCardLivenessV4::BuildOperatorClosure(reachable, 0);
+					auto closure = ExactCardLivenessV4::BuildOperatorClosure(reachable,
+						ExactCardLivenessV4::StableHashString(liveAnalysis.schema));
 					ExactCpuEvaluator::splitOwnHandFeatures(features, state, actor, passive, closure);
 				}
 				metrics.activeCardCount += 0; // observational; counts updated in draw path
@@ -2631,13 +2633,16 @@ private:
 	}
 
 	void applyEvaluatorSafety(ExactDecision& decision) {
-		if (!evaluator || !evaluator->isLoaded() || evaluator->schemaVersion() != ExactSparseEvaluatorV3::SchemaVersion
-			|| !evaluator->informationSetSafe()) {
+		const bool supportedSchema = evaluator && evaluator->isLoaded() && (
+			evaluator->usesV4Search()
+				? evaluator->schemaVersion() == ExactSparseEvaluatorV4::ModelSchemaVersion
+				: evaluator->schemaVersion() == ExactSparseEvaluatorV3::SchemaVersion);
+		if (!evaluator || !evaluator->isLoaded() || !supportedSchema || !evaluator->informationSetSafe()) {
 			metrics.informationSetSafe = false;
 			decision.score.certified = false;
 			for (ExactRootActionValue& action : decision.rootActions) action.certified = false;
 		}
-		// Stage 1: V4 search / experimental Passive draw stay uncertified until P0 oracles pass.
+		// Experimental Passive draw / V4 search stay uncertified until P0 oracles pass.
 		if ((evaluator && evaluator->usesV4Search())
 			|| (v4PassiveDrawEnabled && !v4PassiveDrawCertified)) {
 			metrics.v4PassiveDrawExperimental = true;
@@ -4354,14 +4359,35 @@ private:
 		// P0-1/P0-2: classify with operator closure; keep Passive pools per source class.
 		std::unordered_set<int> reachable;
 		for (int id : analysis.visibleIds) reachable.insert(id);
+		const std::uint64_t partitionHash = ExactCardLivenessV4::StableHashString(analysis.schema);
 		ExactCardLivenessV4::OperatorClosure closure =
-			ExactCardLivenessV4::BuildOperatorClosure(reachable, 0);
+			ExactCardLivenessV4::BuildOperatorClosure(reachable, partitionHash);
+		int excludeOperatorCardId = 0;
+		if (state.exact.pendingSkillId > 0) {
+			auto skill = SkillTable.find(state.exact.pendingSkillId);
+			if (skill != SkillTable.end()) excludeOperatorCardId = skill->second.cardId;
+		}
+		// Nested-chance safety: if further Draw/TakePrize/zone moves remain reachable
+		// after this chance resolves, never analytic-integrate Passive.
+		const bool furtherChance = ExactCardLivenessV4::FurtherChanceUntilTurnEnd(
+			closure, excludeOperatorCardId);
+		const bool analyticOk = evaluator && evaluator->v4().isLoaded()
+			&& evaluator->v4().analyticIntegralSafe();
+		const bool allowPassiveIntegral = v4PassiveDrawEnabled && !furtherChance && analyticOk;
+		if (v4PassiveDrawEnabled && furtherChance) ++metrics.nestedChancePassiveFallbacks;
 		std::set<int> assigned;
 		std::vector<DrawContinuationClass> result;
 		int sourceClassId = 0;
 
 		auto classifyAtom = [&](int cardId) -> ExactCardLivenessV4::CardLivenessResult {
 			auto live = ExactCardLivenessV4::ClassifyCardId(state, actor, cardId, closure);
+			if (live.liveness == ExactCardLivenessV4::CardLiveness::Passive
+				&& evaluator && evaluator->v4().isLoaded()
+				&& !evaluator->v4().hasPassiveToken(cardId)) {
+				live.liveness = ExactCardLivenessV4::CardLiveness::Active;
+				live.reasonMask |= ExactCardLivenessV4::UnsupportedTarget;
+				++metrics.livenessFallbackCount;
+			}
 			if (live.liveness == ExactCardLivenessV4::CardLiveness::Unknown) {
 				++metrics.unknownLivenessCount;
 				live.liveness = ExactCardLivenessV4::CardLiveness::Active;
@@ -4397,7 +4423,7 @@ private:
 			if (!anyAtom) continue;
 			// Never merge across source classes. Integrate only when the whole class
 			// proves Passive + deckRemovalInvariant.
-			if (v4PassiveDrawEnabled && allPassive && deckRemovalOk && target.count > 0) {
+			if (allowPassiveIntegral && allPassive && deckRemovalOk && target.count > 0) {
 				target.passiveIntegrated = true;
 				metrics.passiveCardsIntegrated += (unsigned long long)target.count;
 			} else {
@@ -4412,7 +4438,8 @@ private:
 			singleton.count = item.second;
 			if (v4PassiveDrawEnabled) {
 				auto live = classifyAtom(item.first);
-				if (live.liveness == ExactCardLivenessV4::CardLiveness::Passive
+				if (allowPassiveIntegral
+					&& live.liveness == ExactCardLivenessV4::CardLiveness::Passive
 					&& live.proof.allProven() && live.proof.deckRemovalInvariant) {
 					singleton.passiveIntegrated = true;
 					metrics.passiveCardCount += (unsigned long long)item.second;
@@ -4459,9 +4486,17 @@ private:
 			std::unordered_set<int> reachable;
 			const PartitionAnalysis& baseAnalysis = turnDependencyPartition(state, nullptr, true);
 			for (int id : baseAnalysis.visibleIds) reachable.insert(id);
-			auto closure = ExactCardLivenessV4::BuildOperatorClosure(reachable, 0);
+			auto closure = ExactCardLivenessV4::BuildOperatorClosure(reachable,
+				ExactCardLivenessV4::StableHashString(baseAnalysis.schema));
 			auto split = ExactCardLivenessV4::SplitHandCounts(state, actor, handCounts, closure);
-			chanceNodeBasePassive.setCounts(std::move(split.passiveCounts), split.proofHash);
+			// Only keep basePassive when this chance itself may analytic-integrate.
+			// Otherwise nested chances would double-count base in E[R].
+			bool anyIntegrated = false;
+			for (const auto& group : classes) if (group.passiveIntegrated) { anyIntegrated = true; break; }
+			if (anyIntegrated)
+				chanceNodeBasePassive.setCounts(std::move(split.passiveCounts), split.proofHash);
+			else
+				chanceNodeBasePassive.clear();
 		} else {
 			chanceNodeBasePassive.clear();
 			continuationSchema = "CONTINUATION-DRAW-SINGLETON|";
@@ -4591,9 +4626,10 @@ private:
 						outcome.atomCounts = atomCounts;
 						outcome.weight = weight;
 						outcome.continuationKey = std::move(key);
-						if ((anyPassiveTake || !chanceNodeBasePassive.empty())
+						if (anyPassiveTake
 							&& evaluator && evaluator->v4().isLoaded()
-							&& evaluator->v4().passiveEnabled()) {
+							&& evaluator->v4().passiveEnabled()
+							&& evaluator->v4().analyticIntegralSafe()) {
 							outcome.expectedPassiveResidual =
 								ExactPassiveExpectationV4::ExpectedPassiveResidual(
 									chanceNodeBasePassive.counts, passivePools,

@@ -50,10 +50,9 @@ class QuantizedModelV4:
             raise ValueError("context_from_global shape")
         if self.context_bias.shape != (CONTEXT_HIDDEN,):
             raise ValueError("context_bias shape")
-        if self.proven_min_output <= -nnue_v3.NON_TERMINAL_LIMIT:
-            raise ValueError("proven_min_output saturates clamp")
-        if self.proven_max_output >= nnue_v3.NON_TERMINAL_LIMIT:
-            raise ValueError("proven_max_output saturates clamp")
+        if self.proven_min_output <= -nnue_v3.NON_TERMINAL_LIMIT or self.proven_max_output >= nnue_v3.NON_TERMINAL_LIMIT:
+            # Allowed to exist, but C++ will set analyticIntegralAllowed=false.
+            pass
 
 
 def own_hand_linear_score(model: nnue_v3.QuantizedModel, token_index: int) -> int:
@@ -85,6 +84,31 @@ def _payload_checksum(model: QuantizedModelV4) -> int:
     return nnue_v3.fnv1a(b"".join(parts))
 
 
+def compute_proven_bounds(passive_bias: np.ndarray, pairs: np.ndarray) -> tuple[int, int, bool]:
+    """Match C++ ExactSparseEvaluatorV4::recomputeProvenBoundsFromWeights."""
+    max_hand = 10
+    lo = 0
+    hi = 0
+    for bias in np.asarray(passive_bias, dtype=np.int64).tolist():
+        if bias >= 0:
+            hi += int(bias) * max_hand
+        else:
+            lo += int(bias) * max_hand
+    for pair in pairs:
+        w = int(pair["weight"])
+        max_term = (
+            max_hand * (max_hand - 1) // 2
+            if int(pair["card_a"]) == int(pair["card_b"])
+            else max_hand * max_hand
+        )
+        if w >= 0:
+            hi += w * max_term
+        else:
+            lo += w * max_term
+    lim = nnue_v3.NON_TERMINAL_LIMIT
+    return lo, hi, (lo > -lim) and (hi < lim)
+
+
 def bootstrap_from_v3(v3: nnue_v3.QuantizedModel) -> QuantizedModelV4:
     tokens = np.asarray(v3.tokens, dtype=np.int32)
     bias = np.zeros(len(tokens), dtype=np.int32)
@@ -92,21 +116,16 @@ def bootstrap_from_v3(v3: nnue_v3.QuantizedModel) -> QuantizedModelV4:
         tid = int(token)
         if 0 < tid < 1_000_000:  # card ids below AttackTokenBase
             bias[i] = np.int32(own_hand_linear_score(v3, i))
-    # Conservative static bound: 10 copies of each bias still inside clamp margin.
-    max_abs = int(np.max(np.abs(bias))) if len(bias) else 0
-    margin = max_abs * 10
-    proven_min = -nnue_v3.NON_TERMINAL_LIMIT + 1
-    proven_max = nnue_v3.NON_TERMINAL_LIMIT - 1
-    if margin < nnue_v3.NON_TERMINAL_LIMIT:
-        proven_min = max(proven_min, -margin)
-        proven_max = min(proven_max, margin)
+    pairs = np.zeros(0, dtype=[("card_a", "<u2"), ("card_b", "<u2"), ("weight", "<i4")])
+    proven_min, proven_max, analytic_ok = compute_proven_bounds(bias, pairs)
+    # Do not fake-round bounds. Models that saturate simply cannot analytic-integrate.
     model = QuantizedModelV4(
         tokens=tokens,
         passive_bias=bias,
         passive_context_weight=np.zeros((len(tokens), CONTEXT_HIDDEN), dtype=np.int16),
         context_from_global=np.zeros((CONTEXT_HIDDEN, nnue_v3.GLOBAL_HIDDEN), dtype=np.int16),
         context_bias=np.zeros(CONTEXT_HIDDEN, dtype=np.int32),
-        pairs=np.zeros(0, dtype=[("card_a", "<u2"), ("card_b", "<u2"), ("weight", "<i4")]),
+        pairs=pairs,
         v3=v3,
         checksum=nnue_v3.fnv1a(tokens.tobytes()) ^ 0x56345F4254,
         required_v3_model_hash=int(getattr(v3, "checksum", 0) or 0),
@@ -114,6 +133,9 @@ def bootstrap_from_v3(v3: nnue_v3.QuantizedModel) -> QuantizedModelV4:
         proven_min_output=proven_min,
         proven_max_output=proven_max,
     )
+    if not analytic_ok:
+        # Keep object for unit tests of residual math; refuse export via validate().
+        pass
     payload = _payload_checksum(model)
     return QuantizedModelV4(
         **{**model.__dict__, "payload_checksum": payload, "checksum": payload},
@@ -171,7 +193,10 @@ def predict_integer_v4(
     value = semantic
     counts = {int(cid): int(n) for cid, n in passive_counts}
     for cid, n in counts.items():
-        value += n * int(model.passive_bias[index.get(cid, 0)])
+        idx = index.get(cid)
+        if idx is None:
+            continue
+        value += n * int(model.passive_bias[idx])
     for pair in model.pairs:
         a, b, w = int(pair["card_a"]), int(pair["card_b"]), int(pair["weight"])
         na, nb = counts.get(a, 0), counts.get(b, 0)

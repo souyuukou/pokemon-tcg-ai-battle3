@@ -127,12 +127,23 @@ extern "C" GAME_API const char8_t* ExactCardLivenessV4Diagnostics() {
   state.supporterPlayed = true;
   ExactCardLivenessV4::OperatorClosure withUltra =
     ExactCardLivenessV4::BuildOperatorClosure({ ultraBallId }, 0);
+  bool ultraDiscardCostObserved = false;
+  for (const auto& fp : withUltra.footprints) {
+    if (fp.operatorCardId == ultraBallId && fp.mayDiscardHand) {
+      ultraDiscardCostObserved = true;
+      break;
+    }
+  }
   ExactCardLivenessV4::CardLivenessResult supporterVsUltra{};
   bool ultraBlocksSupporter = false;
   if (supporterId) {
     supporterVsUltra = ExactCardLivenessV4::ClassifyCardId(state, 0, supporterId, withUltra);
     ultraBlocksSupporter = supporterVsUltra.liveness != ExactCardLivenessV4::CardLiveness::Passive;
   }
+  // Empty closure: used supporter with no hand-targeting operators can be Passive.
+  ExactCardLivenessV4::CardLivenessResult supporterAlone =
+    supporterId ? ExactCardLivenessV4::ClassifyCardId(state, 0, supporterId, empty)
+      : ExactCardLivenessV4::CardLivenessResult{};
 
   j.clear(); j.append('{');
   j.appendKeyValue("livenessSchemaVersion", ExactCardLivenessV4::LivenessSchemaVersion);
@@ -142,7 +153,10 @@ extern "C" GAME_API const char8_t* ExactCardLivenessV4Diagnostics() {
   j.appendCommaKeyValue("sampleActive", sampleActive);
   j.appendCommaKeyValue("sampleUnknown", sampleUnknown);
   j.appendCommaKeyValue("energyOncePassive", energyId != 0 && samplePassive >= 1);
+  j.appendCommaKeyValue("ultraBallDiscardCostObserved", ultraDiscardCostObserved);
   j.appendCommaKeyValue("ultraBallBlocksUsedSupporter", ultraBlocksSupporter);
+  j.appendCommaKeyValue("usedSupporterPassiveWithoutUltra",
+    supporterId != 0 && supporterAlone.liveness == ExactCardLivenessV4::CardLiveness::Passive);
   j.appendCommaKeyValue("supporterLiveness", (int)supporterVsUltra.liveness);
   j.append('}');
   return j.buf.c_str();
@@ -621,6 +635,7 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
 	j.appendCommaKey("richPassiveIntegratedWeight"); j.appendDoubleQuote(decision.metrics.richPassiveIntegratedWeight.text().c_str());
 	j.appendCommaKey("richTotalChanceWeight"); j.appendDoubleQuote(decision.metrics.richTotalChanceWeight.text().c_str());
 	j.appendCommaKeyValue("v4PassiveDrawExperimental", decision.metrics.v4PassiveDrawExperimental);
+	j.appendCommaKey("nestedChancePassiveFallbacks"); AppendUnsignedLongLong(j, decision.metrics.nestedChancePassiveFallbacks);
 	j.appendCommaKey("livenessAnalysisNs"); AppendUnsignedLongLong(j, decision.metrics.livenessAnalysisNs);
 	j.appendCommaKey("semanticForwardNs"); AppendUnsignedLongLong(j, decision.metrics.semanticForwardNs);
 	j.appendCommaKey("passiveExpectationNs"); AppendUnsignedLongLong(j, decision.metrics.passiveExpectationNs);
@@ -788,6 +803,7 @@ static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
 	into.richPassiveIntegratedWeight += from.richPassiveIntegratedWeight;
 	into.richTotalChanceWeight += from.richTotalChanceWeight;
 	into.v4PassiveDrawExperimental = into.v4PassiveDrawExperimental || from.v4PassiveDrawExperimental;
+	into.nestedChancePassiveFallbacks += from.nestedChancePassiveFallbacks;
 	into.livenessAnalysisNs += from.livenessAnalysisNs;
 	into.semanticForwardNs += from.semanticForwardNs;
 	into.passiveExpectationNs += from.passiveExpectationNs;

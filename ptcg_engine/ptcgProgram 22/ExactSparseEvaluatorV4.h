@@ -50,11 +50,7 @@ public:
 			error = "invalid V4 model header";
 			return false;
 		}
-		if (header.provenMinOutput <= -ExactSparseEvaluatorV3::NonTerminalLimit
-			|| header.provenMaxOutput >= ExactSparseEvaluatorV3::NonTerminalLimit) {
-			error = "V4 proven output range reaches clamp boundary";
-			return false;
-		}
+		// proven bounds verified after payload via recomputeProvenBoundsFromWeights()
 		tokens.resize(header.tokenCount);
 		in.read(reinterpret_cast<char*>(tokens.data()), (std::streamsize)(tokens.size() * sizeof(std::int32_t)));
 		passiveBias.assign(header.tokenCount, 0);
@@ -89,6 +85,12 @@ public:
 		provenMinOutput = header.provenMinOutput;
 		provenMaxOutput = header.provenMaxOutput;
 		rebuildTokenIndex();
+		recomputeProvenBoundsFromWeights();
+		if (header.provenMinOutput != provenMinOutput || header.provenMaxOutput != provenMaxOutput) {
+			error = "V4 proven bounds mismatch recomputation";
+			return false;
+		}
+		// Saturating models load, but analyticIntegralAllowed stays false.
 		modelHashValue = header.payloadChecksum != 0 ? header.payloadChecksum : header.legacyChecksum;
 		modelPath = path;
 		standalone = true;
@@ -149,21 +151,16 @@ public:
 			if (contrib < minOut) minOut = contrib;
 			if (contrib > maxOut) maxOut = contrib;
 		}
-		provenMinOutput = -ExactSparseEvaluatorV3::NonTerminalLimit + 1 + minOut;
-		provenMaxOutput = ExactSparseEvaluatorV3::NonTerminalLimit - 1 + maxOut;
-		// Keep bootstrap loadable only when residual cannot saturate alone.
-		if (provenMinOutput <= -ExactSparseEvaluatorV3::NonTerminalLimit)
-			provenMinOutput = -ExactSparseEvaluatorV3::NonTerminalLimit + 1;
-		if (provenMaxOutput >= ExactSparseEvaluatorV3::NonTerminalLimit)
-			provenMaxOutput = ExactSparseEvaluatorV3::NonTerminalLimit - 1;
 		requiredV3ModelHash = trunk.modelHash();
 		cardTokenTableHash = fnv1a(reinterpret_cast<const unsigned char*>(tokens.data()),
 			tokens.size() * sizeof(std::int32_t));
 		featureSchemaHash = FeatureSchemaVersion;
 		livenessSchemaHash = LivenessSchemaVersion;
+		recomputeProvenBoundsFromWeights();
 		standalone = false;
 		loaded = true;
 		modelHashValue = trunk.modelHash() ^ 0x56345F4254ULL; // V4BT
+		(void)minOut; (void)maxOut;
 	}
 
 	bool isLoaded() const { return loaded; }
@@ -200,8 +197,14 @@ public:
 
 	long long passiveCardValueContextFree(int cardId) const {
 		const int index = indexFor(cardId);
-		return index < (int)passiveBias.size() ? passiveBias[(size_t)index] : 0;
+		if (index < 0 || index >= (int)passiveBias.size()) return 0;
+		return passiveBias[(size_t)index];
 	}
+
+	bool hasPassiveToken(int cardId) const { return indexFor(cardId) >= 0; }
+	bool analyticIntegralSafe() const { return analyticIntegralAllowed; }
+	std::int64_t provenMin() const { return provenMinOutput; }
+	std::int64_t provenMax() const { return provenMaxOutput; }
 
 	long long evaluatePassiveResidual(const ExactPassivePayloadV4& passive) const {
 		if (!enablePassive || passive.empty()) return 0;
@@ -292,23 +295,46 @@ private:
 		return hash;
 	}
 
+	void recomputeProvenBoundsFromWeights() {
+		constexpr int MaxHandCopies = 10;
+		long long lo = 0, hi = 0;
+		for (std::int32_t bias : passiveBias) {
+			if (bias >= 0) hi += (long long)bias * MaxHandCopies;
+			else lo += (long long)bias * MaxHandCopies;
+		}
+		for (const auto& pair : passivePairs) {
+			const long long w = pair.weight;
+			const long long maxTerm = (pair.cardA == pair.cardB)
+				? (long long)MaxHandCopies * (MaxHandCopies - 1) / 2
+				: (long long)MaxHandCopies * MaxHandCopies;
+			if (w >= 0) hi += w * maxTerm;
+			else lo += w * maxTerm;
+		}
+		const long long lim = ExactSparseEvaluatorV3::NonTerminalLimit;
+		provenMinOutput = lo;
+		provenMaxOutput = hi;
+		analyticIntegralAllowed = (lo > -lim) && (hi < lim);
+	}
+
 	void rebuildTokenIndex() {
 		tokenIndex.clear();
 		int maximum = 0;
 		for (int token : tokens) if (token > maximum) maximum = token;
-		tokenIndex.assign((size_t)maximum + 1, 0);
+		tokenIndex.assign((size_t)maximum + 1, -1);
 		for (size_t i = 0; i < tokens.size(); ++i)
 			if (tokens[i] >= 0 && tokens[i] < (int)tokenIndex.size()) tokenIndex[(size_t)tokens[i]] = (int)i;
 	}
 
 	int indexFor(int token) const {
-		return token >= 0 && token < (int)tokenIndex.size() ? tokenIndex[(size_t)token] : 0;
+		if (token < 0 || token >= (int)tokenIndex.size()) return -1;
+		return tokenIndex[(size_t)token];
 	}
 
 	bool loaded = false;
 	bool standalone = false;
 	bool enablePassive = true;
 	bool enablePairs = true;
+	bool analyticIntegralAllowed = false;
 	std::uint64_t modelHashValue = 0;
 	std::uint64_t requiredV3ModelHash = 0;
 	std::uint64_t featureSchemaHash = 0;

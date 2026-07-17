@@ -100,6 +100,7 @@ def test_liveness_schema_v2(lib):
     data = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
     assert data["livenessSchemaVersion"] == 2
     assert data["ultraBallBlocksUsedSupporter"] is True
+    assert data.get("ultraBallDiscardCostObserved", True) is True
 
 
 def test_liveness_defaults_unknown_not_passive(lib):

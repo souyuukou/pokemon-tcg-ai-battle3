@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
+#include <string>
 #include <vector>
 
 // Conservative turn-remainder liveness for V4 Passive Residual.
@@ -167,6 +168,69 @@ inline std::uint64_t MixHash(std::uint64_t hash, std::uint64_t value) {
 	hash ^= value;
 	hash *= 1099511628211ULL;
 	return hash;
+}
+
+inline std::uint64_t StableHashBytes(const void* data, size_t size) {
+	std::uint64_t hash = 1469598103934665603ULL;
+	const auto* bytes = static_cast<const unsigned char*>(data);
+	for (size_t i = 0; i < size; ++i) {
+		hash ^= bytes[i];
+		hash *= 1099511628211ULL;
+	}
+	return hash;
+}
+
+inline std::uint64_t StableHashString(const std::string& value) {
+	return StableHashBytes(value.data(), value.size());
+}
+
+// Short-term safety: Passive analytic integral is only allowed when no further
+// Draw / TakePrize / hand↔deck movement can occur for the rest of the turn.
+inline bool EffectImpliesFurtherChanceOrZoneMove(EffectType type) {
+	switch (type) {
+	case EffectType::Draw:
+	case EffectType::DrawTargetCount:
+	case EffectType::DrawPrizeCount:
+	case EffectType::DrawUntil:
+	case EffectType::DrawUntilPsychic:
+	case EffectType::DrawMirror:
+	case EffectType::ToHand:
+	case EffectType::ToDeck:
+	case EffectType::ToDeckAndShuffle:
+	case EffectType::ToDeckBottomClose:
+	case EffectType::ToDeckBottomReverse:
+	case EffectType::ToTrash:
+	case EffectType::DeckToTrash:
+	case EffectType::DeckBottomToTrash:
+	case EffectType::LookDeck:
+	case EffectType::LookDeckReverse:
+	case EffectType::LookDeckBottom:
+	case EffectType::LookAndReturn:
+	case EffectType::SwitchDeck:
+	case EffectType::SelectCard:
+	case EffectType::ForEach:
+	case EffectType::SelectEvolvesFrom:
+	case EffectType::SelectEvolvesTo:
+	case EffectType::SelectAttachFrom:
+	case EffectType::SelectAttachTo:
+		return true;
+	default:
+		return false;
+	}
+}
+
+inline bool FurtherChanceUntilTurnEnd(const OperatorClosure& closure,
+	int excludeOperatorCardId = 0) {
+	if (!closure.complete) return true;
+	for (const OperatorFootprint& fp : closure.footprints) {
+		if (excludeOperatorCardId != 0 && fp.operatorCardId == excludeOperatorCardId)
+			continue;
+		if (fp.observation == CardObservationKind::Unknown) return true;
+		if (EffectImpliesFurtherChanceOrZoneMove(fp.effectType)) return true;
+		if (fp.mayTargetDeck || fp.mayMoveCardZones) return true;
+		if (fp.mayReturnHandToDeck || fp.mayDiscardHand) return true;
+	}
+	return false;
 }
 
 // Build operator footprints from reachable card IDs (skills / play effects).

@@ -6,12 +6,12 @@
 #include "ExactSparseEvaluatorV3.h"
 
 #include <cstdint>
+#include <unordered_map>
 #include <unordered_set>
 
-// Explicit V4 feature split: Passive identities never enter Semantic trunk.
+// Explicit V4 feature split: Passive hand identities leave Semantic OwnHand only.
 struct SemanticFeaturesV4 {
 	ExactSparseEvaluatorV3::FeatureRecord features{};
-	// Identity-free aggregates (ablation candidates).
 	std::int32_t passiveHandTotal = 0;
 	std::int32_t passivePokemonCount = 0;
 	std::int32_t passiveTrainerCount = 0;
@@ -27,38 +27,12 @@ struct FeatureRecordV4 {
 
 namespace ExactFeatureV4 {
 
-inline bool IsPassiveIdentityRelation(std::int16_t relation) {
-	using R = ExactSparseEvaluatorV3::GlobalRelation;
-	switch (relation) {
-	case R::OwnHand:
-	case R::OwnHiddenPool:
-	case R::OwnDeckExpected:
-	case R::OwnPrizeExpected:
-	case R::OwnDeckExists:
-	case R::OwnPrizeExists:
-	case R::OwnKnownDeck:
-	case R::OwnKnownPrize:
-	case R::OwnKnownTop0:
-	case R::OwnKnownTop1:
-	case R::OwnKnownTop2:
-	case R::OwnKnownTop3:
-	case R::OwnKnownBottom0:
-	case R::OwnKnownBottom1:
-	case R::OwnKnownBottom2:
-	case R::OwnKnownBottom3:
-	case R::ComboProbability:
-		return true;
-	default:
-		return false;
-	}
-}
-
-// Strip Passive card IDs from identity-bearing global sparse relations.
-// Tokens listed in `passiveIds` are removed from those relations.
+// V4.0: strip Passive copies from OwnHand only. Deck/prize/combo/hidden features that
+// share the same card ID must remain — otherwise deck residual information vanishes.
 inline FeatureRecordV4 BuildFromV3(
 	const ExactSparseEvaluatorV3::FeatureRecord& source,
 	const ExactPassivePayloadV4& passive,
-	const std::unordered_set<int>* passiveIds = nullptr) {
+	const std::unordered_set<int>* /*passiveIds*/ = nullptr) {
 	FeatureRecordV4 out;
 	out.semantic.features = source;
 	out.passive = passive;
@@ -68,16 +42,20 @@ inline FeatureRecordV4 BuildFromV3(
 	ExactSparseEvaluatorV3::FixedSparseList<ExactSparseEvaluatorV3::MaxGlobalSparse> kept;
 	for (int i = 0; i < source.globalSparse.count; ++i) {
 		const auto& item = source.globalSparse.values[i];
-		const bool identityRelation = IsPassiveIdentityRelation(item.relation);
-		const bool isPassiveToken = passiveIds != nullptr && passiveIds->contains(item.token);
-		const bool isPassiveHand = item.relation == ExactSparseEvaluatorV3::OwnHand
-			&& (passive.countOf(item.token) > 0 || isPassiveToken);
-		if (identityRelation && (isPassiveToken || isPassiveHand))
+		if (item.relation != ExactSparseEvaluatorV3::OwnHand) {
+			kept.push(item.token, item.relation, item.value);
 			continue;
-		if (identityRelation && item.relation != ExactSparseEvaluatorV3::OwnHand
-			&& passiveIds != nullptr && isPassiveToken)
+		}
+		const int passiveCopies = passive.countOf(item.token);
+		if (passiveCopies <= 0) {
+			kept.push(item.token, item.relation, item.value);
 			continue;
-		kept.push(item.token, item.relation, item.value);
+		}
+		int copies = item.value / ExactSparseEvaluatorV3::BeliefScale;
+		if (copies <= 0) copies = 1;
+		const int keep = copies - passiveCopies;
+		if (keep > 0)
+			kept.push(item.token, item.relation, keep * ExactSparseEvaluatorV3::BeliefScale);
 	}
 	out.semantic.features.globalSparse = kept;
 	return out;
