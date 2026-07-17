@@ -1,4 +1,4 @@
-"""V4 Phase 1–3 native diagnostics (requires rebuilt cg.dll)."""
+"""V4 Phase 1 E native diagnostics (requires rebuilt cg.dll)."""
 from __future__ import annotations
 
 import json
@@ -20,7 +20,7 @@ def test_liveness_diagnostics_energy_passive(lib):
         pytest.skip("ExactCardLivenessV4Diagnostics not exported")
     raw = lib.ExactCardLivenessV4Diagnostics()
     data = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
-    assert data["livenessSchemaVersion"] == 3
+    assert data["livenessSchemaVersion"] == 4
     # Empty operator closure can still prove energy-once Passive; Active sample may
     # be zero if the chosen Item is turn-locked. At least one classification runs.
     assert data["samplePassive"] + data["sampleActive"] + data["sampleUnknown"] >= 1

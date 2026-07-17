@@ -22,7 +22,7 @@ def test_ultra_ball_discard_cost_makes_used_supporter_active(lib):
 
     raw = lib.ExactCardLivenessV4Diagnostics()
     data = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
-    assert data["livenessSchemaVersion"] == 3
+    assert data["livenessSchemaVersion"] == 4
     assert data["ultraBallDiscardCostObserved"] is True
     assert data["ultraBallBlocksUsedSupporter"] is True
     assert data["usedSupporterPassiveWithoutUltra"] is True
@@ -63,7 +63,7 @@ def test_representative_atom_order_invariant_expectation():
 
 
 def test_nested_draw_double_count_guard_documented():
-    """Document short-term policy: further chance ⇒ no Passive integral."""
+    """Document short-term policy: further chance ⇁Eno Passive integral."""
     # FurtherChanceUntilTurnEnd with Ultra Ball reachable forbids integral.
     # Full moment-state fix is follow-up; this asserts the safety contract exists.
     assert hasattr(sim.lib, "ExactCardLivenessV4Diagnostics")

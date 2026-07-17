@@ -2,20 +2,20 @@
 
 ## Gate verdict
 
-Experimental only. `certified=false` until full identity oracles pass on production decks.
+Experimental only. `certified=false` until full identity oracles + safe residual bounds.
 
-## P0e (this push)
+## P0f (this push)
 
 | Item | Status |
 |------|--------|
-| Per-card `CandidateCoverageProof` / `proveCandidate` | done |
-| Scanners: pending / global / costs / selection / conditions | done |
-| Condition effects included in operator footprints | done |
-| Dropped `closure.complete()` as Passive integral gate | done |
-| Nested chance = pending-skill remainder (not all Main Items) | done |
-| Fallback metrics by coverage category | done |
-| Damage-only operators do not block Passive energy | done (diagnostics) |
-| Mini-deck Passive ON/OFF identity oracle | added (skips if setup fails) |
+| `AnyReachableFurtherChance` disables Passive integral (nested double-count guard) | done |
+| Attack / delay footprints in operator closure | done |
+| Global scan: tool / energy / trigger stacks; attacks only for active player | done |
+| Selection scan uses real `options` + lists (not trusted `selectContext`) | done |
+| `targetMayMatchCandidate` per-card footprint filter | done |
+| Artificial deck asserts `passiveCardsIntegrated > 0` | done |
+| Residual timer + outcome-weight `richPassiveIntegratedWeight` | done |
+| `PassiveMomentStateV4` (leaf-once residual) | **not yet** |
 | seed4 90s certified | still Phase-6 |
 
-`closure.complete()` remains a diagnostic aggregate. Passive classification uses `proveCandidate` + `PassiveProofV4`.
+Bootstrap V3→V4 models may fail `analyticIntegralSafe()` (60-copy residual bound). Experimental Passive draw still integrates; certification stays false.

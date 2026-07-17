@@ -3,6 +3,7 @@
 #pragma once
 
 #include "Card.h"
+#include "ExactCardPartition.h"
 #include "Skill.h"
 #include "State.h"
 #include "Types.h"
@@ -22,7 +23,7 @@
 // Unrelated AttackDamage operators must not block Passive proof for a locked Supporter.
 namespace ExactCardLivenessV4 {
 
-static constexpr int LivenessSchemaVersion = 3;
+static constexpr int LivenessSchemaVersion = 4;
 
 enum class CardLiveness : unsigned char { Active = 0, Passive = 1, Unknown = 2 };
 
@@ -86,6 +87,8 @@ struct OperatorFootprint {
 	ConditionType conditionType = ConditionType::Always;
 	bool isCondition = false;
 	CardObservationKind observation = CardObservationKind::Unknown;
+	Target target{};
+	bool hasTarget = false;
 	bool mayTargetHand = false;
 	bool mayTargetDeck = false;
 	bool mayDiscardHand = false;
@@ -171,8 +174,38 @@ inline CardObservationKind ObservationKindForEffect(EffectType type) {
 	case EffectType::NoEffect:
 	case EffectType::AttackDamage:
 	case EffectType::AttackDamageChange:
+	case EffectType::AttackDamageMulti:
+	case EffectType::AttackDamageCoin:
 	case EffectType::Coin:
+	case EffectType::CoinUntilTail:
 	case EffectType::NotMove:
+	case EffectType::Switch:
+	case EffectType::Paralyze:
+	case EffectType::Heal:
+	case EffectType::HealAll:
+	case EffectType::HealSand:
+	case EffectType::ResetHp:
+	case EffectType::Drain:
+	case EffectType::DamageCounter:
+	case EffectType::DamageCounterRemoved:
+	case EffectType::DamageCounterDamaged:
+	case EffectType::DamageCounterAny:
+	case EffectType::DamageCounterDouble:
+	case EffectType::DamageCounterHp:
+	case EffectType::RemoveDamageCounter:
+	case EffectType::RemoveDamageCounterAll:
+	case EffectType::AttackDamageChangeTargetCount:
+	case EffectType::EffectDamageChangeTargetCount:
+	case EffectType::AttackDamageChangeEnergyCount:
+	case EffectType::EffectDamageChangeEnergyCount:
+	case EffectType::AttackDamageChangeTypeEnergyCount:
+	case EffectType::EffectDamageChangeTypeEnergyCount:
+	case EffectType::AttackDamageChangeEnergyCountCoin:
+	case EffectType::AttackDamageChangeTypeEnergyCountCoin:
+	case EffectType::AttackDamageChangeCoin:
+	case EffectType::AttackDamageChangeCoinUntilTail:
+	case EffectType::AttackDamageChangeTargetCountCoin:
+	case EffectType::DelayEffect:
 		return CardObservationKind::None;
 	case EffectType::Draw:
 	case EffectType::DrawTargetCount:
@@ -198,11 +231,30 @@ inline CardObservationKind ObservationKindForEffect(EffectType type) {
 	case EffectType::SelectEvolvesTo:
 	case EffectType::SelectAttachFrom:
 	case EffectType::SelectAttachTo:
+	case EffectType::Devolve:
+	case EffectType::DevolveAny:
+	case EffectType::TransformDeck:
+	case EffectType::TransformTrash:
 		return CardObservationKind::CardIdentity;
 	case EffectType::ToDeckBottomClose:
 	case EffectType::ToDeckBottomReverse:
 		return CardObservationKind::CardOrder;
+	case EffectType::BreakIfCoinHead:
+	case EffectType::BreakIfCoinTail:
+	case EffectType::BreakIfCoinTailMulti:
+	case EffectType::SkipIfCoinTail:
+	case EffectType::PostEffectActivate:
+	case EffectType::BreakIfNotPostEffectActivated:
+	case EffectType::FailAttack:
+	case EffectType::CancelFailAttack:
+	case EffectType::SelectActivate:
+	case EffectType::SelectPoisonBurnConfuse:
+	case EffectType::SelectSpecialCondition:
+		return CardObservationKind::None;
 	default:
+		// Continual field modifiers (HP/cost/damage changes) do not observe hand IDs.
+		if (type > EffectType::ContinualEffectSeparator)
+			return CardObservationKind::None;
 		return CardObservationKind::Unknown;
 	}
 }
@@ -319,6 +371,8 @@ inline OperatorFootprint FootprintFromEffect(int cardId, const Effect& effect) {
 	fp.effectType = effect.effectType;
 	fp.conditionType = effect.conditionType;
 	fp.isCondition = effect.isCondition;
+	fp.target = effect.target;
+	fp.hasTarget = true;
 	fp.mayTargetHand = TargetIncludesHand(effect.target);
 	fp.mayTargetDeck = TargetIncludesDeck(effect.target);
 	if (effect.isCondition) {
@@ -354,6 +408,27 @@ inline OperatorFootprint FootprintFromEffect(int cardId, const Effect& effect) {
 	fp.mayCountHandByType = fp.mayTargetHand && !effect.target.conditions.empty();
 	fp.maySearchDeckByIdentity = fp.mayTargetDeck && EffectKindBlocksPassive(fp.observation);
 	return fp;
+}
+
+// True if the target filter may select this candidate (fail closed on unsupported).
+inline bool targetMayMatchCandidate(const Target& target, int candidateCardId) {
+	const CardMaster* master = FindCardMaster(candidateCardId);
+	if (master == nullptr) return true;
+	if (target.conditions.empty()) return true;
+	ExactStaticTargetResult result = ExactStaticTargetMatches(*master, target);
+	if (!result.supported) return true;
+	return result.matches;
+}
+
+inline bool footprintMayAffectCandidate(const OperatorFootprint& fp, int candidateCardId) {
+	if (!fp.hasTarget) return true;
+	// Zone-agnostic unknown footprints always apply.
+	if (fp.observation == CardObservationKind::Unknown) return true;
+	// Hand/deck hazards only matter when the target filter can hit the candidate.
+	if (fp.mayTargetHand || fp.mayTargetDeck || fp.mayDiscardHand || fp.mayReturnHandToDeck
+		|| fp.mayCountHandByType || fp.mayCountHandTotal || fp.maySearchDeckByIdentity)
+		return targetMayMatchCandidate(fp.target, candidateCardId);
+	return true;
 }
 
 inline void MergeCoverageHazard(CoverageResult& into, const OperatorFootprint& fp) {
@@ -402,8 +477,11 @@ inline CoverageResult ScanPendingEffects(const State& state) {
 		r.impliesFurtherChance = true;
 		return r;
 	}
-	if (exact.pending == ExactPendingType::Draw
-		|| exact.pending == ExactPendingType::TakePrize
+	// The draw chance currently under analysis is not an extra Passive hazard —
+	// Passive pools describe identities inside this draw.
+	if (exact.pending == ExactPendingType::Draw)
+		return r;
+	if (exact.pending == ExactPendingType::TakePrize
 		|| exact.pending == ExactPendingType::RevealDeck) {
 		r.impliesFurtherChance = true;
 		if (exact.pendingIntent == ExactQueryIntent::ConcreteCards)
@@ -417,6 +495,14 @@ inline CoverageResult ScanPendingEffects(const State& state) {
 			return r;
 		}
 		const Effect& effect = skill->second.effects[exact.pendingEffectIndex];
+		// Skip the Draw effect that owns this pending chance.
+		if (effect.effectType == EffectType::Draw
+			|| effect.effectType == EffectType::DrawTargetCount
+			|| effect.effectType == EffectType::DrawPrizeCount
+			|| effect.effectType == EffectType::DrawUntil
+			|| effect.effectType == EffectType::DrawUntilPsychic
+			|| effect.effectType == EffectType::DrawMirror)
+			return r;
 		OperatorFootprint fp = FootprintFromEffect(skill->second.cardId, effect);
 		MergeCoverageHazard(r, fp);
 	}
@@ -426,81 +512,68 @@ inline CoverageResult ScanPendingEffects(const State& state) {
 inline CoverageResult ScanSelectionContexts(const State& state) {
 	CoverageResult r;
 	r.analyzed = true;
-	switch (state.selectType) {
-	case SelectType::None:
-	case SelectType::Main:
-	case SelectType::Attack:
-	case SelectType::Skill:
-	case SelectType::YesNo:
-	case SelectType::SpecialCondition:
-	case SelectType::Count:
-		return r;
-	case SelectType::Evolve:
-		// Evolution observes Pokémon identity on field, not hand/deck card IDs for Passive.
-		return r;
-	case SelectType::Energy:
-	case SelectType::AttachedCard:
-	case SelectType::CardOrAttachedCard:
-		r.touchesHandIdentity = true; // energy discard/attach often identity-sensitive
-		r.mayDiscardHand = state.selectContext == SelectContext::Discard
-			|| state.selectContext == SelectContext::DiscardEnergy
-			|| state.selectContext == SelectContext::DiscardEnergyCard
-			|| state.selectContext == SelectContext::DiscardCardOrAttachedCard;
-		r.mayReturnHandToDeck = state.selectContext == SelectContext::ToDeck
-			|| state.selectContext == SelectContext::ToDeckBottom
-			|| state.selectContext == SelectContext::ToDeckEnergy;
-		r.mayMoveZones = true;
-		return r;
-	case SelectType::Card:
-		switch (state.selectContext) {
-		case SelectContext::Main:
-		case SelectContext::SetupActivePokemon:
-		case SelectContext::SetupBenchPokemon:
-		case SelectContext::Switch:
-		case SelectContext::ToActive:
-		case SelectContext::ToBench:
-		case SelectContext::ToField:
-		case SelectContext::Damage:
-		case SelectContext::DamageCounter:
-		case SelectContext::DamageCounterAny:
-		case SelectContext::Heal:
-		case SelectContext::RemoveDamageCounter:
-		case SelectContext::CoinHead:
-			return r;
-		case SelectContext::ToHand:
-		case SelectContext::Discard:
-		case SelectContext::ToDeck:
-		case SelectContext::ToDeckBottom:
-		case SelectContext::ToPrize:
-		case SelectContext::Look:
-		case SelectContext::EffectTarget:
-		case SelectContext::DiscardEnergyCard:
-		case SelectContext::DiscardToolCard:
-		case SelectContext::DiscardCardOrAttachedCard:
-		case SelectContext::EvolvesFrom:
-		case SelectContext::EvolvesTo:
-		case SelectContext::AttachFrom:
-		case SelectContext::AttachTo:
+
+	auto markRef = [&](CardRef ref) {
+		if (ref.isNull()) return;
+		const Card& card = state.getCard(ref);
+		if (card.area == AreaType::Hand) {
 			r.touchesHandIdentity = true;
 			r.mayMoveZones = true;
-			r.mayDiscardHand = state.selectContext == SelectContext::Discard
-				|| state.selectContext == SelectContext::DiscardEnergyCard
-				|| state.selectContext == SelectContext::DiscardToolCard
-				|| state.selectContext == SelectContext::DiscardCardOrAttachedCard;
-			r.mayReturnHandToDeck = state.selectContext == SelectContext::ToDeck
-				|| state.selectContext == SelectContext::ToDeckBottom;
-			if (state.selectContext == SelectContext::Look
-				|| state.selectContext == SelectContext::ToHand)
-				r.touchesDeckIdentity = true;
-			return r;
-		default:
-			r.unknown = true;
-			return r;
+		} else if (card.area == AreaType::Deck || card.area == AreaType::Looking
+			|| card.area == AreaType::Prize) {
+			r.touchesDeckIdentity = true;
 		}
-	default:
-		r.unknown = true;
-		return r;
+	};
+	auto markAreaRef = [&](const AreaRef& areaRef) { markRef(areaRef.card); };
+
+	for (const SelectOption& option : state.options) {
+		switch (option.type) {
+		case SelectOptionType::Card:
+		case SelectOptionType::ToolCard:
+		case SelectOptionType::EnergyCard: {
+			CardPosition pos = option.getCardPosition();
+			if (pos.area == AreaType::Hand) {
+				r.touchesHandIdentity = true;
+				r.mayMoveZones = true;
+			}
+			if (pos.area == AreaType::Deck || pos.area == AreaType::Looking
+				|| pos.area == AreaType::Prize) {
+				r.touchesDeckIdentity = true;
+			}
+			break;
+		}
+		case SelectOptionType::Play:
+		case SelectOptionType::Attach:
+		case SelectOptionType::Evolve:
+		case SelectOptionType::Ability:
+			r.touchesHandIdentity = true;
+			break;
+		case SelectOptionType::Discard:
+			r.touchesHandIdentity = true;
+			r.mayDiscardHand = true;
+			r.mayMoveZones = true;
+			break;
+		case SelectOptionType::Energy:
+			r.mayMoveZones = true;
+			break;
+		default:
+			break;
+		}
 	}
+
+	if (state.selectType != SelectType::None && state.selectType != SelectType::Main
+		&& state.selectType != SelectType::Attack && state.selectType != SelectType::YesNo
+		&& state.options.empty()) {
+		r.unknown = true;
+	}
+
+	for (CardRef ref : state.selectedList) markRef(ref);
+	for (CardRef ref : state.looking) markRef(ref);
+	for (CardRef ref : state.playing) markRef(ref);
+	markRef(state.contextCard);
+	for (const AreaRef& areaRef : state.preTargetList) markAreaRef(areaRef);
+	for (const AreaRef& areaRef : state.targetList) markAreaRef(areaRef);
+	return r;
 }
 
 inline CoverageResult ScanActionCosts(const State& /*state*/, const OperatorClosure& closure) {
@@ -534,58 +607,97 @@ inline void AppendSkillFootprints(int cardId, const Skill* skill, CoverageResult
 	}
 }
 
+inline void AppendCardMasterOperators(int cardId, const CardMaster* master, CoverageResult& into,
+	bool includeAttacks) {
+	if (master == nullptr) { into.unknown = true; return; }
+	AppendSkillFootprints(cardId, master->play, into);
+	AppendSkillFootprints(cardId, master->ability, into);
+	AppendSkillFootprints(cardId, master->delay, into);
+	if (!includeAttacks) return;
+	for (const Attack* attack : master->attacks) {
+		if (attack == nullptr) continue;
+		for (const Effect& effect : attack->preEffects)
+			MergeCoverageHazard(into, FootprintFromEffect(cardId, effect));
+		for (const Effect& effect : attack->postEffects)
+			MergeCoverageHazard(into, FootprintFromEffect(cardId, effect));
+	}
+}
+
 inline CoverageResult ScanGlobalEffects(const State& state) {
 	CoverageResult r;
 	r.analyzed = true;
-	// Item/supporter locks change legality without observing hand identities.
-	(void)state.players[0].cannotPlayItem;
-	(void)state.players[0].thisTurn.cannotPlayItem;
+	const int active = state.activePlayerIndex();
 
-	auto scanCard = [&](CardRef ref) {
+	auto scanCard = [&](CardRef ref, bool includeAttacks) {
 		if (ref.isNull()) return;
 		const Card& card = state.getCard(ref);
-		const CardMaster* master = FindCardMaster(card.cardId);
-		if (master == nullptr) { r.unknown = true; return; }
-		AppendSkillFootprints(card.cardId, master->play, r);
-		for (const Skill* skill : master->getSkills()) AppendSkillFootprints(card.cardId, skill, r);
+		AppendCardMasterOperators(card.cardId, FindCardMaster(card.cardId), r, includeAttacks);
+	};
+	auto scanTriggered = [&](const std::vector<TriggeredAbility>& stack) {
+		for (const TriggeredAbility& ta : stack) {
+			auto skill = SkillTable.find(ta.activateInfo.skillId);
+			if (skill == SkillTable.end()) { r.unknown = true; continue; }
+			AppendSkillFootprints(skill->second.cardId, &skill->second, r);
+		}
 	};
 
-	if (!state.stadium.empty()) scanCard(state.stadium[0]);
+	if (!state.stadium.empty()) scanCard(state.stadium[0], false);
 	for (int p = 0; p < 2; ++p) {
+		const bool includeAttacks = (p == active);
 		const PlayerState& ps = state.players[p];
-		if (!ps.active.empty()) scanCard(ps.active[0]);
-		for (int b = 0; b < (int)ps.bench.size(); ++b) scanCard(ps.bench[b]);
+		if (!ps.active.empty()) scanCard(ps.active[0], includeAttacks);
+		for (int b = 0; b < (int)ps.bench.size(); ++b) scanCard(ps.bench[b], includeAttacks);
+		// Tools/energy may trigger mid-turn for either player.
+		for (CardRef ref : ps.tool) scanCard(ref, false);
+		for (CardRef ref : ps.energy) scanCard(ref, false);
 	}
+	scanTriggered(state.delayTriggerStack);
+	scanTriggered(state.temporaryTriggerStack);
+	scanTriggered(state.triggerStack);
+	// functionStack holds opaque deferred callbacks. It does not by itself prove a
+	// hand-identity read; nested-chance gating handles turn-control opacity.
+	(void)state.functionStack;
 	return r;
 }
 
 inline CandidateCoverageProof proveCandidate(
 	const State& state,
-	int /*candidateCardId*/,
+	int candidateCardId,
 	const OperatorClosure& closure) {
 	CandidateCoverageProof proof = CandidateCoverageProof::AllTrue();
-	if (closure.hasUnknown) {
-		ApplyHazardToCandidate(proof, CoverageResult{ true, true });
-		return proof;
-	}
 
 	CoverageResult pending = ScanPendingEffects(state);
 	CoverageResult global = ScanGlobalEffects(state);
-	CoverageResult costs = ScanActionCosts(state, closure);
 	CoverageResult selection = ScanSelectionContexts(state);
-	CoverageResult conditions = ScanReachableConditions(state, closure);
+
+	// Filter cost/condition/operator hazards to this candidate's target match.
+	CoverageResult costs;
+	costs.analyzed = true;
+	CoverageResult conditions;
+	conditions.analyzed = true;
+	CoverageResult ops;
+	ops.analyzed = true;
+	bool anyUnknownFp = false;
+	for (const OperatorFootprint& fp : closure.footprints) {
+		if (!footprintMayAffectCandidate(fp, candidateCardId)) continue;
+		if (fp.observation == CardObservationKind::Unknown) anyUnknownFp = true;
+		if (fp.isCondition) MergeCoverageHazard(conditions, fp);
+		else if (fp.mayDiscardHand || fp.mayReturnHandToDeck || fp.mayCountHandByType
+			|| fp.mayCountHandTotal) {
+			MergeCoverageHazard(costs, fp);
+		}
+		MergeCoverageHazard(ops, fp);
+	}
+	if (anyUnknownFp || closure.hasUnknown) {
+		ApplyHazardToCandidate(proof, CoverageResult{ true, true });
+		return proof;
+	}
 
 	ApplyHazardToCandidate(proof, pending);
 	ApplyHazardToCandidate(proof, global);
 	ApplyHazardToCandidate(proof, costs);
 	ApplyHazardToCandidate(proof, selection);
 	ApplyHazardToCandidate(proof, conditions);
-
-	// Reachable operator footprints: AttackDamage / Coin / None do not clear flags.
-	CoverageResult ops;
-	ops.analyzed = true;
-	for (const OperatorFootprint& fp : closure.footprints)
-		MergeCoverageHazard(ops, fp);
 	ApplyHazardToCandidate(proof, ops);
 	return proof;
 }
@@ -695,8 +807,27 @@ inline OperatorClosure BuildOperatorClosure(
 					closure.hasUnknown = true;
 			}
 		};
+		auto considerAttack = [&](const Attack* attack) {
+			if (attack == nullptr) return;
+			for (const Effect& effect : attack->preEffects) {
+				OperatorFootprint fp = FootprintFromEffect(cardId, effect);
+				closure.reachableEffectTypes.insert((int)effect.effectType);
+				closure.footprints.push_back(fp);
+				if (fp.observation == CardObservationKind::Unknown)
+					closure.hasUnknown = true;
+			}
+			for (const Effect& effect : attack->postEffects) {
+				OperatorFootprint fp = FootprintFromEffect(cardId, effect);
+				closure.reachableEffectTypes.insert((int)effect.effectType);
+				closure.footprints.push_back(fp);
+				if (fp.observation == CardObservationKind::Unknown)
+					closure.hasUnknown = true;
+			}
+		};
 		considerSkill(master->play);
-		for (const Skill* skill : master->getSkills()) considerSkill(skill);
+		considerSkill(master->ability);
+		considerSkill(master->delay);
+		for (const Attack* attack : master->attacks) considerAttack(attack);
 	}
 	for (const auto& fp : closure.footprints)
 		if (fp.observation == CardObservationKind::Unknown) closure.hasUnknown = true;
@@ -773,6 +904,7 @@ inline CardLivenessResult ClassifyCardId(
 	bool actionCostOk = result.coverage.actionCostSafe;
 
 	for (const OperatorFootprint& fp : closure.footprints) {
+		if (!footprintMayAffectCandidate(fp, cardId)) continue;
 		if (fp.observation == CardObservationKind::Unknown) {
 			handTargetOk = zoneOk = deckRemovalOk = semanticOk = actionCostOk = false;
 			result.reasonMask |= UnknownEffect;
@@ -929,6 +1061,20 @@ inline HandSplit SplitHandCounts(const State& state, int actor,
 	std::sort(split.passiveCounts.begin(), split.passiveCounts.end());
 	split.proofHash = hash;
 	return split;
+}
+
+// True if any reachable non-condition operator can open another Draw / zone chance
+// later this turn (Main-phase Items included). Short-term V4.0 guard against
+// double-counting Passive residual across nested multi-draw chances.
+inline bool AnyReachableFurtherChance(const OperatorClosure& closure,
+	int excludeOperatorCardId = 0) {
+	for (const OperatorFootprint& fp : closure.footprints) {
+		if (fp.isCondition) continue;
+		if (excludeOperatorCardId != 0 && fp.operatorCardId == excludeOperatorCardId)
+			continue;
+		if (EffectImpliesFurtherChanceOrZoneMove(fp.effectType)) return true;
+	}
+	return false;
 }
 
 inline const char* LivenessName(CardLiveness live) {

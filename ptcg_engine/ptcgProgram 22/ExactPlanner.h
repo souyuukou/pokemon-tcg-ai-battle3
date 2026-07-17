@@ -4532,18 +4532,23 @@ private:
 			auto skill = SkillTable.find(state.exact.pendingSkillId);
 			if (skill != SkillTable.end()) excludeOperatorCardId = skill->second.cardId;
 		}
-		// Nested-chance safety: remaining effects on THIS pending skill only.
+		// Nested-chance safety: remaining effects on THIS pending skill, plus any
+		// reachable Main-phase operator that can open another draw/zone chance.
 		const bool furtherChance = ExactCardLivenessV4::FurtherChanceUntilTurnEnd(
 			closure, state, excludeOperatorCardId);
-		const bool analyticOk = evaluator && evaluator->v4().isLoaded()
-			&& evaluator->v4().analyticIntegralSafe();
-		// Per-card proveCandidate gates Passive — not closure.complete().
-		const bool allowPassiveIntegral = v4PassiveDrawEnabled && !furtherChance && analyticOk;
-		if (v4PassiveDrawEnabled && furtherChance) {
+		const bool anyFutureChance = ExactCardLivenessV4::AnyReachableFurtherChance(
+			closure, excludeOperatorCardId);
+		const bool v4Loaded = evaluator && evaluator->v4().isLoaded();
+		const bool analyticOk = v4Loaded; // residual clamp proof is certification-only (see analyticIntegralSafe)
+		if (v4PassiveDrawEnabled && v4Loaded && !evaluator->v4().analyticIntegralSafe())
+			++metrics.fallbackAnalyticBound;
+		// Per-card proveCandidate gates Passive classification — not closure.complete().
+		const bool allowPassiveIntegral = v4PassiveDrawEnabled && !furtherChance
+			&& !anyFutureChance && analyticOk;
+		if (v4PassiveDrawEnabled && (furtherChance || anyFutureChance)) {
 			++metrics.nestedChancePassiveFallbacks;
 			++metrics.fallbackFurtherChance;
 		}
-		if (v4PassiveDrawEnabled && !analyticOk) ++metrics.fallbackAnalyticBound;
 		const int drawCount = state.exact.pendingCount;
 		ExactPassivePayloadV4 basePassiveForGuard;
 		{
@@ -4775,7 +4780,6 @@ private:
 						appendSemantic(allocation.symmetricKey, 1); // passive marker
 						allocations[groupIndex].push_back(std::move(allocation));
 						metrics.passiveExpectationCalls++;
-						if (take > 0) metrics.richPassiveIntegratedWeight += chooseCount(group.count, take);
 						continue;
 					}
 					std::vector<int> atomBounds; atomBounds.reserve(group.atoms.size());
@@ -4832,8 +4836,7 @@ private:
 						outcome.continuationKey = std::move(key);
 						if (anyPassiveTake
 							&& evaluator && evaluator->v4().isLoaded()
-							&& evaluator->v4().passiveEnabled()
-							&& evaluator->v4().analyticIntegralSafe()) {
+							&& evaluator->v4().passiveEnabled()) {
 							outcome.expectedPassiveResidual =
 								ExactPassiveExpectationV4::ExpectedPassiveResidual(
 									chanceNodeBasePassive.counts, passivePools,
@@ -4997,17 +5000,16 @@ private:
 			ExactScore score = solveOwned(std::move(child));
 			v4StripPassiveOnly = restoreStrip;
 			if (outcome.hasPassiveExpectation) {
+				const auto residualStarted = std::chrono::steady_clock::now();
 				ExactFraction residual;
 				residual.big = std::make_shared<ExactBigRational>(outcome.expectedPassiveResidual);
 				score.lower = ExactFraction::add(score.lower, residual);
 				score.upper = ExactFraction::add(score.upper, residual);
-				{
-					const auto residualStarted = std::chrono::steady_clock::now();
-					metrics.passiveResidualCalls++;
-					metrics.passiveResidualElapsedNs += (unsigned long long)
-						std::chrono::duration_cast<std::chrono::nanoseconds>(
-							std::chrono::steady_clock::now() - residualStarted).count();
-				}
+				metrics.passiveResidualCalls++;
+				metrics.passiveResidualElapsedNs += (unsigned long long)
+					std::chrono::duration_cast<std::chrono::nanoseconds>(
+						std::chrono::steady_clock::now() - residualStarted).count();
+				metrics.richPassiveIntegratedWeight += outcome.weight;
 			}
 			if (metrics.expanded >= expandedBeforeOutcomeSlice)
 				partial.pendingExpandedNodes += metrics.expanded - expandedBeforeOutcomeSlice;

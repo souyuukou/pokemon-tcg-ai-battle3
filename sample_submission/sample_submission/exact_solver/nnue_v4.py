@@ -13,7 +13,7 @@ from exact_solver import nnue_v3
 MAGIC = b"PTCGEV4\0"
 MODEL_SCHEMA = 2
 FEATURE_SCHEMA = 2
-LIVENESS_SCHEMA = 3
+LIVENESS_SCHEMA = 4
 CONTEXT_HIDDEN = 32
 PASSIVE_CONTEXT_SCALE = 4096
 # magic + 7x u32 + legacyChecksum u64 + 5x u64 + 2x i64 + reserved 16

@@ -166,6 +166,57 @@ extern "C" GAME_API const char8_t* ExactCardLivenessV4Diagnostics() {
       energyVsDamage.liveness == ExactCardLivenessV4::CardLiveness::Passive;
   }
 
+  // Energy-only hand discard must Active energy but leave used Supporter Passive.
+  bool energyDiscardKeepsSupporterPassive = false;
+  bool energyDiscardActivesEnergy = false;
+  if (energyId && supporterId) {
+    ExactCardLivenessV4::OperatorClosure energyCost = empty;
+    ExactCardLivenessV4::OperatorFootprint fp;
+    fp.operatorCardId = 999001;
+    fp.effectType = EffectType::ToTrash;
+    fp.observation = ExactCardLivenessV4::CardObservationKind::CardIdentity;
+    fp.hasTarget = true;
+    fp.target.areas.push_back(AreaType::Hand);
+    TargetCondition cond{};
+    cond.targetType = TargetType::EnergyCard;
+    cond.comparatorType = ComparatorType::Equal;
+    fp.target.conditions.push_back(cond);
+    fp.mayTargetHand = true;
+    fp.mayDiscardHand = true;
+    fp.mayMoveCardZones = true;
+    energyCost.footprints.push_back(fp);
+    auto sup = ExactCardLivenessV4::ClassifyCardId(state, 0, supporterId, energyCost);
+    auto en = ExactCardLivenessV4::ClassifyCardId(state, 0, energyId, energyCost);
+    energyDiscardKeepsSupporterPassive =
+      sup.liveness == ExactCardLivenessV4::CardLiveness::Passive;
+    energyDiscardActivesEnergy =
+      en.liveness != ExactCardLivenessV4::CardLiveness::Passive;
+  }
+
+  // Attack/delay footprints are present for pokemon with attacks.
+  bool attackFootprintsPresent = false;
+  if (basicId) {
+    ExactCardLivenessV4::OperatorClosure withBasic =
+      ExactCardLivenessV4::BuildOperatorClosure({ basicId }, 0);
+    const CardMaster* bm = FindCardMaster(basicId);
+    if (bm != nullptr && !bm->attacks.empty()) {
+      for (const auto& fp : withBasic.footprints) {
+        if (fp.operatorCardId == basicId) { attackFootprintsPresent = true; break; }
+      }
+    }
+  }
+
+  // Reachable Draw operator ⇒ AnyReachableFurtherChance.
+  bool drawImpliesFutureChance = false;
+  {
+    ExactCardLivenessV4::OperatorClosure drawOp = empty;
+    ExactCardLivenessV4::OperatorFootprint fp;
+    fp.effectType = EffectType::Draw;
+    fp.observation = ExactCardLivenessV4::CardObservationKind::CountOnly;
+    drawOp.footprints.push_back(fp);
+    drawImpliesFutureChance = ExactCardLivenessV4::AnyReachableFurtherChance(drawOp, 0);
+  }
+
   j.clear(); j.append('{');
   j.appendKeyValue("livenessSchemaVersion", ExactCardLivenessV4::LivenessSchemaVersion);
   j.appendCommaKeyValue("effectObservationClassified", classified);
@@ -179,6 +230,22 @@ extern "C" GAME_API const char8_t* ExactCardLivenessV4Diagnostics() {
   j.appendCommaKeyValue("usedSupporterPassiveWithoutUltra",
     supporterId != 0 && supporterAlone.liveness == ExactCardLivenessV4::CardLiveness::Passive);
   j.appendCommaKeyValue("damageOnlyDoesNotBlockPassiveEnergy", damageDoesNotBlockEnergy);
+  j.appendCommaKeyValue("energyDiscardKeepsSupporterPassive", energyDiscardKeepsSupporterPassive);
+  j.appendCommaKeyValue("energyDiscardActivesEnergy", energyDiscardActivesEnergy);
+  j.appendCommaKeyValue("attackFootprintsPresent", attackFootprintsPresent);
+  j.appendCommaKeyValue("drawImpliesFutureChance", drawImpliesFutureChance);
+  // Which reachable operators still produce Unknown footprints?
+  int unknownFootprintTypes = 0;
+  {
+    ExactCardLivenessV4::OperatorClosure probe =
+      ExactCardLivenessV4::BuildOperatorClosure({ 5, 13, 741, 305, 1123, 1266 }, 0);
+    for (const auto& fp : probe.footprints) {
+      if (fp.observation == ExactCardLivenessV4::CardObservationKind::Unknown)
+        ++unknownFootprintTypes;
+    }
+    j.appendCommaKeyValue("safeDeckUnknownFootprints", unknownFootprintTypes);
+    j.appendCommaKeyValue("safeDeckHasUnknown", probe.hasUnknown);
+  }
   j.appendCommaKeyValue("supporterLiveness", (int)supporterVsUltra.liveness);
   j.append('}');
   return j.buf.c_str();
