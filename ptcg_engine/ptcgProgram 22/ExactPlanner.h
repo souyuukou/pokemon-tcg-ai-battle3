@@ -725,11 +725,14 @@ struct ExactMetrics {
 	unsigned long long unknownLivenessCount = 0;
 	unsigned long long livenessFallbackCount = 0;
 	unsigned long long richActiveOutcomeCount = 0;
-	unsigned long long richPassiveIntegratedMass = 0;
+	unsigned long long passiveResidualCalls = 0;
+	unsigned long long passiveResidualElapsedNs = 0;
+	ExactWeight richPassiveIntegratedWeight;
+	ExactWeight richTotalChanceWeight;
 	unsigned long long livenessAnalysisNs = 0;
 	unsigned long long semanticForwardNs = 0;
-	unsigned long long passiveResidualNs = 0;
 	unsigned long long passiveExpectationNs = 0;
+	bool v4PassiveDrawExperimental = false;
 	unsigned long long activeDrawEnumerationNs = 0;
 	unsigned long long skeletonClasses = 0;
 	unsigned long long skeletonClassMembers = 0;
@@ -983,7 +986,9 @@ public:
 			skeletonFlag != nullptr && (skeletonFlag[0] == '1' || skeletonFlag[0] == 'y' || skeletonFlag[0] == 'Y'))
 			skeletonSharingEnabled = true;
 #endif
+		// Stage 1 safety: V4 Passive draw is opt-in only. Never auto-enable from evaluator version.
 		v4PassiveDrawEnabled = false;
+		v4PassiveDrawCertified = false;
 #ifdef _WIN32
 		{
 			char passiveDraw[8]{};
@@ -997,8 +1002,8 @@ public:
 			passiveDraw != nullptr && (passiveDraw[0] == '1' || passiveDraw[0] == 'y' || passiveDraw[0] == 'Y'))
 			v4PassiveDrawEnabled = true;
 #endif
-		if (evaluator && evaluator->usesV4Search()) v4PassiveDrawEnabled = true;
 		v4StripPassiveOnly = false;
+		if (v4PassiveDrawEnabled) metrics.v4PassiveDrawExperimental = true;
 		if (runtimeMode != ExactRuntimeMode::Legacy) {
 			metrics.runtimeVersion = 3;
 			metrics.canonicalSchemaVersion = 3;
@@ -1442,7 +1447,9 @@ private:
 	bool reverseActionOrder = false;
 	bool skeletonSharingEnabled = false;
 	bool v4PassiveDrawEnabled = false;
+	bool v4PassiveDrawCertified = false; // true only after P0 oracles pass
 	bool v4StripPassiveOnly = false;
+	ExactPassivePayloadV4 chanceNodeBasePassive;
 	bool concreteWorldCaching = false;
 	// Enabled only by a future shared-frontier scheduler. Root-parity profiling
 	// showed no simultaneous claims, so allocating a flight record per node is
@@ -2454,7 +2461,13 @@ private:
 			const bool useV4 = evaluator->usesV4Search() || evaluator->usesV4PassiveStrip();
 			if (useV4 && evaluator->v4().isLoaded()) {
 				ExactPassivePayloadV4 passive;
-				ExactCpuEvaluator::splitOwnHandFeatures(features, state, actor, passive, nullptr);
+				{
+					std::unordered_set<int> reachable;
+					const PartitionAnalysis& liveAnalysis = turnDependencyPartition(state, nullptr, false);
+					for (int id : liveAnalysis.visibleIds) reachable.insert(id);
+					auto closure = ExactCardLivenessV4::BuildOperatorClosure(reachable, 0);
+					ExactCpuEvaluator::splitOwnHandFeatures(features, state, actor, passive, closure);
+				}
 				metrics.activeCardCount += 0; // observational; counts updated in draw path
 				if (v4StripPassiveOnly) {
 					metrics.v4SemanticEvaluations++;
@@ -2621,6 +2634,13 @@ private:
 		if (!evaluator || !evaluator->isLoaded() || evaluator->schemaVersion() != ExactSparseEvaluatorV3::SchemaVersion
 			|| !evaluator->informationSetSafe()) {
 			metrics.informationSetSafe = false;
+			decision.score.certified = false;
+			for (ExactRootActionValue& action : decision.rootActions) action.certified = false;
+		}
+		// Stage 1: V4 search / experimental Passive draw stay uncertified until P0 oracles pass.
+		if ((evaluator && evaluator->usesV4Search())
+			|| (v4PassiveDrawEnabled && !v4PassiveDrawCertified)) {
+			metrics.v4PassiveDrawExperimental = true;
 			decision.score.certified = false;
 			for (ExactRootActionValue& action : decision.rootActions) action.certified = false;
 		}
@@ -4316,7 +4336,8 @@ private:
 	struct DrawContinuationClass {
 		std::vector<std::pair<int, int>> atoms;
 		int count = 0;
-		bool passiveIntegrated = false; // Phase 4: skip atom split; analytic Passive residual
+		int sourceClassId = -1;
+		bool passiveIntegrated = false; // skip atom split only when PassiveProofV4 is complete
 	};
 
 	std::vector<DrawContinuationClass> drawContinuationClasses(const State& state,
@@ -4330,73 +4351,87 @@ private:
 		const auto analysisStart = std::chrono::steady_clock::now();
 		const PartitionAnalysis& analysis = turnDependencyPartition(state, nullptr, true);
 		const ExactCardPartition& partition = analysis.partition;
-		// Passive proofs use rule-based ClassifyCardId only. Partition visibleIds mark
-		// Transition-Identity classes for Active cards; they must not force Passive
-		// candidates into Active solely because they appear in the deck profile.
+		// P0-1/P0-2: classify with operator closure; keep Passive pools per source class.
+		std::unordered_set<int> reachable;
+		for (int id : analysis.visibleIds) reachable.insert(id);
+		ExactCardLivenessV4::OperatorClosure closure =
+			ExactCardLivenessV4::BuildOperatorClosure(reachable, 0);
 		std::set<int> assigned;
 		std::vector<DrawContinuationClass> result;
-		DrawContinuationClass passivePool;
-		passivePool.passiveIntegrated = v4PassiveDrawEnabled;
+		int sourceClassId = 0;
+
+		auto classifyAtom = [&](int cardId) -> ExactCardLivenessV4::CardLivenessResult {
+			auto live = ExactCardLivenessV4::ClassifyCardId(state, actor, cardId, closure);
+			if (live.liveness == ExactCardLivenessV4::CardLiveness::Unknown) {
+				++metrics.unknownLivenessCount;
+				live.liveness = ExactCardLivenessV4::CardLiveness::Active;
+				++metrics.livenessFallbackCount;
+			}
+			return live;
+		};
 
 		for (const ExactCardClass& source : partition.classes()) {
 			DrawContinuationClass target;
+			target.sourceClassId = sourceClassId++;
+			bool allPassive = true;
+			bool deckRemovalOk = true;
+			bool anyAtom = false;
 			for (const ExactCardAtom& atom : source.atoms) {
 				auto found = available.find(atom.cardId);
 				if (found == available.end() || found->second <= 0) continue;
-				if (v4PassiveDrawEnabled) {
-					auto live = ExactCardLivenessV4::ClassifyCardId(state, actor, atom.cardId, nullptr);
-					if (live.liveness == ExactCardLivenessV4::CardLiveness::Unknown) {
-						++metrics.unknownLivenessCount;
-						live.liveness = ExactCardLivenessV4::CardLiveness::Active;
-						++metrics.livenessFallbackCount;
-					}
-					if (live.liveness == ExactCardLivenessV4::CardLiveness::Passive) {
-						passivePool.atoms.push_back({ atom.cardId, found->second });
-						passivePool.count += found->second;
-						assigned.insert(atom.cardId);
-						metrics.passiveCardCount += (unsigned long long)found->second;
-						continue;
-					}
-					metrics.activeCardCount += (unsigned long long)found->second;
-				}
+				anyAtom = true;
 				target.atoms.push_back({ atom.cardId, found->second });
-				target.count += found->second; assigned.insert(atom.cardId);
+				target.count += found->second;
+				assigned.insert(atom.cardId);
+				if (!v4PassiveDrawEnabled) continue;
+				auto live = classifyAtom(atom.cardId);
+				if (live.liveness != ExactCardLivenessV4::CardLiveness::Passive
+					|| !live.proof.allProven() || !live.proof.deckRemovalInvariant) {
+					allPassive = false;
+					deckRemovalOk = false;
+					metrics.activeCardCount += (unsigned long long)found->second;
+				} else {
+					metrics.passiveCardCount += (unsigned long long)found->second;
+				}
 			}
-			if (target.count > 0) result.push_back(std::move(target));
+			if (!anyAtom) continue;
+			// Never merge across source classes. Integrate only when the whole class
+			// proves Passive + deckRemovalInvariant.
+			if (v4PassiveDrawEnabled && allPassive && deckRemovalOk && target.count > 0) {
+				target.passiveIntegrated = true;
+				metrics.passiveCardsIntegrated += (unsigned long long)target.count;
+			} else {
+				target.passiveIntegrated = false;
+			}
+			result.push_back(std::move(target));
 		}
-		// A stale or partially materialized profile must never silently drop an
-		// identity. Conservatively retain any unmatched card as a singleton class.
 		for (const auto& item : available) if (!assigned.contains(item.first)) {
+			DrawContinuationClass singleton;
+			singleton.sourceClassId = sourceClassId++;
+			singleton.atoms = { { item.first, item.second } };
+			singleton.count = item.second;
 			if (v4PassiveDrawEnabled) {
-				auto live = ExactCardLivenessV4::ClassifyCardId(state, actor, item.first, nullptr);
-				if (live.liveness == ExactCardLivenessV4::CardLiveness::Unknown) {
-					++metrics.unknownLivenessCount;
-					live.liveness = ExactCardLivenessV4::CardLiveness::Active;
-					++metrics.livenessFallbackCount;
-				}
-				if (live.liveness == ExactCardLivenessV4::CardLiveness::Passive) {
-					passivePool.atoms.push_back({ item.first, item.second });
-					passivePool.count += item.second;
+				auto live = classifyAtom(item.first);
+				if (live.liveness == ExactCardLivenessV4::CardLiveness::Passive
+					&& live.proof.allProven() && live.proof.deckRemovalInvariant) {
+					singleton.passiveIntegrated = true;
 					metrics.passiveCardCount += (unsigned long long)item.second;
-					continue;
+					metrics.passiveCardsIntegrated += (unsigned long long)item.second;
+				} else {
+					metrics.activeCardCount += (unsigned long long)item.second;
 				}
-				metrics.activeCardCount += (unsigned long long)item.second;
 			}
-			result.push_back({ { { item.first, item.second } }, item.second, false });
-		}
-		if (passivePool.count > 0) {
-			std::sort(passivePool.atoms.begin(), passivePool.atoms.end());
-			result.push_back(std::move(passivePool));
-			metrics.passiveCardsIntegrated += (unsigned long long)result.back().count;
+			result.push_back(std::move(singleton));
 		}
 		std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
 			if (left.passiveIntegrated != right.passiveIntegrated) return left.passiveIntegrated < right.passiveIntegrated;
 			return left.atoms.front().first < right.atoms.front().first;
 		});
-		schema = v4PassiveDrawEnabled ? "CONTINUATION-DRAW-V4P|" : "CONTINUATION-DRAW-V1|";
+		schema = v4PassiveDrawEnabled ? "CONTINUATION-DRAW-V4P2|" : "CONTINUATION-DRAW-V1|";
 		for (const DrawContinuationClass& group : result) {
 			appendSemantic(schema, group.count); appendSemantic(schema, (long long)group.atoms.size());
 			appendSemantic(schema, group.passiveIntegrated ? 1 : 0);
+			appendSemantic(schema, group.sourceClassId);
 			for (const auto& atom : group.atoms) {
 				appendSemantic(schema, atom.first); appendSemantic(schema, atom.second);
 			}
@@ -4412,9 +4447,23 @@ private:
 		if (types.empty() || drawCount <= 1) return unknown();
 		std::string continuationSchema;
 		std::vector<DrawContinuationClass> classes;
-		if (state.exact.pendingPlayer == actor)
+		if (state.exact.pendingPlayer == actor) {
 			classes = drawContinuationClasses(state, types, continuationSchema);
-		else {
+			// P0-4: freeze Passive hand counts before draw outcomes (context-free residual).
+			chanceNodeBasePassive.clear();
+			std::unordered_map<int, int> handCounts;
+			for (CardRef ref : state.players[actor].hand) {
+				if (ref.isNull()) continue;
+				++handCounts[state.getCard(ref).cardId];
+			}
+			std::unordered_set<int> reachable;
+			const PartitionAnalysis& baseAnalysis = turnDependencyPartition(state, nullptr, true);
+			for (int id : baseAnalysis.visibleIds) reachable.insert(id);
+			auto closure = ExactCardLivenessV4::BuildOperatorClosure(reachable, 0);
+			auto split = ExactCardLivenessV4::SplitHandCounts(state, actor, handCounts, closure);
+			chanceNodeBasePassive.setCounts(std::move(split.passiveCounts), split.proofHash);
+		} else {
+			chanceNodeBasePassive.clear();
 			continuationSchema = "CONTINUATION-DRAW-SINGLETON|";
 			for (const auto& item : types) {
 				if (!item.second.fitsUnsignedLongLong()) return unknown();
@@ -4448,6 +4497,9 @@ private:
 			std::unordered_map<std::string, size_t, ExactStringHasher> byContinuation;
 			ExactWeight generated;
 			unsigned long long rawDrawOutcomes = 0;
+			std::vector<std::pair<int, long long>> cachedPassiveValues;
+			if (evaluator && evaluator->v4().isLoaded() && evaluator->v4().passiveEnabled())
+				cachedPassiveValues = evaluator->v4().passiveValueTableContextFree();
 			// The outer enumeration axis is the continuation class, not card ID.
 			// Only after observing a class-count vector do we conditionally split a
 			// class into atoms. This preserves exact hypergeometric mass while
@@ -4484,7 +4536,7 @@ private:
 						appendSemantic(allocation.symmetricKey, 1); // passive marker
 						allocations[groupIndex].push_back(std::move(allocation));
 						metrics.passiveExpectationCalls++;
-						metrics.richPassiveIntegratedMass += take > 0 ? 1ULL : 0ULL;
+						if (take > 0) metrics.richPassiveIntegratedWeight += chooseCount(group.count, take);
 						continue;
 					}
 					std::vector<int> atomBounds; atomBounds.reserve(group.atoms.size());
@@ -4523,13 +4575,14 @@ private:
 				}
 				ExactWeight generatedForClassVector;
 				std::vector<int> atomCounts(bounds.size(), 0);
-				int passiveTakeForVector = 0;
-				int passivePoolSize = 0;
-				std::vector<std::pair<int, int>> passiveCopies;
+				std::vector<ExactPassiveExpectationV4::PassiveDrawPool> passivePools;
+				bool anyPassiveTake = false;
 				for (int gi = 0; gi < (int)classes.size(); ++gi) if (classes[gi].passiveIntegrated) {
-					passiveTakeForVector = classCounts[gi];
-					passivePoolSize = classes[gi].count;
-					passiveCopies = classes[gi].atoms;
+					ExactPassiveExpectationV4::PassiveDrawPool pool;
+					pool.copies = classes[gi].atoms;
+					pool.take = classCounts[gi];
+					if (pool.take > 0) anyPassiveTake = true;
+					passivePools.push_back(std::move(pool));
 				}
 				std::function<void(int, const ExactWeight&, std::string)> combine;
 				combine = [&](int groupIndex, const ExactWeight& weight, std::string key) {
@@ -4538,12 +4591,13 @@ private:
 						outcome.atomCounts = atomCounts;
 						outcome.weight = weight;
 						outcome.continuationKey = std::move(key);
-						if (passiveTakeForVector > 0 && evaluator && evaluator->v4().isLoaded()
+						if ((anyPassiveTake || !chanceNodeBasePassive.empty())
+							&& evaluator && evaluator->v4().isLoaded()
 							&& evaluator->v4().passiveEnabled()) {
-							std::array<std::int32_t, ExactSparseEvaluatorV4::ContextHidden> context{};
-							auto values = evaluator->v4().passiveValueTable(context);
-							outcome.expectedPassiveResidual = ExactPassiveExpectationV4::ExpectedPassiveResidual(
-								passivePoolSize, passiveTakeForVector, values, evaluator->v4().pairs(), passiveCopies);
+							outcome.expectedPassiveResidual =
+								ExactPassiveExpectationV4::ExpectedPassiveResidual(
+									chanceNodeBasePassive.counts, passivePools,
+									cachedPassiveValues, evaluator->v4().pairs());
 							outcome.hasPassiveExpectation = true;
 							metrics.passiveExpectationCalls++;
 						}
@@ -4575,7 +4629,10 @@ private:
 				return left.continuationKey < right.continuationKey;
 			});
 			metrics.continuationPreparedOutcomes += partial.outcomes.size();
-			if (v4PassiveDrawEnabled) metrics.richActiveOutcomeCount += partial.outcomes.size();
+			if (v4PassiveDrawEnabled) {
+				metrics.richActiveOutcomeCount += partial.outcomes.size();
+				metrics.richTotalChanceWeight += partial.totalWeight;
+			}
 			metrics.groupedOutcomes += rawDrawOutcomes >= partial.outcomes.size()
 				? rawDrawOutcomes - partial.outcomes.size() : 0;
 			partial.initialized = true;
@@ -4704,7 +4761,13 @@ private:
 				residual.big = std::make_shared<ExactBigRational>(outcome.expectedPassiveResidual);
 				score.lower = ExactFraction::add(score.lower, residual);
 				score.upper = ExactFraction::add(score.upper, residual);
-				metrics.passiveResidualNs += 1;
+				{
+					const auto residualStarted = std::chrono::steady_clock::now();
+					metrics.passiveResidualCalls++;
+					metrics.passiveResidualElapsedNs += (unsigned long long)
+						std::chrono::duration_cast<std::chrono::nanoseconds>(
+							std::chrono::steady_clock::now() - residualStarted).count();
+				}
 			}
 			if (metrics.expanded >= expandedBeforeOutcomeSlice)
 				partial.pendingExpandedNodes += metrics.expanded - expandedBeforeOutcomeSlice;

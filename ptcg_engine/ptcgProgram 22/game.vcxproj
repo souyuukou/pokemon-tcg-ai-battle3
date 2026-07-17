@@ -118,8 +118,9 @@
     <ClInclude Include="ExactSearchHooks.h" />
     <ClInclude Include="ExactCardPartition.h" />
     <ClInclude Include="ExactCardLivenessV4.h" />
-    <ClInclude Include="ExactPassivePayloadV4.h" />
+    <ClInclude Include="ExactFeatureRecordV4.h" />
     <ClInclude Include="ExactPassiveExpectationV4.h" />
+    <ClInclude Include="ExactPassivePayloadV4.h" />
     <ClInclude Include="ExactSparseEvaluatorV4.h" />
     <ClInclude Include="ExactSkeletonDag.h" />
 	<ClInclude Include="ExactEvaluatorAvx2.h" />

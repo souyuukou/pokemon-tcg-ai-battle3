@@ -11,10 +11,13 @@ import numpy as np
 from exact_solver import nnue_v3
 
 MAGIC = b"PTCGEV4\0"
-MODEL_SCHEMA = FEATURE_SCHEMA = LIVENESS_SCHEMA = 1
+MODEL_SCHEMA = 2
+FEATURE_SCHEMA = 2
+LIVENESS_SCHEMA = 2
 CONTEXT_HIDDEN = 32
 PASSIVE_CONTEXT_SCALE = 4096
-HEADER = struct.Struct("<8s7IQ32s")
+# magic + 7x u32 + legacyChecksum u64 + 5x u64 + 2x i64 + reserved 16
+HEADER = struct.Struct("<8s7IQQQQQQQqq16s")
 
 
 @dataclass(frozen=True)
@@ -27,6 +30,14 @@ class QuantizedModelV4:
     pairs: np.ndarray  # structured (card_a u2, card_b u2, weight i4)
     v3: nnue_v3.QuantizedModel
     checksum: int = 0
+    required_v3_model_hash: int = 0
+    feature_schema_hash: int = FEATURE_SCHEMA
+    liveness_schema_hash: int = LIVENESS_SCHEMA
+    card_token_table_hash: int = 0
+    payload_checksum: int = 0
+    expected_file_size: int = 0
+    proven_min_output: int = -nnue_v3.NON_TERMINAL_LIMIT + 1
+    proven_max_output: int = nnue_v3.NON_TERMINAL_LIMIT - 1
 
     def validate(self) -> None:
         self.v3.validate()
@@ -39,6 +50,10 @@ class QuantizedModelV4:
             raise ValueError("context_from_global shape")
         if self.context_bias.shape != (CONTEXT_HIDDEN,):
             raise ValueError("context_bias shape")
+        if self.proven_min_output <= -nnue_v3.NON_TERMINAL_LIMIT:
+            raise ValueError("proven_min_output saturates clamp")
+        if self.proven_max_output >= nnue_v3.NON_TERMINAL_LIMIT:
+            raise ValueError("proven_max_output saturates clamp")
 
 
 def own_hand_linear_score(model: nnue_v3.QuantizedModel, token_index: int) -> int:
@@ -58,6 +73,18 @@ def own_hand_linear_score(model: nnue_v3.QuantizedModel, token_index: int) -> in
     return max(-nnue_v3.NON_TERMINAL_LIMIT, min(nnue_v3.NON_TERMINAL_LIMIT, score))
 
 
+def _payload_checksum(model: QuantizedModelV4) -> int:
+    parts = [
+        np.asarray(model.tokens, dtype="<i4").tobytes(order="C"),
+        np.asarray(model.passive_bias, dtype="<i4").tobytes(order="C"),
+        np.asarray(model.passive_context_weight, dtype="<i2").tobytes(order="C"),
+        np.asarray(model.context_from_global, dtype="<i2").tobytes(order="C"),
+        np.asarray(model.context_bias, dtype="<i4").tobytes(order="C"),
+        np.asarray(model.pairs).tobytes(order="C") if len(model.pairs) else b"",
+    ]
+    return nnue_v3.fnv1a(b"".join(parts))
+
+
 def bootstrap_from_v3(v3: nnue_v3.QuantizedModel) -> QuantizedModelV4:
     tokens = np.asarray(v3.tokens, dtype=np.int32)
     bias = np.zeros(len(tokens), dtype=np.int32)
@@ -65,7 +92,15 @@ def bootstrap_from_v3(v3: nnue_v3.QuantizedModel) -> QuantizedModelV4:
         tid = int(token)
         if 0 < tid < 1_000_000:  # card ids below AttackTokenBase
             bias[i] = np.int32(own_hand_linear_score(v3, i))
-    return QuantizedModelV4(
+    # Conservative static bound: 10 copies of each bias still inside clamp margin.
+    max_abs = int(np.max(np.abs(bias))) if len(bias) else 0
+    margin = max_abs * 10
+    proven_min = -nnue_v3.NON_TERMINAL_LIMIT + 1
+    proven_max = nnue_v3.NON_TERMINAL_LIMIT - 1
+    if margin < nnue_v3.NON_TERMINAL_LIMIT:
+        proven_min = max(proven_min, -margin)
+        proven_max = min(proven_max, margin)
+    model = QuantizedModelV4(
         tokens=tokens,
         passive_bias=bias,
         passive_context_weight=np.zeros((len(tokens), CONTEXT_HIDDEN), dtype=np.int16),
@@ -74,12 +109,32 @@ def bootstrap_from_v3(v3: nnue_v3.QuantizedModel) -> QuantizedModelV4:
         pairs=np.zeros(0, dtype=[("card_a", "<u2"), ("card_b", "<u2"), ("weight", "<i4")]),
         v3=v3,
         checksum=nnue_v3.fnv1a(tokens.tobytes()) ^ 0x56345F4254,
+        required_v3_model_hash=int(getattr(v3, "checksum", 0) or 0),
+        card_token_table_hash=nnue_v3.fnv1a(tokens.tobytes()),
+        proven_min_output=proven_min,
+        proven_max_output=proven_max,
+    )
+    payload = _payload_checksum(model)
+    return QuantizedModelV4(
+        **{**model.__dict__, "payload_checksum": payload, "checksum": payload},
     )
 
 
 def export_quantized(path: str | Path, model: QuantizedModelV4) -> None:
     model.validate()
     tokens = np.asarray(model.tokens, dtype="<i4")
+    payload = [
+        tokens.tobytes(order="C"),
+        np.asarray(model.passive_bias, dtype="<i4").tobytes(order="C"),
+        np.asarray(model.passive_context_weight, dtype="<i2").tobytes(order="C"),
+        np.asarray(model.context_from_global, dtype="<i2").tobytes(order="C"),
+        np.asarray(model.context_bias, dtype="<i4").tobytes(order="C"),
+        np.asarray(model.pairs).tobytes(order="C") if len(model.pairs) else b"",
+    ]
+    body = b"".join(payload)
+    payload_checksum = model.payload_checksum or nnue_v3.fnv1a(body)
+    header_size = HEADER.size
+    expected = header_size + len(body)
     header = HEADER.pack(
         MAGIC,
         MODEL_SCHEMA,
@@ -90,17 +145,17 @@ def export_quantized(path: str | Path, model: QuantizedModelV4) -> None:
         len(tokens),
         len(model.pairs),
         int(model.checksum),
-        bytes(32),
+        int(model.required_v3_model_hash),
+        int(model.feature_schema_hash),
+        int(model.liveness_schema_hash),
+        int(model.card_token_table_hash),
+        int(payload_checksum),
+        int(expected),
+        int(model.proven_min_output),
+        int(model.proven_max_output),
+        bytes(16),
     )
-    payload = [
-        tokens.tobytes(order="C"),
-        np.asarray(model.passive_bias, dtype="<i4").tobytes(order="C"),
-        np.asarray(model.passive_context_weight, dtype="<i2").tobytes(order="C"),
-        np.asarray(model.context_from_global, dtype="<i2").tobytes(order="C"),
-        np.asarray(model.context_bias, dtype="<i4").tobytes(order="C"),
-        np.asarray(model.pairs).tobytes(order="C") if len(model.pairs) else b"",
-    ]
-    Path(path).write_bytes(header + b"".join(payload))
+    Path(path).write_bytes(header + body)
 
 
 def predict_integer_v4(
@@ -108,7 +163,7 @@ def predict_integer_v4(
     feature: nnue_v3.FeatureRecord,
     passive_counts: Sequence[tuple[int, int]] | None = None,
 ) -> int:
-    """Semantic = V3(feature); Passive = sum n_i * bias[i] (+ pairs)."""
+    """Semantic = V3(feature); Passive = sum n_i * bias[i] (+ pairs). Context-free V4.0."""
     semantic = nnue_v3.predict_integer(model.v3, feature)
     if not passive_counts:
         return semantic

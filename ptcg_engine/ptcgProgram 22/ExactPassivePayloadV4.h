@@ -9,7 +9,7 @@
 
 // Passive card multiset that affects evaluation only (never Control State TT keys).
 struct ExactPassivePayloadV4 {
-	static constexpr int SchemaVersion = 1;
+	static constexpr int SchemaVersion = 2;
 	std::vector<std::pair<int, int>> counts; // sorted (cardId, count)
 	std::uint64_t livenessProofHash = 0;
 	int totalCount = 0;
@@ -36,6 +36,17 @@ struct ExactPassivePayloadV4 {
 	}
 
 	bool empty() const { return totalCount <= 0; }
+};
+
+// Passive atoms must stay partitioned by their source continuation class unless
+// both hand semantics and deck-removal semantics are proven identical.
+struct ExactPassivePoolBySourceClassV4 {
+	int sourceClassId = -1;
+	std::vector<std::pair<int, int>> atoms; // (cardId, copies in that class)
+	int count = 0;
+	std::uint64_t proofHash = 0;
+	bool deckRemovalInvariant = false;
+	bool handTargetInvariant = false;
 };
 
 struct ExactPassivePairWeightV4 {

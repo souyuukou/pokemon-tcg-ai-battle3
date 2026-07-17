@@ -101,22 +101,39 @@ extern "C" GAME_API const char8_t* ExactCardLivenessV4Diagnostics() {
   Game game; GameConfig config{}; game.init(config); State state{}; state.game = &game;
   state.turn = 2; state.firstPlayer = 0; state.energyPlayed = true;
   state.players[0].playerIndex = 0; state.players[1].playerIndex = 1;
-  int energyId = 0, itemId = 0, basicId = 0;
+  int energyId = 0, itemId = 0, basicId = 0, supporterId = 0;
+  const int ultraBallId = 1121;
   for (const auto& item : CardTable) {
     if (energyId == 0 && IsEnergy(item.second.cardType)) energyId = item.first;
     if (itemId == 0 && item.second.cardType == CardType::Item) itemId = item.first;
     if (basicId == 0 && item.second.cardType == CardType::Pokemon
       && item.second.evolutionType == EvolutionType::Basic) basicId = item.first;
+    if (supporterId == 0 && item.second.cardType == CardType::Supporter) supporterId = item.first;
   }
-  auto classify = [&](int id) {
-    auto result = ExactCardLivenessV4::ClassifyCardId(state, 0, id, nullptr);
+  auto classify = [&](int id, const ExactCardLivenessV4::OperatorClosure& closure) {
+    auto result = ExactCardLivenessV4::ClassifyCardId(state, 0, id, closure);
     if (result.liveness == ExactCardLivenessV4::CardLiveness::Passive) ++samplePassive;
     else if (result.liveness == ExactCardLivenessV4::CardLiveness::Active) ++sampleActive;
     else ++sampleUnknown;
+    return result;
   };
-  if (energyId) classify(energyId);
-  if (itemId) classify(itemId);
-  if (basicId) classify(basicId);
+  ExactCardLivenessV4::OperatorClosure empty =
+    ExactCardLivenessV4::BuildOperatorClosure({}, 0);
+  if (energyId) classify(energyId, empty);
+  if (itemId) classify(itemId, empty);
+  if (basicId) classify(basicId, empty);
+
+  // P0-1 counterexample: supporter already used, but Ultra Ball can discard it.
+  state.supporterPlayed = true;
+  ExactCardLivenessV4::OperatorClosure withUltra =
+    ExactCardLivenessV4::BuildOperatorClosure({ ultraBallId }, 0);
+  ExactCardLivenessV4::CardLivenessResult supporterVsUltra{};
+  bool ultraBlocksSupporter = false;
+  if (supporterId) {
+    supporterVsUltra = ExactCardLivenessV4::ClassifyCardId(state, 0, supporterId, withUltra);
+    ultraBlocksSupporter = supporterVsUltra.liveness != ExactCardLivenessV4::CardLiveness::Passive;
+  }
+
   j.clear(); j.append('{');
   j.appendKeyValue("livenessSchemaVersion", ExactCardLivenessV4::LivenessSchemaVersion);
   j.appendCommaKeyValue("effectObservationClassified", classified);
@@ -125,6 +142,8 @@ extern "C" GAME_API const char8_t* ExactCardLivenessV4Diagnostics() {
   j.appendCommaKeyValue("sampleActive", sampleActive);
   j.appendCommaKeyValue("sampleUnknown", sampleUnknown);
   j.appendCommaKeyValue("energyOncePassive", energyId != 0 && samplePassive >= 1);
+  j.appendCommaKeyValue("ultraBallBlocksUsedSupporter", ultraBlocksSupporter);
+  j.appendCommaKeyValue("supporterLiveness", (int)supporterVsUltra.liveness);
   j.append('}');
   return j.buf.c_str();
 }
@@ -597,10 +616,13 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
 	j.appendCommaKey("unknownLivenessCount"); AppendUnsignedLongLong(j, decision.metrics.unknownLivenessCount);
 	j.appendCommaKey("livenessFallbackCount"); AppendUnsignedLongLong(j, decision.metrics.livenessFallbackCount);
 	j.appendCommaKey("richActiveOutcomeCount"); AppendUnsignedLongLong(j, decision.metrics.richActiveOutcomeCount);
-	j.appendCommaKey("richPassiveIntegratedMass"); AppendUnsignedLongLong(j, decision.metrics.richPassiveIntegratedMass);
+	j.appendCommaKey("passiveResidualCalls"); AppendUnsignedLongLong(j, decision.metrics.passiveResidualCalls);
+	j.appendCommaKey("passiveResidualElapsedNs"); AppendUnsignedLongLong(j, decision.metrics.passiveResidualElapsedNs);
+	j.appendCommaKey("richPassiveIntegratedWeight"); j.appendDoubleQuote(decision.metrics.richPassiveIntegratedWeight.text().c_str());
+	j.appendCommaKey("richTotalChanceWeight"); j.appendDoubleQuote(decision.metrics.richTotalChanceWeight.text().c_str());
+	j.appendCommaKeyValue("v4PassiveDrawExperimental", decision.metrics.v4PassiveDrawExperimental);
 	j.appendCommaKey("livenessAnalysisNs"); AppendUnsignedLongLong(j, decision.metrics.livenessAnalysisNs);
 	j.appendCommaKey("semanticForwardNs"); AppendUnsignedLongLong(j, decision.metrics.semanticForwardNs);
-	j.appendCommaKey("passiveResidualNs"); AppendUnsignedLongLong(j, decision.metrics.passiveResidualNs);
 	j.appendCommaKey("passiveExpectationNs"); AppendUnsignedLongLong(j, decision.metrics.passiveExpectationNs);
 	j.appendCommaKey("activeDrawEnumerationNs"); AppendUnsignedLongLong(j, decision.metrics.activeDrawEnumerationNs);
 	j.appendCommaKey("skeletonClasses"); AppendUnsignedLongLong(j, decision.metrics.skeletonClasses);
@@ -761,10 +783,13 @@ static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
 	into.unknownLivenessCount += from.unknownLivenessCount;
 	into.livenessFallbackCount += from.livenessFallbackCount;
 	into.richActiveOutcomeCount += from.richActiveOutcomeCount;
-	into.richPassiveIntegratedMass += from.richPassiveIntegratedMass;
+	into.passiveResidualCalls += from.passiveResidualCalls;
+	into.passiveResidualElapsedNs += from.passiveResidualElapsedNs;
+	into.richPassiveIntegratedWeight += from.richPassiveIntegratedWeight;
+	into.richTotalChanceWeight += from.richTotalChanceWeight;
+	into.v4PassiveDrawExperimental = into.v4PassiveDrawExperimental || from.v4PassiveDrawExperimental;
 	into.livenessAnalysisNs += from.livenessAnalysisNs;
 	into.semanticForwardNs += from.semanticForwardNs;
-	into.passiveResidualNs += from.passiveResidualNs;
 	into.passiveExpectationNs += from.passiveExpectationNs;
 	into.activeDrawEnumerationNs += from.activeDrawEnumerationNs;
 	into.skeletonClasses += from.skeletonClasses;

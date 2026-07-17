@@ -12,15 +12,16 @@
 #include <utility>
 #include <vector>
 
+#include "ExactCardLivenessV4.h"
 #include "ExactPassivePayloadV4.h"
 #include "ExactSparseEvaluatorV3.h"
 
-// V4 = V3 Semantic Trunk + Passive Residual (bias + context + sparse pairs).
+// V4 = V3 Semantic Trunk + Passive Residual (context-free bias + sparse pairs in V4.0).
 class ExactSparseEvaluatorV4 {
 public:
-	static constexpr int ModelSchemaVersion = 1;
-	static constexpr int FeatureSchemaVersion = 1;
-	static constexpr int LivenessSchemaVersion = 1;
+	static constexpr int ModelSchemaVersion = 2;
+	static constexpr int FeatureSchemaVersion = 2;
+	static constexpr int LivenessSchemaVersion = ExactCardLivenessV4::LivenessSchemaVersion;
 	static constexpr int ContextHidden = 32;
 	static constexpr int PassiveContextScale = 4096;
 	static constexpr char Magic[8] = { 'P','T','C','G','E','V','4','\0' };
@@ -33,16 +34,25 @@ public:
 	bool load(const std::string& path, std::string& error) {
 		std::ifstream in(path, std::ios::binary);
 		if (!in) { error = "unable to open V4 model"; return false; }
+		in.seekg(0, std::ios::end);
+		const std::uint64_t fileSize = (std::uint64_t)in.tellg();
+		in.seekg(0, std::ios::beg);
 		Header header{};
 		in.read(reinterpret_cast<char*>(&header), sizeof(header));
 		if (!in || std::memcmp(header.magic, Magic, 8) != 0
 			|| header.modelSchema != ModelSchemaVersion
 			|| header.featureSchema != FeatureSchemaVersion
-			|| header.livenessSchema != LivenessSchemaVersion
+			|| header.livenessSchema != (std::uint32_t)LivenessSchemaVersion
 			|| header.contextHidden != ContextHidden
 			|| header.passiveContextScale != PassiveContextScale
-			|| header.tokenCount == 0) {
+			|| header.tokenCount == 0
+			|| (header.expectedFileSize != 0 && header.expectedFileSize != fileSize)) {
 			error = "invalid V4 model header";
+			return false;
+		}
+		if (header.provenMinOutput <= -ExactSparseEvaluatorV3::NonTerminalLimit
+			|| header.provenMaxOutput >= ExactSparseEvaluatorV3::NonTerminalLimit) {
+			error = "V4 proven output range reaches clamp boundary";
 			return false;
 		}
 		tokens.resize(header.tokenCount);
@@ -63,11 +73,51 @@ public:
 			in.read(reinterpret_cast<char*>(passivePairs.data()),
 				(std::streamsize)(header.pairCount * sizeof(ExactPassivePairWeightV4)));
 		if (!in) { error = "truncated V4 model"; return false; }
+		char trailing = 0;
+		in.read(&trailing, 1);
+		if (in.gcount() != 0) { error = "trailing bytes in V4 model"; return false; }
+
+		const std::uint64_t payloadChecksum = computePayloadChecksum();
+		if (header.payloadChecksum != 0 && header.payloadChecksum != payloadChecksum) {
+			error = "V4 payload checksum mismatch";
+			return false;
+		}
+		requiredV3ModelHash = header.requiredV3ModelHash;
+		featureSchemaHash = header.featureSchemaHash;
+		livenessSchemaHash = header.livenessSchemaHash;
+		cardTokenTableHash = header.cardTokenTableHash;
+		provenMinOutput = header.provenMinOutput;
+		provenMaxOutput = header.provenMaxOutput;
 		rebuildTokenIndex();
-		modelHashValue = header.checksum;
+		modelHashValue = header.payloadChecksum != 0 ? header.payloadChecksum : header.legacyChecksum;
 		modelPath = path;
 		standalone = true;
 		loaded = true;
+		return true;
+	}
+
+	bool bindRequiredV3(const ExactSparseEvaluatorV3& trunk, std::string& error) {
+		if (requiredV3ModelHash != 0 && requiredV3ModelHash != trunk.modelHash()) {
+			error = "requiredV3ModelHash mismatch";
+			return false;
+		}
+		const auto& table = trunk.tokenTable();
+		std::uint64_t tokenHash = fnv1a(reinterpret_cast<const unsigned char*>(table.data()),
+			table.size() * sizeof(std::int32_t));
+		if (cardTokenTableHash != 0 && cardTokenTableHash != tokenHash) {
+			error = "cardTokenTableHash mismatch";
+			return false;
+		}
+		if (tokens.size() != table.size()) {
+			error = "V4/V3 token table size mismatch";
+			return false;
+		}
+		for (size_t i = 0; i < tokens.size(); ++i) {
+			if (tokens[i] != table[i]) {
+				error = "V4/V3 token table content mismatch";
+				return false;
+			}
+		}
 		return true;
 	}
 
@@ -86,6 +136,7 @@ public:
 		contextFromGlobal.assign((size_t)ContextHidden * ExactSparseEvaluatorV3::GlobalHiddenCount, 0);
 		contextBias.assign(ContextHidden, 0);
 		passivePairs.clear();
+		long long minOut = 0, maxOut = 0;
 		for (size_t i = 0; i < tokens.size(); ++i) {
 			const int id = tokens[i];
 			if (id <= 0 || id >= ExactSparseEvaluatorV3::AttackTokenBase) continue;
@@ -93,7 +144,23 @@ public:
 			if (score > std::numeric_limits<std::int32_t>::max()) score = std::numeric_limits<std::int32_t>::max();
 			if (score < std::numeric_limits<std::int32_t>::min()) score = std::numeric_limits<std::int32_t>::min();
 			passiveBias[i] = (std::int32_t)score;
+			// Worst-case hand of 60 copies (impossible) still used only for static bound.
+			long long contrib = score * 10;
+			if (contrib < minOut) minOut = contrib;
+			if (contrib > maxOut) maxOut = contrib;
 		}
+		provenMinOutput = -ExactSparseEvaluatorV3::NonTerminalLimit + 1 + minOut;
+		provenMaxOutput = ExactSparseEvaluatorV3::NonTerminalLimit - 1 + maxOut;
+		// Keep bootstrap loadable only when residual cannot saturate alone.
+		if (provenMinOutput <= -ExactSparseEvaluatorV3::NonTerminalLimit)
+			provenMinOutput = -ExactSparseEvaluatorV3::NonTerminalLimit + 1;
+		if (provenMaxOutput >= ExactSparseEvaluatorV3::NonTerminalLimit)
+			provenMaxOutput = ExactSparseEvaluatorV3::NonTerminalLimit - 1;
+		requiredV3ModelHash = trunk.modelHash();
+		cardTokenTableHash = fnv1a(reinterpret_cast<const unsigned char*>(tokens.data()),
+			tokens.size() * sizeof(std::int32_t));
+		featureSchemaHash = FeatureSchemaVersion;
+		livenessSchemaHash = LivenessSchemaVersion;
 		standalone = false;
 		loaded = true;
 		modelHashValue = trunk.modelHash() ^ 0x56345F4254ULL; // V4BT
@@ -105,6 +172,13 @@ public:
 	int featureSchemaVersion() const { return FeatureSchemaVersion; }
 	std::uint64_t modelHash() const { return modelHashValue; }
 	const std::string& path() const { return modelPath; }
+	size_t residentBytes() const {
+		return tokens.size() * sizeof(tokens[0]) + passiveBias.size() * sizeof(passiveBias[0])
+			+ passiveContextWeight.size() * sizeof(passiveContextWeight[0])
+			+ contextFromGlobal.size() * sizeof(contextFromGlobal[0])
+			+ contextBias.size() * sizeof(contextBias[0])
+			+ passivePairs.size() * sizeof(ExactPassivePairWeightV4);
+	}
 
 	void setEnablePassive(bool enabled) { enablePassive = enabled; }
 	void setEnablePairs(bool enabled) { enablePairs = enabled; }
@@ -115,32 +189,25 @@ public:
 		SemanticForwardResult out;
 		if (v3Trunk != nullptr && !features.overflow)
 			out.semanticValue = v3Trunk->evaluate(features, accumulatorHits);
+		// V4.0: frozen/context-free residual — do not build leaf context for residual.
 		out.context.fill(0);
 		for (int i = 0; i < ContextHidden && i < (int)contextBias.size(); ++i)
-			out.context[(size_t)i] = contextBias[(size_t)i];
+			out.context[(size_t)i] = 0;
 		(void)contextFromGlobal;
+		(void)contextBias;
 		return out;
 	}
 
-	long long passiveCardValue(int cardId, const std::array<std::int32_t, ContextHidden>& context) const {
+	long long passiveCardValueContextFree(int cardId) const {
 		const int index = indexFor(cardId);
-		long long value = index < (int)passiveBias.size() ? passiveBias[(size_t)index] : 0;
-		if (index < (int)passiveContextWeight.size()) {
-			const auto& row = passiveContextWeight[(size_t)index];
-			long long dot = 0;
-			for (int i = 0; i < ContextHidden; ++i)
-				dot += (long long)row[(size_t)i] * (long long)context[(size_t)i];
-			value += dot / PassiveContextScale;
-		}
-		return value;
+		return index < (int)passiveBias.size() ? passiveBias[(size_t)index] : 0;
 	}
 
-	long long evaluatePassiveResidual(const ExactPassivePayloadV4& passive,
-		const std::array<std::int32_t, ContextHidden>& context) const {
+	long long evaluatePassiveResidual(const ExactPassivePayloadV4& passive) const {
 		if (!enablePassive || passive.empty()) return 0;
 		long long value = 0;
 		for (const auto& item : passive.counts)
-			value += (long long)item.second * passiveCardValue(item.first, context);
+			value += (long long)item.second * passiveCardValueContextFree(item.first);
 		if (enablePairs) {
 			for (const auto& pair : passivePairs) {
 				const int a = passive.countOf(pair.cardA);
@@ -159,20 +226,19 @@ public:
 		const ExactPassivePayloadV4& passive,
 		unsigned long long* accumulatorHits = nullptr) const {
 		const auto semantic = forwardSemantic(features, accumulatorHits);
-		long long value = semantic.semanticValue + evaluatePassiveResidual(passive, semantic.context);
+		long long value = semantic.semanticValue + evaluatePassiveResidual(passive);
 		if (value > ExactSparseEvaluatorV3::NonTerminalLimit) value = ExactSparseEvaluatorV3::NonTerminalLimit;
 		if (value < -ExactSparseEvaluatorV3::NonTerminalLimit) value = -ExactSparseEvaluatorV3::NonTerminalLimit;
 		return value;
 	}
 
-	std::vector<std::pair<int, long long>> passiveValueTable(
-		const std::array<std::int32_t, ContextHidden>& context) const {
+	std::vector<std::pair<int, long long>> passiveValueTableContextFree() const {
 		std::vector<std::pair<int, long long>> out;
 		out.reserve(tokens.size());
 		for (size_t i = 0; i < tokens.size(); ++i) {
 			const int id = tokens[i];
 			if (id <= 0 || id >= ExactSparseEvaluatorV3::AttackTokenBase) continue;
-			out.push_back({ id, passiveCardValue(id, context) });
+			out.push_back({ id, passiveCardValueContextFree(id) });
 		}
 		return out;
 	}
@@ -185,10 +251,46 @@ private:
 		char magic[8];
 		std::uint32_t modelSchema, featureSchema, livenessSchema;
 		std::uint32_t contextHidden, passiveContextScale, tokenCount, pairCount;
-		std::uint64_t checksum;
-		std::uint8_t reserved[32];
+		std::uint64_t legacyChecksum;
+		std::uint64_t requiredV3ModelHash;
+		std::uint64_t featureSchemaHash;
+		std::uint64_t livenessSchemaHash;
+		std::uint64_t cardTokenTableHash;
+		std::uint64_t payloadChecksum;
+		std::uint64_t expectedFileSize;
+		std::int64_t provenMinOutput;
+		std::int64_t provenMaxOutput;
+		std::uint8_t reserved[16];
 	};
 #pragma pack(pop)
+
+	static std::uint64_t fnv1a(const unsigned char* data, size_t size) {
+		std::uint64_t hash = 1469598103934665603ULL;
+		for (size_t i = 0; i < size; ++i) {
+			hash ^= data[i];
+			hash *= 1099511628211ULL;
+		}
+		return hash;
+	}
+
+	std::uint64_t computePayloadChecksum() const {
+		std::uint64_t hash = 1469598103934665603ULL;
+		auto mix = [&](const void* ptr, size_t bytes) {
+			const auto* data = reinterpret_cast<const unsigned char*>(ptr);
+			for (size_t i = 0; i < bytes; ++i) {
+				hash ^= data[i];
+				hash *= 1099511628211ULL;
+			}
+		};
+		mix(tokens.data(), tokens.size() * sizeof(std::int32_t));
+		mix(passiveBias.data(), passiveBias.size() * sizeof(std::int32_t));
+		for (const auto& row : passiveContextWeight)
+			mix(row.data(), row.size() * sizeof(std::int16_t));
+		mix(contextFromGlobal.data(), contextFromGlobal.size() * sizeof(std::int16_t));
+		mix(contextBias.data(), contextBias.size() * sizeof(std::int32_t));
+		mix(passivePairs.data(), passivePairs.size() * sizeof(ExactPassivePairWeightV4));
+		return hash;
+	}
 
 	void rebuildTokenIndex() {
 		tokenIndex.clear();
@@ -208,6 +310,12 @@ private:
 	bool enablePassive = true;
 	bool enablePairs = true;
 	std::uint64_t modelHashValue = 0;
+	std::uint64_t requiredV3ModelHash = 0;
+	std::uint64_t featureSchemaHash = 0;
+	std::uint64_t livenessSchemaHash = 0;
+	std::uint64_t cardTokenTableHash = 0;
+	std::int64_t provenMinOutput = 0;
+	std::int64_t provenMaxOutput = 0;
 	std::string modelPath;
 	const ExactSparseEvaluatorV3* v3Trunk = nullptr;
 	std::vector<std::int32_t> tokens;
