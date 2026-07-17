@@ -35,6 +35,40 @@
 #include <sys/resource.h>
 #endif
 
+// Registers ActivateSkillEffect / AfterEffect / … so Passive scans can treat the
+// skill-pipeline frames as EffectControl instead of Opaque (P0-2).
+inline void ExactEnsureDeferredFunctionRegistry() {
+	static bool once = false;
+	if (once) return;
+	once = true;
+	auto reg = [](void* fp) {
+		auto found = FunctionIndexTable.find((long long)fp);
+		int idx = -1;
+		if (found != FunctionIndexTable.end()) {
+			idx = found->second;
+		} else {
+			GameFunction tmp{ fp, ArgType::None };
+			idx = tmp.functionIndex;
+		}
+		ExactCardLivenessV4::RegisterEffectControlFunction(idx);
+	};
+	reg((void*)AfterEffect);
+	reg((void*)ActivateSkillEffect);
+	reg((void*)ActivateEffectMultiple);
+	reg((void*)ActivateEffectEachSelected);
+	reg((void*)ActivateEffectForEach);
+	reg((void*)SeparatorProc);
+	// Attach / trigger pipeline (Enriching Energy attaches via temporaryTriggerStack).
+	reg((void*)AfterAbility);
+	reg((void*)AfterTriggerAbility);
+	reg((void*)ResolveTriggerStack);
+	reg((void*)AfterPlay);
+	reg((void*)AfterRefresh);
+	reg((void*)ToMain);
+	reg((void*)MainSelect);
+	reg((void*)SelectedMain);
+}
+
 inline unsigned long long ExactResidentBytes() {
 #ifdef _WIN32
 	PROCESS_MEMORY_COUNTERS_EX counters{};
@@ -1016,6 +1050,7 @@ public:
 #endif
 		v4StripPassiveOnly = false;
 		if (v4PassiveDrawEnabled) metrics.v4PassiveDrawExperimental = true;
+		ExactEnsureDeferredFunctionRegistry();
 		if (runtimeMode != ExactRuntimeMode::Legacy) {
 			metrics.runtimeVersion = 3;
 			metrics.canonicalSchemaVersion = 3;
@@ -1974,14 +2009,10 @@ private:
 						return lateHit->second;
 					}
 				}
-				auto closure = ExactCardLivenessV4::BuildOperatorClosure(reachableSet, preHash);
+				ExactEnsureDeferredFunctionRegistry();
+			auto closure = ExactCardLivenessV4::BuildOperatorClosure(reachableSet, preHash);
 				ExactCardLivenessV4::ApplyStateCoverageScanners(closure, state);
-				int excludeOperatorCardId = 0;
-				if (state.exact.pendingSkillId > 0) {
-					auto skill = SkillTable.find(state.exact.pendingSkillId);
-					if (skill != SkillTable.end()) excludeOperatorCardId = skill->second.cardId;
-				}
-				(void)ExactCardLivenessV4::FurtherChanceUntilTurnEnd(closure, state, excludeOperatorCardId);
+				(void)ExactCardLivenessV4::FurtherChanceUntilTurnEnd(closure, state);
 				// Per-card proveCandidate inside ClassifyCardId — no SealCoverage.
 				partition.refineEquivalent([&](int cardId) {
 					auto live = ExactCardLivenessV4::ClassifyCardId(state, actor, cardId, closure);
@@ -2570,6 +2601,7 @@ private:
 					for (int id : liveAnalysis.visibleIds) reachable.insert(id);
 					auto closure = ExactCardLivenessV4::BuildOperatorClosure(reachable,
 						ExactCardLivenessV4::StableHashString(liveAnalysis.schema));
+					ExactEnsureDeferredFunctionRegistry();
 					ExactCardLivenessV4::ApplyStateCoverageScanners(closure, state);
 					ExactCpuEvaluator::splitOwnHandFeatures(features, state, actor, passive, closure);
 				}
@@ -4518,6 +4550,7 @@ private:
 			available[item.first] = (int)item.second.unsignedLongLong();
 		}
 		const auto analysisStart = std::chrono::steady_clock::now();
+		ExactEnsureDeferredFunctionRegistry();
 		const PartitionAnalysis& analysis = turnDependencyPartition(state, nullptr, true);
 		const ExactCardPartition& partition = analysis.partition;
 		// P0-1/P0-2: classify with operator closure; keep Passive pools per source class.
@@ -4527,17 +4560,13 @@ private:
 		ExactCardLivenessV4::OperatorClosure closure =
 			ExactCardLivenessV4::BuildOperatorClosure(reachable, partitionHash);
 		ExactCardLivenessV4::ApplyStateCoverageScanners(closure, state);
-		int excludeOperatorCardId = 0;
-		if (state.exact.pendingSkillId > 0) {
-			auto skill = SkillTable.find(state.exact.pendingSkillId);
-			if (skill != SkillTable.end()) excludeOperatorCardId = skill->second.cardId;
-		}
-		// Nested-chance safety: remaining effects on THIS pending skill, plus any
-		// reachable Main-phase operator that can open another draw/zone chance.
-		const bool furtherChance = ExactCardLivenessV4::FurtherChanceUntilTurnEnd(
-			closure, state, excludeOperatorCardId);
+		const ExactCardLivenessV4::OperatorSourceKey currentDrawEffect =
+			ExactCardLivenessV4::PendingEffectSourceKey(state);
+		// Nested-chance: remaining effects after pendingEffectIndex, plus any other
+		// reachable further-chance operator (excluding only this Draw Effect key).
+		const bool furtherChance = ExactCardLivenessV4::FurtherChanceUntilTurnEnd(closure, state);
 		const bool anyFutureChance = ExactCardLivenessV4::AnyReachableFurtherChance(
-			closure, excludeOperatorCardId);
+			closure, state, currentDrawEffect);
 		const bool v4Loaded = evaluator && evaluator->v4().isLoaded();
 		const bool analyticOk = v4Loaded; // residual clamp proof is certification-only (see analyticIntegralSafe)
 		if (v4PassiveDrawEnabled && v4Loaded && !evaluator->v4().analyticIntegralSafe())
@@ -4696,6 +4725,7 @@ private:
 			for (int id : baseAnalysis.visibleIds) reachable.insert(id);
 			auto closure = ExactCardLivenessV4::BuildOperatorClosure(reachable,
 				ExactCardLivenessV4::StableHashString(baseAnalysis.schema));
+			ExactEnsureDeferredFunctionRegistry();
 			ExactCardLivenessV4::ApplyStateCoverageScanners(closure, state);
 			auto split = ExactCardLivenessV4::SplitHandCounts(state, actor, handCounts, closure);
 			// Only keep basePassive when this chance itself may analytic-integrate.

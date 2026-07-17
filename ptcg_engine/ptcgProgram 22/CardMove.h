@@ -303,6 +303,18 @@ inline void Draw(State& state, int playerIndex, int count) {
 			state.exact.pending = ExactPendingType::Draw;
 			state.exact.pendingPlayer = (signed char)playerIndex;
 			state.exact.pendingCount = (unsigned char)std::min(count, ps.deck.size());
+			// P0-1: record the concrete Draw Effect so further-chance scans can
+			// exclude this slot only (not every effect on the same cardId).
+			if (state.onEffect()) {
+				state.exact.pendingSkillId = state.effectState.ability.skillId;
+				state.exact.pendingEffectIndex = state.effectState.effectIndex;
+				const CardRef effectCard = state.getEffectCard().card;
+				if (!effectCard.isNull()) {
+					state.exact.pendingEffectCardId = state.getCard(effectCard).cardId;
+					state.exact.pendingEffectPlayer =
+						(signed char)state.getCard(effectCard).playerIndex;
+				}
+			}
 			return;
 		}
 	}

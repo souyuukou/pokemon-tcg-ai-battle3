@@ -24,10 +24,10 @@ def lib():
 
 
 def test_liveness_schema_v3_and_per_card_coverage(lib):
-    assert nnue_v4.LIVENESS_SCHEMA == 4
+    assert nnue_v4.LIVENESS_SCHEMA == 5
     raw = lib.ExactCardLivenessV4Diagnostics()
     data = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
-    assert data["livenessSchemaVersion"] == 4
+    assert data["livenessSchemaVersion"] == lib.ExactCardLivenessV4SchemaVersion()
     assert data["ultraBallBlocksUsedSupporter"] is True
     assert data["usedSupporterPassiveWithoutUltra"] is True
     assert data["damageOnlyDoesNotBlockPassiveEnergy"] is True

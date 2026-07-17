@@ -98,7 +98,7 @@ def test_liveness_schema_v3(lib):
 
     raw = lib.ExactCardLivenessV4Diagnostics()
     data = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
-    assert data["livenessSchemaVersion"] == 4
+    assert data["livenessSchemaVersion"] == lib.ExactCardLivenessV4SchemaVersion()
     assert data["ultraBallBlocksUsedSupporter"] is True
     assert data.get("ultraBallDiscardCostObserved", True) is True
     assert data.get("damageOnlyDoesNotBlockPassiveEnergy", False) is True
@@ -120,5 +120,5 @@ def test_deck_removal_classes_must_not_merge():
     from exact_solver import nnue_v4
 
     assert nnue_v4.MODEL_SCHEMA == 2
-    assert nnue_v4.LIVENESS_SCHEMA == 4
+    assert nnue_v4.LIVENESS_SCHEMA == 5
     assert nnue_v4.FEATURE_SCHEMA == 2

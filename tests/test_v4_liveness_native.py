@@ -18,9 +18,11 @@ def lib():
 def test_liveness_diagnostics_energy_passive(lib):
     if not hasattr(lib, "ExactCardLivenessV4Diagnostics"):
         pytest.skip("ExactCardLivenessV4Diagnostics not exported")
+    if not hasattr(lib, "ExactCardLivenessV4SchemaVersion"):
+        pytest.skip("ExactCardLivenessV4SchemaVersion not exported")
     raw = lib.ExactCardLivenessV4Diagnostics()
     data = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
-    assert data["livenessSchemaVersion"] == 4
+    assert data["livenessSchemaVersion"] == lib.ExactCardLivenessV4SchemaVersion()
     # Empty operator closure can still prove energy-once Passive; Active sample may
     # be zero if the chosen Item is turn-locked. At least one classification runs.
     assert data["samplePassive"] + data["sampleActive"] + data["sampleUnknown"] >= 1

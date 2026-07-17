@@ -23,9 +23,43 @@
 // Unrelated AttackDamage operators must not block Passive proof for a locked Supporter.
 namespace ExactCardLivenessV4 {
 
-static constexpr int LivenessSchemaVersion = 4;
+static constexpr int LivenessSchemaVersion = 5;
 
 enum class CardLiveness : unsigned char { Active = 0, Passive = 1, Unknown = 2 };
+
+enum class OperatorSourceKind : unsigned char {
+	Play = 0,
+	Ability = 1,
+	Delay = 2,
+	AttackPre = 3,
+	AttackPost = 4,
+	Unknown = 5,
+};
+
+// Deferred functionStack entries. Opaque callbacks fail closed; EffectControl
+// frames only resume skill resolution already covered by pendingEffectIndex+1
+// and reachable-operator scans (TypedDeferredFunction long-term target).
+enum class DeferredFunctionKind : unsigned char {
+	Opaque = 0,
+	EffectControl = 1,
+};
+
+struct OperatorSourceKey {
+	int cardId = 0;
+	int skillId = 0;
+	int effectIndex = -1;
+	OperatorSourceKind kind = OperatorSourceKind::Unknown;
+
+	bool valid() const { return effectIndex >= 0 && skillId > 0; }
+
+	// Match the concrete Effect slot (kind may differ if inferred).
+	bool sameEffect(const OperatorSourceKey& other) const {
+		return valid() && other.valid()
+			&& cardId == other.cardId
+			&& skillId == other.skillId
+			&& effectIndex == other.effectIndex;
+	}
+};
 
 enum class CardObservationKind : unsigned char {
 	None = 0,
@@ -82,7 +116,8 @@ struct PassiveProofV4 {
 };
 
 struct OperatorFootprint {
-	int operatorCardId = 0;
+	OperatorSourceKey source{};
+	int operatorCardId = 0; // == source.cardId (legacy accessors)
 	EffectType effectType = EffectType::NoEffect;
 	ConditionType conditionType = ConditionType::Always;
 	bool isCondition = false;
@@ -161,6 +196,55 @@ struct CoverageResult {
 
 	bool covered() const { return analyzed && !unknown; }
 };
+
+inline void MergeCoverageHazardFromResult(CoverageResult& into, const CoverageResult& src) {
+	if (!src.analyzed) return;
+	into.analyzed = true;
+	if (src.unknown) into.unknown = true;
+	if (src.touchesHandIdentity) into.touchesHandIdentity = true;
+	if (src.touchesHandType) into.touchesHandType = true;
+	if (src.touchesHandCount) into.touchesHandCount = true;
+	if (src.touchesDeckIdentity) into.touchesDeckIdentity = true;
+	if (src.mayDiscardHand) into.mayDiscardHand = true;
+	if (src.mayReturnHandToDeck) into.mayReturnHandToDeck = true;
+	if (src.mayMoveZones) into.mayMoveZones = true;
+	if (src.mayObserveCardOrder) into.mayObserveCardOrder = true;
+	if (src.impliesFurtherChance) into.impliesFurtherChance = true;
+}
+
+// Function indices for skill-pipeline frames that only resume effect resolution.
+// Populated by ExactEnsureDeferredFunctionRegistry() once GameProc symbols exist.
+inline std::unordered_set<int>& EffectControlFunctionIndices() {
+	static std::unordered_set<int> indices;
+	return indices;
+}
+
+inline void RegisterEffectControlFunction(int functionIndex) {
+	if (functionIndex >= 0) EffectControlFunctionIndices().insert(functionIndex);
+}
+
+// Short-term TypedDeferredFunction: EffectControl frames are safe relative to
+// Passive hand/deck reads (remaining effects are scanned separately). Any other
+// callback is Opaque → unknown + furtherChance.
+inline CoverageResult ScanDeferredFunctionStack(const State& state) {
+	CoverageResult r;
+	r.analyzed = true;
+	if (state.functionStack.empty()) return r;
+	const auto& ok = EffectControlFunctionIndices();
+	if (ok.empty()) {
+		r.unknown = true;
+		r.impliesFurtherChance = true;
+		return r;
+	}
+	for (const GameFunction& gf : state.functionStack) {
+		if (!ok.count(gf.functionIndex)) {
+			r.unknown = true;
+			r.impliesFurtherChance = true;
+			return r;
+		}
+	}
+	return r;
+}
 
 struct CardLivenessResult {
 	CardLiveness liveness = CardLiveness::Unknown;
@@ -365,9 +449,10 @@ inline bool EffectImpliesFurtherChanceOrZoneMove(EffectType type) {
 	}
 }
 
-inline OperatorFootprint FootprintFromEffect(int cardId, const Effect& effect) {
+inline OperatorFootprint FootprintFromEffect(const OperatorSourceKey& source, const Effect& effect) {
 	OperatorFootprint fp;
-	fp.operatorCardId = cardId;
+	fp.source = source;
+	fp.operatorCardId = source.cardId;
 	fp.effectType = effect.effectType;
 	fp.conditionType = effect.conditionType;
 	fp.isCondition = effect.isCondition;
@@ -408,6 +493,51 @@ inline OperatorFootprint FootprintFromEffect(int cardId, const Effect& effect) {
 	fp.mayCountHandByType = fp.mayTargetHand && !effect.target.conditions.empty();
 	fp.maySearchDeckByIdentity = fp.mayTargetDeck && EffectKindBlocksPassive(fp.observation);
 	return fp;
+}
+
+// Legacy helper used by diagnostics that only know a card id.
+inline OperatorFootprint FootprintFromEffect(int cardId, const Effect& effect) {
+	OperatorSourceKey source;
+	source.cardId = cardId;
+	source.skillId = effect.skillId > 0 ? effect.skillId : 0;
+	source.effectIndex = 0;
+	source.kind = OperatorSourceKind::Unknown;
+	return FootprintFromEffect(source, effect);
+}
+
+inline OperatorSourceKind KindFromSkillType(SkillType type) {
+	switch (type) {
+	case SkillType::Ability: return OperatorSourceKind::Ability;
+	case SkillType::Play:
+	case SkillType::Attach: return OperatorSourceKind::Play;
+	default: return OperatorSourceKind::Unknown;
+	}
+}
+
+inline OperatorSourceKind KindForSkillOnCard(const CardMaster* master, const Skill& skill) {
+	if (master != nullptr) {
+		if (master->play != nullptr && master->play->skillId == skill.skillId)
+			return OperatorSourceKind::Play;
+		if (master->ability != nullptr && master->ability->skillId == skill.skillId)
+			return OperatorSourceKind::Ability;
+		if (master->delay != nullptr && master->delay->skillId == skill.skillId)
+			return OperatorSourceKind::Delay;
+	}
+	return KindFromSkillType(skill.skillType);
+}
+
+// Concrete Effect currently owning the pending chance (Draw etc.).
+inline OperatorSourceKey PendingEffectSourceKey(const State& state) {
+	OperatorSourceKey key;
+	if (state.exact.pendingSkillId <= 0 || state.exact.pendingEffectIndex < 0)
+		return key;
+	auto skill = SkillTable.find(state.exact.pendingSkillId);
+	if (skill == SkillTable.end()) return key;
+	key.cardId = skill->second.cardId;
+	key.skillId = state.exact.pendingSkillId;
+	key.effectIndex = state.exact.pendingEffectIndex;
+	key.kind = KindForSkillOnCard(FindCardMaster(key.cardId), skill->second);
+	return key;
 }
 
 // True if the target filter may select this candidate (fail closed on unsupported).
@@ -509,13 +639,14 @@ inline CoverageResult ScanPendingEffects(const State& state) {
 	return r;
 }
 
-inline CoverageResult ScanSelectionContexts(const State& state) {
+inline CoverageResult ScanSelectionContexts(const State& state, int candidateCardId = 0) {
 	CoverageResult r;
 	r.analyzed = true;
 
-	auto markRef = [&](CardRef ref) {
+	auto markRefIfCandidate = [&](CardRef ref) {
 		if (ref.isNull()) return;
 		const Card& card = state.getCard(ref);
+		if (candidateCardId != 0 && card.cardId != candidateCardId) return;
 		if (card.area == AreaType::Hand) {
 			r.touchesHandIdentity = true;
 			r.mayMoveZones = true;
@@ -524,7 +655,14 @@ inline CoverageResult ScanSelectionContexts(const State& state) {
 			r.touchesDeckIdentity = true;
 		}
 	};
-	auto markAreaRef = [&](const AreaRef& areaRef) { markRef(areaRef.card); };
+	auto markAreaRef = [&](const AreaRef& areaRef) { markRefIfCandidate(areaRef.card); };
+
+	auto tryHandCard = [&](int handIndex) -> CardRef {
+		const int player = state.activePlayerIndex();
+		if (handIndex < 0 || handIndex >= (int)state.players[player].hand.size())
+			return {};
+		return state.players[player].hand[handIndex];
+	};
 
 	for (const SelectOption& option : state.options) {
 		switch (option.type) {
@@ -532,27 +670,81 @@ inline CoverageResult ScanSelectionContexts(const State& state) {
 		case SelectOptionType::ToolCard:
 		case SelectOptionType::EnergyCard: {
 			CardPosition pos = option.getCardPosition();
-			if (pos.area == AreaType::Hand) {
-				r.touchesHandIdentity = true;
-				r.mayMoveZones = true;
+			CardRef ref{};
+			const int player = pos.playerIndex;
+			if (player >= 0 && player < 2) {
+				const PlayerState& ps = state.players[player];
+				auto inRange = [&](const auto& list) {
+					return pos.areaIndex >= 0 && pos.areaIndex < (int)list.size();
+				};
+				if (pos.area == AreaType::Hand && inRange(ps.hand)) ref = ps.hand[pos.areaIndex];
+				else if (pos.area == AreaType::Deck && inRange(ps.deck)) ref = ps.deck[pos.areaIndex];
+				else if (pos.area == AreaType::Prize && inRange(ps.prize)) ref = ps.prize[pos.areaIndex];
+				else if (pos.area == AreaType::Looking && inRange(state.looking))
+					ref = state.looking[pos.areaIndex];
 			}
-			if (pos.area == AreaType::Deck || pos.area == AreaType::Looking
-				|| pos.area == AreaType::Prize) {
-				r.touchesDeckIdentity = true;
+			if (!ref.isNull()) {
+				markRefIfCandidate(ref);
+			} else if (candidateCardId == 0) {
+				if (pos.area == AreaType::Hand) {
+					r.touchesHandIdentity = true;
+					r.mayMoveZones = true;
+				}
+				if (pos.area == AreaType::Deck || pos.area == AreaType::Looking
+					|| pos.area == AreaType::Prize)
+					r.touchesDeckIdentity = true;
+			} else {
+				// Unresolved option with a concrete candidate: fail closed for that zone.
+				if (pos.area == AreaType::Hand) {
+					r.touchesHandIdentity = true;
+					r.mayMoveZones = true;
+				}
+				if (pos.area == AreaType::Deck || pos.area == AreaType::Looking
+					|| pos.area == AreaType::Prize)
+					r.touchesDeckIdentity = true;
 			}
 			break;
 		}
-		case SelectOptionType::Play:
+		case SelectOptionType::Play: {
+			CardRef ref = tryHandCard(option.param0);
+			if (!ref.isNull()) {
+				markRefIfCandidate(ref);
+			} else {
+				r.touchesHandIdentity = true;
+			}
+			break;
+		}
 		case SelectOptionType::Attach:
 		case SelectOptionType::Evolve:
-		case SelectOptionType::Ability:
-			r.touchesHandIdentity = true;
+		case SelectOptionType::Ability: {
+			// param0 = AreaType, param1 = area index (see SelectOption construction).
+			CardRef ref{};
+			try {
+				ref = state.getCardRef((AreaType)option.param0, option.param1,
+					state.activePlayerIndex());
+			} catch (...) {}
+			if (!ref.isNull()) {
+				markRefIfCandidate(ref);
+			} else {
+				r.touchesHandIdentity = true;
+			}
 			break;
-		case SelectOptionType::Discard:
-			r.touchesHandIdentity = true;
-			r.mayDiscardHand = true;
-			r.mayMoveZones = true;
+		}
+		case SelectOptionType::Discard: {
+			CardRef ref = tryHandCard(option.param0);
+			if (!ref.isNull()) {
+				if (candidateCardId == 0 || state.getCard(ref).cardId == candidateCardId) {
+					r.touchesHandIdentity = true;
+					r.mayDiscardHand = true;
+					r.mayMoveZones = true;
+				}
+			} else {
+				r.touchesHandIdentity = true;
+				r.mayDiscardHand = true;
+				r.mayMoveZones = true;
+			}
 			break;
+		}
 		case SelectOptionType::Energy:
 			r.mayMoveZones = true;
 			break;
@@ -567,10 +759,10 @@ inline CoverageResult ScanSelectionContexts(const State& state) {
 		r.unknown = true;
 	}
 
-	for (CardRef ref : state.selectedList) markRef(ref);
-	for (CardRef ref : state.looking) markRef(ref);
-	for (CardRef ref : state.playing) markRef(ref);
-	markRef(state.contextCard);
+	for (CardRef ref : state.selectedList) markRefIfCandidate(ref);
+	for (CardRef ref : state.looking) markRefIfCandidate(ref);
+	for (CardRef ref : state.playing) markRefIfCandidate(ref);
+	markRefIfCandidate(state.contextCard);
 	for (const AreaRef& areaRef : state.preTargetList) markAreaRef(areaRef);
 	for (const AreaRef& areaRef : state.targetList) markAreaRef(areaRef);
 	return r;
@@ -599,31 +791,57 @@ inline CoverageResult ScanReachableConditions(const State& /*state*/, const Oper
 	return r;
 }
 
-inline void AppendSkillFootprints(int cardId, const Skill* skill, CoverageResult& into) {
+inline void AppendSkillFootprints(const Skill* skill, OperatorSourceKind kind,
+	CoverageResult& into, int candidateCardId = 0) {
 	if (skill == nullptr) return;
-	for (const Effect& effect : skill->effects) {
-		OperatorFootprint fp = FootprintFromEffect(cardId, effect);
+	for (int i = 0; i < (int)skill->effects.size(); ++i) {
+		OperatorSourceKey source;
+		source.cardId = skill->cardId;
+		source.skillId = skill->skillId;
+		source.effectIndex = i;
+		source.kind = kind;
+		OperatorFootprint fp = FootprintFromEffect(source, skill->effects[i]);
+		if (candidateCardId != 0 && !footprintMayAffectCandidate(fp, candidateCardId))
+			continue;
 		MergeCoverageHazard(into, fp);
 	}
 }
 
 inline void AppendCardMasterOperators(int cardId, const CardMaster* master, CoverageResult& into,
-	bool includeAttacks) {
+	bool includeAttacks, int candidateCardId = 0) {
 	if (master == nullptr) { into.unknown = true; return; }
-	AppendSkillFootprints(cardId, master->play, into);
-	AppendSkillFootprints(cardId, master->ability, into);
-	AppendSkillFootprints(cardId, master->delay, into);
+	AppendSkillFootprints(master->play, OperatorSourceKind::Play, into, candidateCardId);
+	AppendSkillFootprints(master->ability, OperatorSourceKind::Ability, into, candidateCardId);
+	AppendSkillFootprints(master->delay, OperatorSourceKind::Delay, into, candidateCardId);
 	if (!includeAttacks) return;
 	for (const Attack* attack : master->attacks) {
 		if (attack == nullptr) continue;
-		for (const Effect& effect : attack->preEffects)
-			MergeCoverageHazard(into, FootprintFromEffect(cardId, effect));
-		for (const Effect& effect : attack->postEffects)
-			MergeCoverageHazard(into, FootprintFromEffect(cardId, effect));
+		for (int i = 0; i < (int)attack->preEffects.size(); ++i) {
+			OperatorSourceKey source;
+			source.cardId = cardId;
+			source.skillId = attack->attackId;
+			source.effectIndex = i;
+			source.kind = OperatorSourceKind::AttackPre;
+			OperatorFootprint fp = FootprintFromEffect(source, attack->preEffects[i]);
+			if (candidateCardId != 0 && !footprintMayAffectCandidate(fp, candidateCardId))
+				continue;
+			MergeCoverageHazard(into, fp);
+		}
+		for (int i = 0; i < (int)attack->postEffects.size(); ++i) {
+			OperatorSourceKey source;
+			source.cardId = cardId;
+			source.skillId = attack->attackId;
+			source.effectIndex = i;
+			source.kind = OperatorSourceKind::AttackPost;
+			OperatorFootprint fp = FootprintFromEffect(source, attack->postEffects[i]);
+			if (candidateCardId != 0 && !footprintMayAffectCandidate(fp, candidateCardId))
+				continue;
+			MergeCoverageHazard(into, fp);
+		}
 	}
 }
 
-inline CoverageResult ScanGlobalEffects(const State& state) {
+inline CoverageResult ScanGlobalEffects(const State& state, int candidateCardId = 0) {
 	CoverageResult r;
 	r.analyzed = true;
 	const int active = state.activePlayerIndex();
@@ -631,13 +849,15 @@ inline CoverageResult ScanGlobalEffects(const State& state) {
 	auto scanCard = [&](CardRef ref, bool includeAttacks) {
 		if (ref.isNull()) return;
 		const Card& card = state.getCard(ref);
-		AppendCardMasterOperators(card.cardId, FindCardMaster(card.cardId), r, includeAttacks);
+		AppendCardMasterOperators(card.cardId, FindCardMaster(card.cardId), r, includeAttacks,
+			candidateCardId);
 	};
 	auto scanTriggered = [&](const std::vector<TriggeredAbility>& stack) {
 		for (const TriggeredAbility& ta : stack) {
 			auto skill = SkillTable.find(ta.activateInfo.skillId);
 			if (skill == SkillTable.end()) { r.unknown = true; continue; }
-			AppendSkillFootprints(skill->second.cardId, &skill->second, r);
+			AppendSkillFootprints(&skill->second, KindFromSkillType(skill->second.skillType),
+				r, candidateCardId);
 		}
 	};
 
@@ -647,16 +867,13 @@ inline CoverageResult ScanGlobalEffects(const State& state) {
 		const PlayerState& ps = state.players[p];
 		if (!ps.active.empty()) scanCard(ps.active[0], includeAttacks);
 		for (int b = 0; b < (int)ps.bench.size(); ++b) scanCard(ps.bench[b], includeAttacks);
-		// Tools/energy may trigger mid-turn for either player.
 		for (CardRef ref : ps.tool) scanCard(ref, false);
 		for (CardRef ref : ps.energy) scanCard(ref, false);
 	}
 	scanTriggered(state.delayTriggerStack);
 	scanTriggered(state.temporaryTriggerStack);
 	scanTriggered(state.triggerStack);
-	// functionStack holds opaque deferred callbacks. It does not by itself prove a
-	// hand-identity read; nested-chance gating handles turn-control opacity.
-	(void)state.functionStack;
+	MergeCoverageHazardFromResult(r, ScanDeferredFunctionStack(state));
 	return r;
 }
 
@@ -667,10 +884,9 @@ inline CandidateCoverageProof proveCandidate(
 	CandidateCoverageProof proof = CandidateCoverageProof::AllTrue();
 
 	CoverageResult pending = ScanPendingEffects(state);
-	CoverageResult global = ScanGlobalEffects(state);
-	CoverageResult selection = ScanSelectionContexts(state);
+	CoverageResult global = ScanGlobalEffects(state, candidateCardId);
+	CoverageResult selection = ScanSelectionContexts(state, candidateCardId);
 
-	// Filter cost/condition/operator hazards to this candidate's target match.
 	CoverageResult costs;
 	costs.analyzed = true;
 	CoverageResult conditions;
@@ -678,7 +894,10 @@ inline CandidateCoverageProof proveCandidate(
 	CoverageResult ops;
 	ops.analyzed = true;
 	bool anyUnknownFp = false;
+	const OperatorSourceKey currentDraw = PendingEffectSourceKey(state);
 	for (const OperatorFootprint& fp : closure.footprints) {
+		if (currentDraw.valid() && fp.source.sameEffect(currentDraw))
+			continue; // exclude only the pending Draw Effect itself
 		if (!footprintMayAffectCandidate(fp, candidateCardId)) continue;
 		if (fp.observation == CardObservationKind::Unknown) anyUnknownFp = true;
 		if (fp.isCondition) MergeCoverageHazard(conditions, fp);
@@ -699,6 +918,16 @@ inline CandidateCoverageProof proveCandidate(
 	ApplyHazardToCandidate(proof, selection);
 	ApplyHazardToCandidate(proof, conditions);
 	ApplyHazardToCandidate(proof, ops);
+
+	const bool selectionHazard = selection.unknown || selection.touchesHandIdentity
+		|| selection.touchesDeckIdentity || selection.mayDiscardHand
+		|| selection.mayReturnHandToDeck;
+	if (selectionHazard) proof.selectionSafe = false;
+
+	const bool conditionHazard = conditions.unknown || conditions.touchesHandIdentity
+		|| conditions.touchesHandType || conditions.touchesHandCount;
+	if (conditionHazard) proof.conditionSafe = false;
+
 	return proof;
 }
 
@@ -717,11 +946,10 @@ inline void ApplyStateCoverageScanners(OperatorClosure& closure, const State& st
 		closure.hasUnknown = true;
 }
 
-// Nested-chance safety for the CURRENT pending skill resolution path only.
-// Main-phase Items (e.g. Ultra Ball) are handled by proveCandidate / ClassifyCardId,
-// not by disabling Passive integral for the whole draw.
-inline bool FurtherChanceUntilTurnEnd(const OperatorClosure& /*closure*/, const State& state,
-	int excludeOperatorCardId = 0) {
+// Nested-chance safety for the CURRENT pending skill resolution path.
+// Does NOT skip remaining effects by cardId — only pendingEffectIndex+1..end are scanned.
+inline bool FurtherChanceUntilTurnEnd(const OperatorClosure& /*closure*/, const State& state) {
+	if (ScanDeferredFunctionStack(state).impliesFurtherChance) return true;
 	CoverageResult pending = ScanPendingEffects(state);
 	if (pending.unknown) return true;
 	if (state.exact.pendingSkillId > 0 && state.exact.pendingEffectIndex >= 0) {
@@ -730,21 +958,24 @@ inline bool FurtherChanceUntilTurnEnd(const OperatorClosure& /*closure*/, const 
 		const int opCard = skill->second.cardId;
 		for (int i = state.exact.pendingEffectIndex + 1; i < (int)skill->second.effects.size(); ++i) {
 			const Effect& effect = skill->second.effects[i];
-			if (excludeOperatorCardId != 0 && opCard == excludeOperatorCardId) continue;
 			if (effect.isCondition) {
 				if (ObservationKindForCondition(effect.conditionType) == CardObservationKind::Unknown)
 					return true;
 				continue;
 			}
 			if (EffectImpliesFurtherChanceOrZoneMove(effect.effectType)) return true;
-			OperatorFootprint fp = FootprintFromEffect(opCard, effect);
+			OperatorSourceKey source;
+			source.cardId = opCard;
+			source.skillId = skill->second.skillId;
+			source.effectIndex = i;
+			source.kind = KindForSkillOnCard(FindCardMaster(opCard), skill->second);
+			OperatorFootprint fp = FootprintFromEffect(source, effect);
 			if (fp.observation == CardObservationKind::Unknown) return true;
 			if (fp.mayTargetDeck || fp.mayReturnHandToDeck) return true;
 		}
 	} else if (pending.impliesFurtherChance
 		&& state.exact.pending != ExactPendingType::Draw
 		&& state.exact.pending != ExactPendingType::None) {
-		// Non-draw pending (prize / reveal) still nests chance.
 		return true;
 	}
 	CoverageResult selection = ScanSelectionContexts(state);
@@ -753,11 +984,11 @@ inline bool FurtherChanceUntilTurnEnd(const OperatorClosure& /*closure*/, const 
 	return false;
 }
 
-// Backward-compatible overload without State: inspect footprints only.
+// Footprint-only overload: exclude a single Effect source key (not a whole card).
 inline bool FurtherChanceUntilTurnEnd(const OperatorClosure& closure,
-	int excludeOperatorCardId = 0) {
+	const OperatorSourceKey& excludeEffect = {}) {
 	for (const OperatorFootprint& fp : closure.footprints) {
-		if (excludeOperatorCardId != 0 && fp.operatorCardId == excludeOperatorCardId)
+		if (excludeEffect.valid() && fp.source.sameEffect(excludeEffect))
 			continue;
 		if (fp.isCondition) continue;
 		if (fp.observation == CardObservationKind::Unknown) return true;
@@ -796,12 +1027,16 @@ inline OperatorClosure BuildOperatorClosure(
 			closure.hasUnknown = true;
 			continue;
 		}
-		auto considerSkill = [&](const Skill* skill) {
+		auto considerSkill = [&](const Skill* skill, OperatorSourceKind kind) {
 			if (skill == nullptr) return;
-			for (const Effect& effect : skill->effects) {
-				// Conditions are included — hand-count / type predicates matter.
-				OperatorFootprint fp = FootprintFromEffect(cardId, effect);
-				closure.reachableEffectTypes.insert((int)effect.effectType);
+			for (int i = 0; i < (int)skill->effects.size(); ++i) {
+				OperatorSourceKey source;
+				source.cardId = cardId;
+				source.skillId = skill->skillId;
+				source.effectIndex = i;
+				source.kind = kind;
+				OperatorFootprint fp = FootprintFromEffect(source, skill->effects[i]);
+				closure.reachableEffectTypes.insert((int)skill->effects[i].effectType);
 				closure.footprints.push_back(fp);
 				if (fp.observation == CardObservationKind::Unknown)
 					closure.hasUnknown = true;
@@ -809,24 +1044,34 @@ inline OperatorClosure BuildOperatorClosure(
 		};
 		auto considerAttack = [&](const Attack* attack) {
 			if (attack == nullptr) return;
-			for (const Effect& effect : attack->preEffects) {
-				OperatorFootprint fp = FootprintFromEffect(cardId, effect);
-				closure.reachableEffectTypes.insert((int)effect.effectType);
+			for (int i = 0; i < (int)attack->preEffects.size(); ++i) {
+				OperatorSourceKey source;
+				source.cardId = cardId;
+				source.skillId = attack->attackId;
+				source.effectIndex = i;
+				source.kind = OperatorSourceKind::AttackPre;
+				OperatorFootprint fp = FootprintFromEffect(source, attack->preEffects[i]);
+				closure.reachableEffectTypes.insert((int)attack->preEffects[i].effectType);
 				closure.footprints.push_back(fp);
 				if (fp.observation == CardObservationKind::Unknown)
 					closure.hasUnknown = true;
 			}
-			for (const Effect& effect : attack->postEffects) {
-				OperatorFootprint fp = FootprintFromEffect(cardId, effect);
-				closure.reachableEffectTypes.insert((int)effect.effectType);
+			for (int i = 0; i < (int)attack->postEffects.size(); ++i) {
+				OperatorSourceKey source;
+				source.cardId = cardId;
+				source.skillId = attack->attackId;
+				source.effectIndex = i;
+				source.kind = OperatorSourceKind::AttackPost;
+				OperatorFootprint fp = FootprintFromEffect(source, attack->postEffects[i]);
+				closure.reachableEffectTypes.insert((int)attack->postEffects[i].effectType);
 				closure.footprints.push_back(fp);
 				if (fp.observation == CardObservationKind::Unknown)
 					closure.hasUnknown = true;
 			}
 		};
-		considerSkill(master->play);
-		considerSkill(master->ability);
-		considerSkill(master->delay);
+		considerSkill(master->play, OperatorSourceKind::Play);
+		considerSkill(master->ability, OperatorSourceKind::Ability);
+		considerSkill(master->delay, OperatorSourceKind::Delay);
 		for (const Attack* attack : master->attacks) considerAttack(attack);
 	}
 	for (const auto& fp : closure.footprints)
@@ -1064,17 +1309,22 @@ inline HandSplit SplitHandCounts(const State& state, int actor,
 }
 
 // True if any reachable non-condition operator can open another Draw / zone chance
-// later this turn (Main-phase Items included). Short-term V4.0 guard against
-// double-counting Passive residual across nested multi-draw chances.
+// later this turn. Excludes only the concrete pending Draw Effect source key.
 inline bool AnyReachableFurtherChance(const OperatorClosure& closure,
-	int excludeOperatorCardId = 0) {
+	const OperatorSourceKey& excludeEffect = {}) {
 	for (const OperatorFootprint& fp : closure.footprints) {
 		if (fp.isCondition) continue;
-		if (excludeOperatorCardId != 0 && fp.operatorCardId == excludeOperatorCardId)
+		if (excludeEffect.valid() && fp.source.sameEffect(excludeEffect))
 			continue;
 		if (EffectImpliesFurtherChanceOrZoneMove(fp.effectType)) return true;
 	}
 	return false;
+}
+
+inline bool AnyReachableFurtherChance(const OperatorClosure& closure, const State& state,
+	const OperatorSourceKey& excludeEffect = {}) {
+	if (ScanDeferredFunctionStack(state).impliesFurtherChance) return true;
+	return AnyReachableFurtherChance(closure, excludeEffect);
 }
 
 inline const char* LivenessName(CardLiveness live) {

@@ -87,6 +87,10 @@ extern "C" GAME_API const char8_t* ExactArithmeticDiagnostics() {
   j.appendCommaKeyValue("promoted", product.isLarge()); j.append('}'); return j.buf.c_str();
 }
 
+extern "C" GAME_API int ExactCardLivenessV4SchemaVersion() {
+  return ExactCardLivenessV4::LivenessSchemaVersion;
+}
+
 extern "C" GAME_API const char8_t* ExactCardLivenessV4Diagnostics() {
   static thread_local JsonBuilder j;
   // Observation coverage: unclassified EffectType values fail closed as Unknown.
@@ -214,7 +218,26 @@ extern "C" GAME_API const char8_t* ExactCardLivenessV4Diagnostics() {
     fp.effectType = EffectType::Draw;
     fp.observation = ExactCardLivenessV4::CardObservationKind::CountOnly;
     drawOp.footprints.push_back(fp);
-    drawImpliesFutureChance = ExactCardLivenessV4::AnyReachableFurtherChance(drawOp, 0);
+    drawImpliesFutureChance = ExactCardLivenessV4::AnyReachableFurtherChance(drawOp);
+  }
+
+  // Same-card later Draw must NOT be skipped when excluding only the current Effect key.
+  bool sameCardLaterDrawDetected = false;
+  {
+    ExactCardLivenessV4::OperatorClosure twoDraws = empty;
+    ExactCardLivenessV4::OperatorSourceKey first;
+    first.cardId = 13; first.skillId = 6; first.effectIndex = 0;
+    first.kind = ExactCardLivenessV4::OperatorSourceKind::Play;
+    ExactCardLivenessV4::OperatorSourceKey second = first;
+    second.effectIndex = 1;
+    ExactCardLivenessV4::OperatorFootprint a;
+    a.source = first; a.operatorCardId = 13; a.effectType = EffectType::Draw;
+    a.observation = ExactCardLivenessV4::CardObservationKind::CountOnly;
+    ExactCardLivenessV4::OperatorFootprint b = a;
+    b.source = second;
+    twoDraws.footprints.push_back(a);
+    twoDraws.footprints.push_back(b);
+    sameCardLaterDrawDetected = ExactCardLivenessV4::AnyReachableFurtherChance(twoDraws, first);
   }
 
   j.clear(); j.append('{');
@@ -234,6 +257,7 @@ extern "C" GAME_API const char8_t* ExactCardLivenessV4Diagnostics() {
   j.appendCommaKeyValue("energyDiscardActivesEnergy", energyDiscardActivesEnergy);
   j.appendCommaKeyValue("attackFootprintsPresent", attackFootprintsPresent);
   j.appendCommaKeyValue("drawImpliesFutureChance", drawImpliesFutureChance);
+  j.appendCommaKeyValue("sameCardLaterDrawDetected", sameCardLaterDrawDetected);
   // Which reachable operators still produce Unknown footprints?
   int unknownFootprintTypes = 0;
   {
