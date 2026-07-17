@@ -86,7 +86,7 @@ def _payload_checksum(model: QuantizedModelV4) -> int:
 
 def compute_proven_bounds(passive_bias: np.ndarray, pairs: np.ndarray) -> tuple[int, int, bool]:
     """Match C++ ExactSparseEvaluatorV4::recomputeProvenBoundsFromWeights."""
-    max_hand = 10
+    max_hand = 60  # DECK_SIZE
     lo = 0
     hi = 0
     for bias in np.asarray(passive_bias, dtype=np.int64).tolist():

@@ -235,6 +235,14 @@ public:
 		return value;
 	}
 
+	// Exact Search path: no final clamp. Models must prove residual bounds in int64.
+	long long evaluateV4ExactUnclamped(const ExactSparseEvaluatorV3::FeatureRecord& features,
+		const ExactPassivePayloadV4& passive,
+		unsigned long long* accumulatorHits = nullptr) const {
+		const auto semantic = forwardSemantic(features, accumulatorHits);
+		return semantic.semanticValue + evaluatePassiveResidual(passive);
+	}
+
 	std::vector<std::pair<int, long long>> passiveValueTableContextFree() const {
 		std::vector<std::pair<int, long long>> out;
 		out.reserve(tokens.size());
@@ -296,7 +304,7 @@ private:
 	}
 
 	void recomputeProvenBoundsFromWeights() {
-		constexpr int MaxHandCopies = 10;
+		constexpr int MaxHandCopies = 60; // DECK_SIZE; never under-bound residual proof
 		long long lo = 0, hi = 0;
 		for (std::int32_t bias : passiveBias) {
 			if (bias >= 0) hi += (long long)bias * MaxHandCopies;

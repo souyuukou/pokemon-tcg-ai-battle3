@@ -111,6 +111,13 @@ public:
 		value = sparseV4.evaluateV4(features, passive, accumulatorHits); return true;
 	}
 
+	bool evaluateV4FeaturesUnclamped(const ExactSparseEvaluatorV3::FeatureRecord& features,
+		const ExactPassivePayloadV4& passive, long long& value,
+		unsigned long long* accumulatorHits = nullptr) const {
+		if (!loaded || features.overflow || !sparseV4.isLoaded()) return false;
+		value = sparseV4.evaluateV4ExactUnclamped(features, passive, accumulatorHits); return true;
+	}
+
 	// Strip Passive identities into payload using mandatory operator closure.
 	static void splitOwnHandFeatures(ExactSparseEvaluatorV3::FeatureRecord& features,
 		const State& state, int actor, ExactPassivePayloadV4& passive,

@@ -636,6 +636,7 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
 	j.appendCommaKey("richTotalChanceWeight"); j.appendDoubleQuote(decision.metrics.richTotalChanceWeight.text().c_str());
 	j.appendCommaKeyValue("v4PassiveDrawExperimental", decision.metrics.v4PassiveDrawExperimental);
 	j.appendCommaKey("nestedChancePassiveFallbacks"); AppendUnsignedLongLong(j, decision.metrics.nestedChancePassiveFallbacks);
+	j.appendCommaKey("representativeInvariantFallbacks"); AppendUnsignedLongLong(j, decision.metrics.representativeInvariantFallbacks);
 	j.appendCommaKey("livenessAnalysisNs"); AppendUnsignedLongLong(j, decision.metrics.livenessAnalysisNs);
 	j.appendCommaKey("semanticForwardNs"); AppendUnsignedLongLong(j, decision.metrics.semanticForwardNs);
 	j.appendCommaKey("passiveExpectationNs"); AppendUnsignedLongLong(j, decision.metrics.passiveExpectationNs);
@@ -804,6 +805,7 @@ static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
 	into.richTotalChanceWeight += from.richTotalChanceWeight;
 	into.v4PassiveDrawExperimental = into.v4PassiveDrawExperimental || from.v4PassiveDrawExperimental;
 	into.nestedChancePassiveFallbacks += from.nestedChancePassiveFallbacks;
+	into.representativeInvariantFallbacks += from.representativeInvariantFallbacks;
 	into.livenessAnalysisNs += from.livenessAnalysisNs;
 	into.semanticForwardNs += from.semanticForwardNs;
 	into.passiveExpectationNs += from.passiveExpectationNs;

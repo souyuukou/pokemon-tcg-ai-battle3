@@ -95,7 +95,20 @@ struct OperatorClosure {
 	std::vector<OperatorFootprint> footprints;
 	std::uint64_t reachableOperatorHash = 0;
 	std::uint64_t partitionSchemaHash = 0;
-	bool complete = false;
+	bool hasUnknown = false;
+	// Coverage: complete() is true only when every flag is proven.
+	bool allCardOperatorsCovered = false;
+	bool pendingEffectsCovered = false;
+	bool globalEffectsCovered = false;
+	bool actionCostsCovered = false;
+	bool selectionContextsCovered = false;
+	bool conditionsCovered = false;
+
+	bool complete() const {
+		return allCardOperatorsCovered && pendingEffectsCovered && globalEffectsCovered
+			&& actionCostsCovered && selectionContextsCovered && conditionsCovered
+			&& !hasUnknown;
+	}
 };
 
 struct CardLivenessResult {
@@ -221,7 +234,7 @@ inline bool EffectImpliesFurtherChanceOrZoneMove(EffectType type) {
 
 inline bool FurtherChanceUntilTurnEnd(const OperatorClosure& closure,
 	int excludeOperatorCardId = 0) {
-	if (!closure.complete) return true;
+	if (!closure.complete()) return true;
 	for (const OperatorFootprint& fp : closure.footprints) {
 		if (excludeOperatorCardId != 0 && fp.operatorCardId == excludeOperatorCardId)
 			continue;
@@ -259,7 +272,7 @@ inline OperatorClosure BuildOperatorClosure(
 			unknown.maySearchDeckByIdentity = true;
 			unknown.mayMoveCardZones = true;
 			closure.footprints.push_back(unknown);
-			closure.complete = false;
+			closure.hasUnknown = true;
 			continue;
 		}
 		auto considerSkill = [&](const Skill* skill) {
@@ -295,20 +308,55 @@ inline OperatorClosure BuildOperatorClosure(
 				closure.reachableEffectTypes.insert((int)effect.effectType);
 				closure.footprints.push_back(fp);
 				if (fp.observation == CardObservationKind::Unknown)
-					closure.complete = false;
+					closure.hasUnknown = true;
 			}
 		};
 		considerSkill(master->play);
 		for (const Skill* skill : master->getSkills()) considerSkill(skill);
 	}
-	if (closure.complete == false && !closure.footprints.empty()) {
-		// complete stays false if any unknown; otherwise mark true when all classified.
-		bool anyUnknown = false;
-		for (const auto& fp : closure.footprints)
-			if (fp.observation == CardObservationKind::Unknown) anyUnknown = true;
-		closure.complete = !anyUnknown;
-	} else if (closure.footprints.empty()) {
-		closure.complete = true;
+	for (const auto& fp : closure.footprints)
+		if (fp.observation == CardObservationKind::Unknown) closure.hasUnknown = true;
+	closure.allCardOperatorsCovered = true;
+	if (reachableCards.empty() && !closure.hasUnknown) {
+		// Vacuous: no reachable operators ⇒ nothing left to cover this turn.
+		closure.pendingEffectsCovered = true;
+		closure.globalEffectsCovered = true;
+		closure.actionCostsCovered = true;
+		closure.selectionContextsCovered = true;
+		closure.conditionsCovered = true;
+	} else {
+		// Pending / global / costs / selection / conditions are not fully modeled yet.
+		closure.pendingEffectsCovered = false;
+		closure.globalEffectsCovered = false;
+		closure.actionCostsCovered = false;
+		closure.selectionContextsCovered = false;
+		closure.conditionsCovered = false;
+	}
+	return closure;
+}
+
+// When no further Draw/TakePrize/zone operators remain, mark residual coverage
+// flags for V4.0 experimental terminal-chance integrals. Full scanners replace this.
+inline void SealCoverageForTerminalChance(OperatorClosure& closure) {
+	if (closure.hasUnknown) return;
+	if (!closure.allCardOperatorsCovered) return;
+	closure.pendingEffectsCovered = true;
+	closure.globalEffectsCovered = true;
+	closure.actionCostsCovered = true;
+	closure.selectionContextsCovered = true;
+	closure.conditionsCovered = true;
+}
+
+// Extended builder: mark coverage that the planner can currently prove.
+inline OperatorClosure BuildOperatorClosureEx(
+	const std::unordered_set<int>& reachableCards,
+	std::uint64_t partitionSchemaHash,
+	bool pendingCovered,
+	bool costsCovered) {
+	OperatorClosure closure = BuildOperatorClosure(reachableCards, partitionSchemaHash);
+	if (!reachableCards.empty()) {
+		closure.pendingEffectsCovered = pendingCovered;
+		closure.actionCostsCovered = costsCovered;
 	}
 	return closure;
 }
@@ -329,7 +377,7 @@ inline CardLivenessResult ClassifyCardId(
 		result.reasonMask |= UnknownEffect | UnsupportedTarget | ClosureRequired;
 		return result;
 	}
-	if (!closure.complete) {
+	if (!closure.complete()) {
 		result.liveness = CardLiveness::Unknown;
 		result.reasonMask |= ProofIncomplete | ClosureRequired;
 		return result;
