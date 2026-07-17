@@ -335,16 +335,11 @@ inline OperatorClosure BuildOperatorClosure(
 	return closure;
 }
 
-// When no further Draw/TakePrize/zone operators remain, mark residual coverage
-// flags for V4.0 experimental terminal-chance integrals. Full scanners replace this.
-inline void SealCoverageForTerminalChance(OperatorClosure& closure) {
-	if (closure.hasUnknown) return;
-	if (!closure.allCardOperatorsCovered) return;
-	closure.pendingEffectsCovered = true;
-	closure.globalEffectsCovered = true;
-	closure.actionCostsCovered = true;
-	closure.selectionContextsCovered = true;
-	closure.conditionsCovered = true;
+// Do NOT seal coverage without scanners. Uncovered flags stay false.
+// Kept as a named no-op so call sites remain explicit about the policy.
+inline void SealCoverageForTerminalChance(OperatorClosure& /*closure*/) {
+	// Intentionally empty: FurtherChanceUntilTurnEnd==false does not prove
+	// action costs, selection contexts, conditions, or global effects.
 }
 
 // Extended builder: mark coverage that the planner can currently prove.

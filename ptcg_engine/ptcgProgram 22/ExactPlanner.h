@@ -1387,11 +1387,13 @@ private:
 		bool earlyTurn = false;
 		bool hasPending = false;
 		bool v4PassivePartition = false;
+		std::uint64_t prePartitionProofHash = 0;
 		int pendingPlayer = 0, pendingSkillId = 0, pendingEffectIndex = 0, pendingDetail = 0;
 		bool operator==(const PartitionDependencyKey& other) const {
 			return populationSize == other.populationSize && reachableSize == other.reachableSize
 				&& drawContinuationOnly == other.drawContinuationOnly && earlyTurn == other.earlyTurn
 				&& hasPending == other.hasPending && v4PassivePartition == other.v4PassivePartition
+				&& prePartitionProofHash == other.prePartitionProofHash
 				&& pendingPlayer == other.pendingPlayer
 				&& pendingSkillId == other.pendingSkillId && pendingEffectIndex == other.pendingEffectIndex
 				&& pendingDetail == other.pendingDetail
@@ -1406,6 +1408,7 @@ private:
 			auto add = [&](std::uint64_t value) { hash ^= value; hash *= 1099511628211ULL; };
 			add(key.populationSize); add(key.reachableSize); add(key.drawContinuationOnly);
 			add(key.earlyTurn); add(key.hasPending); add(key.v4PassivePartition);
+			add(key.prePartitionProofHash);
 			for (size_t i = 0; i < key.populationSize; ++i) { add((std::uint32_t)key.populationId[i]); add((std::uint32_t)key.populationCount[i]); }
 			for (size_t i = 0; i < key.reachableSize; ++i) add((std::uint32_t)key.reachable[i]);
 			if (key.hasPending) { add((std::uint32_t)key.pendingPlayer); add((std::uint32_t)key.pendingSkillId);
@@ -1939,15 +1942,37 @@ private:
 				std::unordered_set<int> reachableSet;
 				for (size_t i = 0; i < dependencyKey.reachableSize; ++i)
 					reachableSet.insert(dependencyKey.reachable[i]);
-				auto closure = ExactCardLivenessV4::BuildOperatorClosure(reachableSet, 0);
+				std::uint64_t preHash = 1469598103934665603ULL;
+				preHash = ExactCardLivenessV4::MixHash(preHash, ExactCardLivenessV4::LivenessSchemaVersion);
+				preHash = ExactCardLivenessV4::MixHash(preHash, ExactFeatureV4::SchemaVersion);
+				preHash = ExactCardLivenessV4::MixHash(preHash, dependencyKey.drawContinuationOnly ? 1ull : 0ull);
+				preHash = ExactCardLivenessV4::MixHash(preHash, dependencyKey.earlyTurn ? 1ull : 0ull);
+				preHash = ExactCardLivenessV4::MixHash(preHash, dependencyKey.reachableSize);
+				for (size_t i = 0; i < dependencyKey.reachableSize; ++i)
+					preHash = ExactCardLivenessV4::MixHash(preHash, (std::uint64_t)dependencyKey.reachable[i]);
+				for (size_t i = 0; i < dependencyKey.populationSize; ++i) {
+					preHash = ExactCardLivenessV4::MixHash(preHash, (std::uint64_t)dependencyKey.populationId[i]);
+					preHash = ExactCardLivenessV4::MixHash(preHash, (std::uint64_t)dependencyKey.populationCount[i]);
+				}
+				if (evaluator && evaluator->isLoaded())
+					preHash = ExactCardLivenessV4::MixHash(preHash, evaluator->modelHash());
+				dependencyKey.prePartitionProofHash = preHash;
+				cacheKey.prePartitionProofHash = preHash;
+				{
+					auto lateHit = partitionAnalysisCache.find(cacheKey);
+					if (lateHit != partitionAnalysisCache.end()) {
+						metrics.dynamicPartitionCacheHits++;
+						return lateHit->second;
+					}
+				}
+				auto closure = ExactCardLivenessV4::BuildOperatorClosure(reachableSet, preHash);
 				int excludeOperatorCardId = 0;
 				if (state.exact.pendingSkillId > 0) {
 					auto skill = SkillTable.find(state.exact.pendingSkillId);
 					if (skill != SkillTable.end()) excludeOperatorCardId = skill->second.cardId;
 				}
-				const bool further = ExactCardLivenessV4::FurtherChanceUntilTurnEnd(
-					closure, excludeOperatorCardId);
-				if (!further) ExactCardLivenessV4::SealCoverageForTerminalChance(closure);
+				(void)ExactCardLivenessV4::FurtherChanceUntilTurnEnd(closure, excludeOperatorCardId);
+				// Do not SealCoverage — uncovered flags stay false until real scanners exist.
 				partition.refineEquivalent([&](int cardId) {
 					auto live = ExactCardLivenessV4::ClassifyCardId(state, actor, cardId, closure);
 					if (live.liveness == ExactCardLivenessV4::CardLiveness::Passive
@@ -2553,7 +2578,7 @@ private:
 				} else if (evaluator->usesV4Search()) {
 					metrics.v4SemanticEvaluations++;
 					if (!passive.empty()) metrics.v4PassiveEvaluations++;
-					if (!evaluator->evaluateV4Features(features, passive, result,
+					if (!evaluator->evaluateV4FeaturesUnclamped(features, passive, result,
 						&metrics.evaluatorAccumulatorHits)) {
 						if (evaluator->allowV3Fallback()) {
 							ExactSparseEvaluatorV3::extractFeaturesInto(features, state, actor, &actorProfileCount,
@@ -4412,45 +4437,45 @@ private:
 		bool passiveIntegrated = false; // skip atom split only when PassiveProofV4 is complete
 	};
 
-	// Representative physical draws must not change SemanticFeaturesV4.
-	bool passiveSemanticInvariant(const State& state, const DrawContinuationClass& group, int take) {
+	// Representative physical draws must not change Semantic FeatureRecord bytes.
+	// Does not reclassify the whole hand: strips only basePassive + cards drawn from group.
+	bool passiveSemanticInvariant(const State& state, const DrawContinuationClass& group, int take,
+		const ExactCardLivenessV4::OperatorClosure& /*closure*/,
+		const ExactPassivePayloadV4& basePassive) {
 		if (group.atoms.size() <= 1) return true;
 		if (take <= 0 || !evaluator || !evaluator->isLoaded()) return false;
-		int checkTake = take;
-		if ((int)group.atoms.size() > 8 || checkTake > 2) checkTake = 1;
+		// Rich Energy can take up to 4; never silently shrink the check.
+		if ((int)group.atoms.size() > 6 || take > 4) return false;
 		std::vector<int> bounds;
 		bounds.reserve(group.atoms.size());
 		for (const auto& atom : group.atoms) bounds.push_back(atom.second);
 		BoundedCompositionCursor cursor;
-		cursor.reset(bounds, checkTake);
+		cursor.reset(bounds, take);
 		std::vector<int> localCounts;
 		std::string canonical;
 		bool haveCanonical = false;
-		ExactCardLivenessV4::OperatorClosure empty =
-			ExactCardLivenessV4::BuildOperatorClosure({}, 0);
+		int outcomes = 0;
 		while (cursor.next(localCounts)) {
+			if (++outcomes > 256) return false; // too heavy ⇒ Active fallback
 			auto child = cloneState(state);
+			std::vector<std::pair<int, int>> drawn;
 			try {
-				for (int ai = 0; ai < (int)group.atoms.size(); ++ai)
+				for (int ai = 0; ai < (int)group.atoms.size(); ++ai) {
+					if (localCounts[ai] <= 0) continue;
+					drawn.push_back({ group.atoms[ai].first, localCounts[ai] });
 					for (int n = 0; n < localCounts[ai]; ++n)
 						resolveDraw(*child, group.atoms[ai].first);
+				}
 			} catch (...) { return false; }
 			ExactSparseEvaluatorV3::FeatureRecord features;
 			ExactSparseEvaluatorV3::extractFeaturesInto(features, *child, actor, &actorProfileCount,
 				nullptr, nullptr, nullptr, &actorProfileSorted, false);
-			ExactPassivePayloadV4 passive;
-			ExactCpuEvaluator::splitOwnHandFeatures(features, *child, actor, passive, empty);
+			ExactPassivePayloadV4 passive = ExactFeatureV4::MergePassiveCounts(basePassive, drawn);
 			auto record = ExactFeatureV4::BuildFromV3(features, passive, nullptr);
-			std::string bytes;
-			bytes.reserve(64 + (size_t)record.semantic.features.globalSparse.count * 16);
-			const auto& sparse = record.semantic.features.globalSparse;
-			bytes.append(reinterpret_cast<const char*>(&sparse.count), sizeof(sparse.count));
-			for (int i = 0; i < sparse.count; ++i) {
-				const auto& item = sparse.values[i];
-				bytes.append(reinterpret_cast<const char*>(&item.token), sizeof(item.token));
-				bytes.append(reinterpret_cast<const char*>(&item.relation), sizeof(item.relation));
-				bytes.append(reinterpret_cast<const char*>(&item.value), sizeof(item.value));
-			}
+			std::string bytes = ExactFeatureV4::SerializeSemanticFeatures(record.semantic.features);
+			bytes.push_back((char)(record.overflow ? 1 : 0));
+			bytes.append(reinterpret_cast<const char*>(&record.semantic.passiveHandTotal),
+				sizeof(record.semantic.passiveHandTotal));
 			long long semanticValue = 0;
 			if (!evaluator->evaluateV4FeaturesUnclamped(record.semantic.features,
 				ExactPassivePayloadV4{}, semanticValue))
@@ -4460,6 +4485,17 @@ private:
 			else if (bytes != canonical) return false;
 		}
 		return haveCanonical;
+	}
+
+	bool passiveSemanticInvariantAllTakes(const State& state, const DrawContinuationClass& group,
+		int drawCount, const ExactCardLivenessV4::OperatorClosure& closure,
+		const ExactPassivePayloadV4& basePassive) {
+		const int maxTake = std::min(drawCount, group.count);
+		for (int take = 1; take <= maxTake; ++take) {
+			if (!passiveSemanticInvariant(state, group, take, closure, basePassive))
+				return false;
+		}
+		return maxTake >= 1 || group.atoms.size() <= 1;
 	}
 
 	std::vector<DrawContinuationClass> drawContinuationClasses(const State& state,
@@ -4488,12 +4524,23 @@ private:
 		// after this chance resolves, never analytic-integrate Passive.
 		const bool furtherChance = ExactCardLivenessV4::FurtherChanceUntilTurnEnd(
 			closure, excludeOperatorCardId);
-		if (!furtherChance) ExactCardLivenessV4::SealCoverageForTerminalChance(closure);
+		// Coverage flags stay false until real scanners exist (no SealCoverage).
 		const bool analyticOk = evaluator && evaluator->v4().isLoaded()
 			&& evaluator->v4().analyticIntegralSafe();
 		const bool allowPassiveIntegral = v4PassiveDrawEnabled && !furtherChance && analyticOk
 			&& closure.complete();
 		if (v4PassiveDrawEnabled && furtherChance) ++metrics.nestedChancePassiveFallbacks;
+		const int drawCount = state.exact.pendingCount;
+		ExactPassivePayloadV4 basePassiveForGuard;
+		{
+			std::unordered_map<int, int> handCounts;
+			for (CardRef ref : state.players[actor].hand) {
+				if (ref.isNull()) continue;
+				++handCounts[state.getCard(ref).cardId];
+			}
+			auto split = ExactCardLivenessV4::SplitHandCounts(state, actor, handCounts, closure);
+			basePassiveForGuard.setCounts(std::move(split.passiveCounts), split.proofHash);
+		}
 		std::set<int> assigned;
 		std::vector<DrawContinuationClass> result;
 		int sourceClassId = 0;
@@ -4544,9 +4591,7 @@ private:
 			// proves Passive + deckRemovalInvariant.
 			if (allowPassiveIntegral && allPassive && deckRemovalOk && target.count > 0) {
 				target.passiveIntegrated = true;
-				if (!passiveSemanticInvariant(state, target, 1)
-					|| (target.count > 1
-						&& !passiveSemanticInvariant(state, target, std::min(2, target.count)))) {
+				if (!passiveSemanticInvariantAllTakes(state, target, drawCount, closure, basePassiveForGuard)) {
 					target.passiveIntegrated = false;
 					++metrics.representativeInvariantFallbacks;
 				} else {
@@ -4568,7 +4613,7 @@ private:
 					&& live.liveness == ExactCardLivenessV4::CardLiveness::Passive
 					&& live.proof.allProven() && live.proof.deckRemovalInvariant) {
 					singleton.passiveIntegrated = true;
-					if (!passiveSemanticInvariant(state, singleton, 1)) {
+					if (!passiveSemanticInvariantAllTakes(state, singleton, drawCount, closure, basePassiveForGuard)) {
 						singleton.passiveIntegrated = false;
 						++metrics.representativeInvariantFallbacks;
 						metrics.activeCardCount += (unsigned long long)item.second;

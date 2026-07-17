@@ -2,21 +2,19 @@
 
 ## Gate verdict
 
-**Experimental path only.** Not Exact-certified for general nested search.
+Experimental only. `certified=false` until coverage scanners + oracles pass.
 
-## P0c (this push)
+## P0d (this push)
 
 | Item | Status |
 |------|--------|
-| Passive uses `transitionContinuationKey` (no V3 signature) before partition | done |
-| Active keeps full `continuationIdentityKey` (V3 signature) | done |
-| Classify → then partition (not signature-first singleton) | done |
-| Representative Semantic invariance guard | done |
-| OperatorClosure coverage flags + `complete()` | done |
-| Terminal chance seals coverage when no further draw/zone | provisional |
-| Clamp: `evaluateV4ExactUnclamped` for strip path; bounds use 60 copies | done |
-| `PassiveMomentStateV4` | not yet |
-| Full V4 Semantic retrain without Passive hidden IDs | not yet |
-| End-to-end identity oracle | not yet |
+| `passiveSemanticInvariant`: explicit base+drawn Passive, no empty-closure reclassify | done |
+| Check take = 1..min(drawCount, class.count); heavy class ⇒ Active fallback | done |
+| Full FeatureRecord serialization (`SerializeSemanticFeatures`) | done |
+| Removed fake `SealCoverageForTerminalChance` true-stamping | done |
+| V4 search leaf path uses unclamped eval uniformly | done |
+| `prePartitionProofHash` from dependency/reachable/model (not 0) | done |
+| Real coverage scanners (pending/global/costs/selection/conditions) | **not yet** |
+| Full identity e2e oracle | **not yet** |
 
-Default: V3. `PTCG_EXACT_V4_PASSIVE_DRAW=1` stays uncertified.
+Without coverage scanners, `OperatorClosure::complete()` is rarely true when reachable operators exist, so Passive integral stays fail-closed — intentional.
