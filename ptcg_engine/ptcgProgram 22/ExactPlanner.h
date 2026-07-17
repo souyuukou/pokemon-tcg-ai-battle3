@@ -5,9 +5,14 @@
 #include "ExactCpuEvaluator.h"
 #include "ExactBigRational.h"
 #include "ExactCardPartition.h"
+#include "ExactCardLivenessV4.h"
+#include "ExactPassiveExpectationV4.h"
+#include "ExactPassivePayloadV4.h"
+#include "ExactSkeletonDag.h"
 
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <numeric>
 #include <memory>
 #include <mutex>
@@ -16,6 +21,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <unordered_map>
 #include <unordered_set>
 #include <thread>
@@ -709,12 +715,40 @@ struct ExactMetrics {
 	unsigned long long continuationCompletedOutcomeNodes = 0;
 	unsigned long long continuationMaxOutcomeNodes = 0;
 	unsigned long long continuationAtomsMerged = 0;
+	unsigned long long v4SemanticEvaluations = 0;
+	unsigned long long v4PassiveEvaluations = 0;
+	unsigned long long passiveCardsIntegrated = 0;
+	unsigned long long passivePairTermsEvaluated = 0;
+	unsigned long long passiveExpectationCalls = 0;
+	unsigned long long activeCardCount = 0;
+	unsigned long long passiveCardCount = 0;
+	unsigned long long unknownLivenessCount = 0;
+	unsigned long long livenessFallbackCount = 0;
+	unsigned long long richActiveOutcomeCount = 0;
+	unsigned long long richPassiveIntegratedMass = 0;
+	unsigned long long livenessAnalysisNs = 0;
+	unsigned long long semanticForwardNs = 0;
+	unsigned long long passiveResidualNs = 0;
+	unsigned long long passiveExpectationNs = 0;
+	unsigned long long activeDrawEnumerationNs = 0;
+	unsigned long long skeletonClasses = 0;
+	unsigned long long skeletonClassMembers = 0;
+	unsigned long long skeletonExpansions = 0;
+	unsigned long long skeletonSweeps = 0;
+	unsigned long long skeletonGuardFallbacks = 0;
+	unsigned long long skeletonNodes = 0;
+	unsigned long long skeletonInteriorChances = 0;
+	unsigned long long turnInertIdentities = 0;
+	unsigned long long macroCollapsedTransitions = 0;
+	unsigned long long sleepSetPrunes = 0;
+	unsigned long long argmaxDominatedCuts = 0;
 	int dynamicPartitionFallbackCardId = 0;
 	int dynamicPartitionFallbackEffectType = 0;
 	int dynamicPartitionFallbackTargetType = 0;
 	bool hiddenInformationLeakDetected = false;
 	bool probabilityExact = true;
 	bool informationSetSafe = true;
+	ExactSkeleton::CertScope certificationScope = ExactSkeleton::CertScope::ExactEvaluatorExpectation;
 };
 
 struct ExactDecision {
@@ -932,6 +966,39 @@ public:
 			environmentPriorId ^= (unsigned char)((unsigned)id >> shift); environmentPriorId *= 1099511628211ULL;
 		}
 		runtimeMode = ExactRuntimeModeFromEnvironment();
+		metrics.certificationScope = ExactSkeleton::CertScopeFromEnvironment();
+		// Skeleton sharing stays opt-in until Continuation Signature + verified
+		// guided walk pass unconditional parity. Default is the legacy path.
+		skeletonSharingEnabled = false;
+#ifdef _WIN32
+		{
+			char skeletonFlag[8]{};
+			DWORD length = GetEnvironmentVariableA("PTCG_EXACT_SKELETON", skeletonFlag, (DWORD)std::size(skeletonFlag));
+			if (length > 0 && length < std::size(skeletonFlag)
+				&& (skeletonFlag[0] == '1' || skeletonFlag[0] == 'y' || skeletonFlag[0] == 'Y'))
+				skeletonSharingEnabled = true;
+		}
+#else
+		if (const char* skeletonFlag = std::getenv("PTCG_EXACT_SKELETON");
+			skeletonFlag != nullptr && (skeletonFlag[0] == '1' || skeletonFlag[0] == 'y' || skeletonFlag[0] == 'Y'))
+			skeletonSharingEnabled = true;
+#endif
+		v4PassiveDrawEnabled = false;
+#ifdef _WIN32
+		{
+			char passiveDraw[8]{};
+			DWORD length = GetEnvironmentVariableA("PTCG_EXACT_V4_PASSIVE_DRAW", passiveDraw, (DWORD)std::size(passiveDraw));
+			if (length > 0 && length < std::size(passiveDraw)
+				&& (passiveDraw[0] == '1' || passiveDraw[0] == 'y' || passiveDraw[0] == 'Y'))
+				v4PassiveDrawEnabled = true;
+		}
+#else
+		if (const char* passiveDraw = std::getenv("PTCG_EXACT_V4_PASSIVE_DRAW");
+			passiveDraw != nullptr && (passiveDraw[0] == '1' || passiveDraw[0] == 'y' || passiveDraw[0] == 'Y'))
+			v4PassiveDrawEnabled = true;
+#endif
+		if (evaluator && evaluator->usesV4Search()) v4PassiveDrawEnabled = true;
+		v4StripPassiveOnly = false;
 		if (runtimeMode != ExactRuntimeMode::Legacy) {
 			metrics.runtimeVersion = 3;
 			metrics.canonicalSchemaVersion = 3;
@@ -1249,6 +1316,8 @@ private:
 		std::vector<int> atomCounts;
 		ExactWeight weight;
 		std::string continuationKey;
+		bool hasPassiveExpectation = false;
+		ExactBigRational expectedPassiveResidual{};
 	};
 	struct PartialMultiDrawEntry {
 		std::vector<int> bounds;
@@ -1371,6 +1440,9 @@ private:
 	int recursionDepth = 0;
 	bool canonicalMainEnabled = false;
 	bool reverseActionOrder = false;
+	bool skeletonSharingEnabled = false;
+	bool v4PassiveDrawEnabled = false;
+	bool v4StripPassiveOnly = false;
 	bool concreteWorldCaching = false;
 	// Enabled only by a future shared-frontier scheduler. Root-parity profiling
 	// showed no simultaneous claims, so allocating a flight record per node is
@@ -1683,6 +1755,22 @@ private:
 				exhausted = exhausted || (card.cardType == CardType::Stadium
 					&& (state.stadiumPlayed || player.cannotPlayStadium
 						|| player.thisTurn.cannotPlayStadium));
+				// Neither player may evolve on turn 1–2; Stage cards drawn this turn
+				// cannot become operators and are Passive-eligible under V4.
+				exhausted = exhausted || (state.turn <= 2
+					&& (card.evolutionType == EvolutionType::Stage1
+						|| card.evolutionType == EvolutionType::Stage2));
+				// Items whose play skill requires a later turn (e.g. Rare Candy) are
+				// not operators for the remainder of an early turn.
+				if (!exhausted && card.play != nullptr) {
+					for (const Effect& effect : card.play->effects) {
+						if (!effect.isCondition) break;
+						if (effect.conditionType != ConditionType::Turn) continue;
+						const int need = effect.values[0];
+						if (effect.comparatorType == ComparatorType::GreaterEqual && state.turn < need) exhausted = true;
+						if (effect.comparatorType == ComparatorType::Greater && state.turn <= need) exhausted = true;
+					}
+				}
 				if (!exhausted) addReachable(atomCardId);
 			}
 		}
@@ -2363,7 +2451,45 @@ private:
 			long long result = 0;
 			auto inferenceStarted = timer.sample ? std::chrono::steady_clock::now()
 				: std::chrono::steady_clock::time_point{};
-			if (!evaluator->evaluateV3Features(features, result, &metrics.evaluatorAccumulatorHits)) {
+			const bool useV4 = evaluator->usesV4Search() || evaluator->usesV4PassiveStrip();
+			if (useV4 && evaluator->v4().isLoaded()) {
+				ExactPassivePayloadV4 passive;
+				ExactCpuEvaluator::splitOwnHandFeatures(features, state, actor, passive, nullptr);
+				metrics.activeCardCount += 0; // observational; counts updated in draw path
+				if (v4StripPassiveOnly) {
+					metrics.v4SemanticEvaluations++;
+					if (!evaluator->evaluateV4Features(features, ExactPassivePayloadV4{}, result,
+						&metrics.evaluatorAccumulatorHits)) {
+						if (evaluator->allowV3Fallback()) {
+							ExactSparseEvaluatorV3::extractFeaturesInto(features, state, actor, &actorProfileCount,
+								nullptr, nullptr, nullptr, &actorProfileSorted, false);
+							if (!evaluator->evaluateV3Features(features, result, &metrics.evaluatorAccumulatorHits)) {
+								metrics.informationSetSafe = false; return 0;
+							}
+						} else { metrics.informationSetSafe = false; return 0; }
+					}
+				} else if (evaluator->usesV4Search()) {
+					metrics.v4SemanticEvaluations++;
+					if (!passive.empty()) metrics.v4PassiveEvaluations++;
+					if (!evaluator->evaluateV4Features(features, passive, result,
+						&metrics.evaluatorAccumulatorHits)) {
+						if (evaluator->allowV3Fallback()) {
+							ExactSparseEvaluatorV3::extractFeaturesInto(features, state, actor, &actorProfileCount,
+								nullptr, nullptr, nullptr, &actorProfileSorted, false);
+							if (!evaluator->evaluateV3Features(features, result, &metrics.evaluatorAccumulatorHits)) {
+								metrics.informationSetSafe = false; return 0;
+							}
+						} else { metrics.informationSetSafe = false; return 0; }
+					}
+				} else {
+					// Dual: search still uses V3 absolute values.
+					ExactSparseEvaluatorV3::extractFeaturesInto(features, state, actor, &actorProfileCount,
+						nullptr, nullptr, nullptr, &actorProfileSorted, false);
+					if (!evaluator->evaluateV3Features(features, result, &metrics.evaluatorAccumulatorHits)) {
+						metrics.informationSetSafe = false; return 0;
+					}
+				}
+			} else if (!evaluator->evaluateV3Features(features, result, &metrics.evaluatorAccumulatorHits)) {
 				metrics.informationSetSafe = false; return 0;
 			}
 			if (runtimeMode == ExactRuntimeMode::Shadow) {
@@ -2381,9 +2507,6 @@ private:
 					std::chrono::steady_clock::now() - inferenceStarted).count();
 			return result;
 		}
-		// A missing model is not silently replaced by the retired V1 heuristic.
-		// Zero is useful for structural tests, but applyEvaluatorSafety prevents it
-		// from being reported as a certified evaluator result.
 		return 0;
 	}
 
@@ -3768,9 +3891,432 @@ private:
 		return result;
 	}
 
+	std::unordered_set<int> collectAssumedInert(const State& state) const {
+		std::unordered_set<int> inert;
+		for (const auto& item : actorProfileCount) {
+			if (ExactSkeleton::IsTurnInertCardId(state, actor, item.first)) {
+				inert.insert(item.first);
+			}
+		}
+		return inert;
+	}
+
+	bool optionReferencesInert(const State& state, int optionIndex,
+		const std::unordered_set<int>& assumedInert) const {
+		if (optionIndex < 0 || optionIndex >= (int)state.options.size()) return false;
+		const SelectOption& option = state.options[optionIndex];
+		auto checkRef = [&](AreaType area, int index) {
+			try {
+				CardRef ref = state.getCardRef(area, index, state.selectPlayer);
+				if (ref.isNull()) return false;
+				return assumedInert.contains(state.getCard(ref).cardId);
+			} catch (...) { return false; }
+		};
+		switch (option.type) {
+		case SelectOptionType::Play: return checkRef(AreaType::Hand, option.param0);
+		case SelectOptionType::Attach:
+		case SelectOptionType::Evolve: return checkRef((AreaType)option.param0, option.param1);
+		case SelectOptionType::Ability: return checkRef((AreaType)option.param0, option.param1);
+		case SelectOptionType::Card: {
+			CardPosition pos = option.getCardPosition();
+			if (pos.area == AreaType::Hand || pos.area == AreaType::Deck || pos.area == AreaType::Prize)
+				return checkRef(pos.area, pos.areaIndex);
+			return false;
+		}
+		default: return false;
+		}
+	}
+
+	int internSkeletonNode(ExactSkeleton::Dag& dag, ExactSkeleton::NodeKind kind, std::string internKey) {
+		auto found = dag.intern.find(internKey);
+		if (found != dag.intern.end()) {
+			// Only reuse fully built nodes. Hitting an in-progress node would create
+			// a cycle and stack-overflow the guided walk.
+			if (dag.nodes[found->second].complete) return found->second;
+			internKey.append("#");
+			internKey.append(std::to_string(dag.nodes.size()));
+		}
+		ExactSkeleton::DagNode node;
+		node.kind = kind;
+		node.internKey = internKey;
+		node.complete = false;
+		int id = (int)dag.nodes.size();
+		dag.nodes.push_back(std::move(node));
+		dag.intern.emplace(std::move(internKey), id);
+		return id;
+	}
+
+	bool sameContinuationSignature(int leftId, int rightId) {
+		return continuationIdentityKey(leftId) == continuationIdentityKey(rightId);
+	}
+
+	bool canMergeInertIdentities(const State& state, int leftId, int rightId) {
+		if (leftId == rightId) return true;
+		if (!ExactSkeleton::IsTurnInertCardId(state, actor, leftId)) return false;
+		if (!ExactSkeleton::IsTurnInertCardId(state, actor, rightId)) return false;
+		return sameContinuationSignature(leftId, rightId);
+	}
+
+	int expandSkeletonNode(ExactStatePtr owned, ExactSkeleton::Dag& dag, int depthLimit) {
+		if (dag.inertGuardFailed) return -1;
+		if (dag.expandedNodes > 200'000ULL) {
+			dag.inertGuardFailed = true;
+			metrics.skeletonGuardFallbacks++;
+			return -1;
+		}
+		if (depthLimit <= 0 || expired()) {
+			return internSkeletonNode(dag, ExactSkeleton::NodeKind::Blocked, "BLOCKED");
+		}
+		State& state = *owned;
+		metrics.expanded++;
+		dag.expandedNodes++;
+		try {
+			while (!state.isFinish() && !IsExactTurnLeaf(state)
+				&& state.exact.pending == ExactPendingType::None && state.selectType == SelectType::None) {
+				stepExact(state);
+				metrics.expanded++;
+				dag.expandedNodes++;
+				if (expired()) break;
+			}
+		} catch (...) {
+			dag.inertGuardFailed = true;
+			return -1;
+		}
+		if (state.isFinish() || IsExactTurnLeaf(state)) {
+			metrics.leaves++;
+			int leaf = internSkeletonNode(dag, ExactSkeleton::NodeKind::Leaf, keyFor(state) + "\x1f" "LEAF");
+			dag.nodes[leaf].complete = true;
+			return leaf;
+		}
+		for (int i = 0; i < (int)state.options.size(); ++i) {
+			if (optionReferencesInert(state, i, dag.assumedInert)) {
+				dag.inertGuardFailed = true;
+				metrics.skeletonGuardFallbacks++;
+				return -1;
+			}
+		}
+		if (state.selectType != SelectType::Main && state.selectType != SelectType::Attack
+			&& state.selectMin == 1 && state.selectMax == 1 && state.options.size() == 1) {
+			metrics.macroCollapsedTransitions++;
+			dag.macroCollapsed++;
+			ExactSmallAction only{ 0 };
+			if (!advance(state, only)) { dag.inertGuardFailed = true; return -1; }
+			return expandSkeletonNode(std::move(owned), dag, depthLimit - 1);
+		}
+		if (state.exact.pending == ExactPendingType::Draw || state.exact.pending == ExactPendingType::TakePrize) {
+			dag.interiorChanceNodes++;
+			metrics.skeletonInteriorChances++;
+			std::string chanceKey = keyFor(state) + "\x1f" "CHANCE";
+			auto existing = dag.intern.find(chanceKey);
+			if (existing != dag.intern.end() && dag.nodes[existing->second].complete)
+				return existing->second;
+			int chanceNode = internSkeletonNode(dag, ExactSkeleton::NodeKind::Chance, chanceKey);
+			auto types = chanceCardTypes(state);
+			if (types.empty()) { dag.inertGuardFailed = true; return -1; }
+
+			auto appendChanceEdge = [&](std::string label, std::vector<int> atomCounts, ExactWeight weight,
+				ExactStatePtr childState) -> bool {
+				int child = expandSkeletonNode(std::move(childState), dag, depthLimit - 1);
+				if (dag.inertGuardFailed || child < 0) return false;
+				ExactSkeleton::DagEdge edge;
+				edge.label = std::move(label);
+				edge.child = child;
+				edge.atomCounts = std::move(atomCounts);
+				edge.weight = weight;
+				dag.nodes[chanceNode].edges.push_back(std::move(edge));
+				return true;
+			};
+
+			if (state.exact.pendingCount > 1) {
+				// Interior multi-draw fan-out inside a skeleton class is still too
+				// large to materialize as an explicit DAG. Fall back to per-outcome
+				// solveOwned; structural sharing remains for draw-free Main segments.
+				dag.inertGuardFailed = true;
+				metrics.skeletonGuardFallbacks++;
+				return -1;
+			} else {
+				std::vector<bool> merged(types.size(), false);
+				for (int ti = 0; ti < (int)types.size(); ++ti) {
+					if (merged[ti]) continue;
+					std::vector<int> group = { ti };
+					ExactWeight weight = types[ti].second;
+					for (int tj = ti + 1; tj < (int)types.size(); ++tj) {
+						if (merged[tj]) continue;
+						if (!canMergeInertIdentities(state, types[ti].first, types[tj].first)) continue;
+						merged[tj] = true;
+						group.push_back(tj);
+						weight += types[tj].second;
+					}
+					merged[ti] = true;
+					auto childState = cloneState(state);
+					try {
+						if (state.exact.pending == ExactPendingType::Draw) resolveDraw(*childState, types[ti].first);
+						else resolvePrize(*childState, types[ti].first);
+					} catch (...) { dag.inertGuardFailed = true; return -1; }
+					std::string label = "CHANCE:";
+					label.append(std::to_string(types[ti].first));
+					if (group.size() > 1) {
+						label.append(":SIG");
+						for (int gi : group) { label.push_back('+'); label.append(std::to_string(types[gi].first)); }
+					}
+					std::vector<int> atomCounts(types.size(), 0);
+					for (int gi : group) atomCounts[gi] = 1;
+					if (!appendChanceEdge(std::move(label), std::move(atomCounts), weight, std::move(childState)))
+						return -1;
+				}
+			}
+			if (dag.nodes[chanceNode].edges.empty()) { dag.inertGuardFailed = true; return -1; }
+			dag.nodes[chanceNode].complete = true;
+			return chanceNode;
+		}
+		if (state.selectType == SelectType::YesNo && state.selectContext == SelectContext::CoinHead) {
+			dag.inertGuardFailed = true;
+			return -1;
+		}
+		const bool maximize = state.selectPlayer == actor;
+		std::string decisionKey = keyFor(state) + (maximize ? "\x1f" "MAX" : "\x1f" "MIN");
+		auto existingDecision = dag.intern.find(decisionKey);
+		if (existingDecision != dag.intern.end() && dag.nodes[existingDecision->second].complete)
+			return existingDecision->second;
+		int decisionNode = internSkeletonNode(dag,
+			maximize ? ExactSkeleton::NodeKind::DecisionMax : ExactSkeleton::NodeKind::DecisionMin,
+			decisionKey);
+		bool completed = forEachLegalAction(state, [&](const ExactSmallAction& action) {
+			if (dag.inertGuardFailed) return false;
+			std::string label = actionEquivalenceKey(state, action);
+			auto child = cloneState(state);
+			if (!advance(*child, action)) return true;
+			int childId = expandSkeletonNode(std::move(child), dag, depthLimit - 1);
+			if (dag.inertGuardFailed || childId < 0) return false;
+			ExactSkeleton::DagEdge edge;
+			edge.label = std::move(label);
+			edge.child = childId;
+			dag.nodes[decisionNode].edges.push_back(std::move(edge));
+			return true;
+		});
+		if (!completed || dag.inertGuardFailed) return -1;
+		if (dag.nodes[decisionNode].edges.empty()) {
+			dag.inertGuardFailed = true;
+			return -1;
+		}
+		dag.nodes[decisionNode].complete = true;
+		return decisionNode;
+	}
+
+	ExactWeight memberChanceEdgeWeight(const std::vector<std::pair<int, ExactWeight>>& types,
+		const std::vector<int>& atomCounts) const {
+		if (atomCounts.size() != types.size()) return ExactWeight();
+		int take = 0;
+		for (int n : atomCounts) take += n;
+		if (take <= 1) {
+			ExactWeight sum;
+			for (int i = 0; i < (int)atomCounts.size(); ++i) if (atomCounts[i] > 0) sum += types[i].second;
+			return sum;
+		}
+		ExactWeight weight(1);
+		for (int i = 0; i < (int)atomCounts.size(); ++i) {
+			if (atomCounts[i] <= 0) continue;
+			if (!types[i].second.fitsUnsignedLongLong()) return ExactWeight();
+			int available = (int)types[i].second.unsignedLongLong();
+			if (atomCounts[i] > available) return ExactWeight();
+			weight = ExactWeight::multiply(weight, chooseCount(available, atomCounts[i]));
+		}
+		return weight;
+	}
+
+	ExactScore walkSkeletonNode(ExactSkeleton::Dag& dag, int nodeId, ExactStatePtr owned, int depthLimit = 96) {
+		if (nodeId < 0 || nodeId >= (int)dag.nodes.size() || !owned || depthLimit <= 0) {
+			dag.walkFailed = true; return unknown();
+		}
+		const ExactSkeleton::DagNode& node = dag.nodes[nodeId];
+		if (node.kind == ExactSkeleton::NodeKind::Blocked) { dag.walkFailed = true; return unknown(); }
+		State& state = *owned;
+		try {
+			while (!state.isFinish() && !IsExactTurnLeaf(state)
+				&& state.exact.pending == ExactPendingType::None && state.selectType == SelectType::None) {
+				stepExact(state);
+			}
+			// Mirror expand's macro-collapse so member state aligns with interned nodes.
+			while (!state.isFinish() && !IsExactTurnLeaf(state)
+				&& state.exact.pending == ExactPendingType::None
+				&& state.selectType != SelectType::Main
+				&& state.selectType != SelectType::Attack
+				&& state.selectType != SelectType::YesNo
+				&& state.selectMin == 1 && state.selectMax == 1
+				&& state.options.size() == 1) {
+				if (!advance(state, ExactSmallAction{ 0 })) { dag.walkFailed = true; return unknown(); }
+				while (!state.isFinish() && !IsExactTurnLeaf(state)
+					&& state.exact.pending == ExactPendingType::None && state.selectType == SelectType::None) {
+					stepExact(state);
+				}
+			}
+		} catch (...) { dag.walkFailed = true; return unknown(); }
+
+		if (node.kind == ExactSkeleton::NodeKind::Leaf) {
+			if (!(state.isFinish() || IsExactTurnLeaf(state))) { dag.walkFailed = true; return unknown(); }
+			auto value = ExactFraction::integer(evaluate(state));
+			return { value, value, {}, !state.exact.provisionalOpponentPolicy };
+		}
+
+		if (node.kind == ExactSkeleton::NodeKind::Chance) {
+			if (state.exact.pending != ExactPendingType::Draw
+				&& state.exact.pending != ExactPendingType::TakePrize) {
+				dag.walkFailed = true; return unknown();
+			}
+			auto types = chanceCardTypes(state);
+			if (types.empty()) { dag.walkFailed = true; return unknown(); }
+			ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
+			bool certified = true;
+			ExactWeight total;
+			struct Branch { ExactWeight weight; ExactScore score; };
+			std::vector<Branch> branches;
+			branches.reserve(node.edges.size());
+			for (const ExactSkeleton::DagEdge& edge : node.edges) {
+				ExactWeight weight = memberChanceEdgeWeight(types, edge.atomCounts);
+				if (weight.zero()) { dag.walkFailed = true; return unknown(); }
+				auto childState = cloneState(state);
+				try {
+					if (state.exact.pendingCount > 1 || edge.label.rfind("CHANCE-MULTI:", 0) == 0) {
+						for (int i = 0; i < (int)edge.atomCounts.size(); ++i)
+							for (int n = 0; n < edge.atomCounts[i]; ++n) {
+								if (state.exact.pending == ExactPendingType::Draw)
+									resolveDraw(*childState, types[i].first);
+								else resolvePrize(*childState, types[i].first);
+							}
+					} else {
+						int pick = -1;
+						for (int i = 0; i < (int)edge.atomCounts.size(); ++i) if (edge.atomCounts[i] > 0) { pick = i; break; }
+						if (pick < 0) { dag.walkFailed = true; return unknown(); }
+						if (state.exact.pending == ExactPendingType::Draw) resolveDraw(*childState, types[pick].first);
+						else resolvePrize(*childState, types[pick].first);
+					}
+				} catch (...) { dag.walkFailed = true; return unknown(); }
+				ExactScore child = walkSkeletonNode(dag, edge.child, std::move(childState), depthLimit - 1);
+				if (dag.walkFailed) return unknown();
+				branches.push_back({ weight, child });
+				total += weight;
+				certified = certified && child.certified;
+			}
+			if (total.zero()) { dag.walkFailed = true; return unknown(); }
+			for (const Branch& branch : branches) {
+				lower = ExactFraction::add(lower, branch.score.lower.scaled(branch.weight, total));
+				upper = ExactFraction::add(upper, branch.score.upper.scaled(branch.weight, total));
+				if (!lower.valid || !upper.valid) { metrics.arithmeticOverflow = true; dag.walkFailed = true; return unknown(); }
+			}
+			return { lower, upper, {}, certified && ExactCompare(lower, upper) == 0 };
+		}
+
+		std::vector<std::pair<std::string, ExactSmallAction>> legal;
+		bool listed = forEachLegalAction(state, [&](const ExactSmallAction& action) {
+			legal.push_back({ actionEquivalenceKey(state, action), action });
+			return true;
+		});
+		if (!listed) { dag.walkFailed = true; return unknown(); }
+		std::sort(legal.begin(), legal.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+		std::vector<std::string> edgeLabels;
+		edgeLabels.reserve(node.edges.size());
+		for (const auto& edge : node.edges) edgeLabels.push_back(edge.label);
+		std::sort(edgeLabels.begin(), edgeLabels.end());
+		std::vector<std::string> legalLabels;
+		legalLabels.reserve(legal.size());
+		for (const auto& item : legal) legalLabels.push_back(item.first);
+		if (legalLabels != edgeLabels) { dag.walkFailed = true; return unknown(); }
+
+		ExactScore best;
+		bool first = true;
+		bool allCertified = true;
+		const bool maximize = node.kind == ExactSkeleton::NodeKind::DecisionMax;
+		for (const ExactSkeleton::DagEdge& edge : node.edges) {
+			auto found = std::find_if(legal.begin(), legal.end(),
+				[&](const auto& item) { return item.first == edge.label; });
+			if (found == legal.end()) { dag.walkFailed = true; return unknown(); }
+			auto child = cloneState(state);
+			if (!advance(*child, found->second)) { dag.walkFailed = true; return unknown(); }
+			ExactScore childScore = walkSkeletonNode(dag, edge.child, std::move(child), depthLimit - 1);
+			if (dag.walkFailed) return unknown();
+			allCertified = allCertified && childScore.certified;
+			if (first || (maximize ? ExactCompare(childScore.lower, best.lower) > 0
+				: ExactCompare(childScore.upper, best.upper) < 0)) {
+				best = childScore;
+				first = false;
+			}
+		}
+		if (first) { dag.walkFailed = true; return unknown(); }
+		best.certified = allCertified && ExactCompare(best.lower, best.upper) == 0;
+		return best;
+	}
+
+	ExactScore solveSkeletonClass(const State& preDrawState,
+		const std::vector<std::pair<int, ExactWeight>>& types,
+		const std::vector<MultiDrawOutcome>& outcomes,
+		const std::vector<size_t>& members,
+		const ExactWeight& totalMass) {
+		if (members.empty()) return unknown();
+		ExactSkeleton::Dag dag;
+		dag.assumedInert = collectAssumedInert(preDrawState);
+		metrics.turnInertIdentities += dag.assumedInert.size();
+		metrics.skeletonClasses++;
+		metrics.skeletonClassMembers += members.size();
+		auto makePostDraw = [&](size_t outcomeIndex) -> ExactStatePtr {
+			auto child = cloneState(preDrawState);
+			const MultiDrawOutcome& outcome = outcomes[outcomeIndex];
+			for (int i = 0; i < (int)outcome.atomCounts.size(); ++i)
+				for (int n = 0; n < outcome.atomCounts[i]; ++n) resolveDraw(*child, types[i].first);
+			return child;
+		};
+		ExactStatePtr representative;
+		try {
+			representative = makePostDraw(members.front());
+		} catch (...) { return unknown(); }
+		metrics.skeletonExpansions++;
+		dag.root = expandSkeletonNode(std::move(representative), dag, 96);
+		metrics.skeletonNodes += dag.nodes.size();
+		auto fallbackAll = [&]() {
+			metrics.skeletonGuardFallbacks++;
+			ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
+			bool certified = true;
+			for (size_t member : members) {
+				if (expired()) return unknown();
+				ExactStatePtr child;
+				try { child = makePostDraw(member); }
+				catch (...) { return unknown(); }
+				ExactScore score = solveOwned(std::move(child));
+				lower = ExactFraction::add(lower, score.lower.scaled(outcomes[member].weight, totalMass));
+				upper = ExactFraction::add(upper, score.upper.scaled(outcomes[member].weight, totalMass));
+				if (!lower.valid || !upper.valid) { metrics.arithmeticOverflow = true; return unknown(); }
+				certified = certified && score.certified;
+			}
+			return ExactScore{ lower, upper, {}, certified && ExactCompare(lower, upper) == 0 };
+		};
+		if (dag.inertGuardFailed || dag.root < 0) return fallbackAll();
+		ExactFraction lower = ExactFraction::integer(0), upper = ExactFraction::integer(0);
+		bool certified = true;
+		for (size_t member : members) {
+			if (expired()) return unknown();
+			ExactStatePtr child;
+			try { child = makePostDraw(member); }
+			catch (...) { return unknown(); }
+			metrics.skeletonSweeps++;
+			dag.walkFailed = false;
+			ExactScore score = walkSkeletonNode(dag, dag.root, std::move(child));
+			if (dag.walkFailed || !score.certified) {
+				metrics.skeletonGuardFallbacks++;
+				try { child = makePostDraw(member); }
+				catch (...) { return unknown(); }
+				score = solveOwned(std::move(child));
+			}
+			lower = ExactFraction::add(lower, score.lower.scaled(outcomes[member].weight, totalMass));
+			upper = ExactFraction::add(upper, score.upper.scaled(outcomes[member].weight, totalMass));
+			if (!lower.valid || !upper.valid) { metrics.arithmeticOverflow = true; return unknown(); }
+			certified = certified && score.certified;
+		}
+		return { lower, upper, {}, certified && ExactCompare(lower, upper) == 0 };
+	}
+
 	struct DrawContinuationClass {
 		std::vector<std::pair<int, int>> atoms;
 		int count = 0;
+		bool passiveIntegrated = false; // Phase 4: skip atom split; analytic Passive residual
 	};
 
 	std::vector<DrawContinuationClass> drawContinuationClasses(const State& state,
@@ -3781,14 +4327,38 @@ private:
 				|| item.second.unsignedLongLong() > (unsigned long long)DECK_SIZE) return {};
 			available[item.first] = (int)item.second.unsignedLongLong();
 		}
-		const ExactCardPartition& partition = turnDependencyPartition(state, nullptr, true).partition;
+		const auto analysisStart = std::chrono::steady_clock::now();
+		const PartitionAnalysis& analysis = turnDependencyPartition(state, nullptr, true);
+		const ExactCardPartition& partition = analysis.partition;
+		// Passive proofs use rule-based ClassifyCardId only. Partition visibleIds mark
+		// Transition-Identity classes for Active cards; they must not force Passive
+		// candidates into Active solely because they appear in the deck profile.
 		std::set<int> assigned;
 		std::vector<DrawContinuationClass> result;
+		DrawContinuationClass passivePool;
+		passivePool.passiveIntegrated = v4PassiveDrawEnabled;
+
 		for (const ExactCardClass& source : partition.classes()) {
 			DrawContinuationClass target;
 			for (const ExactCardAtom& atom : source.atoms) {
 				auto found = available.find(atom.cardId);
 				if (found == available.end() || found->second <= 0) continue;
+				if (v4PassiveDrawEnabled) {
+					auto live = ExactCardLivenessV4::ClassifyCardId(state, actor, atom.cardId, nullptr);
+					if (live.liveness == ExactCardLivenessV4::CardLiveness::Unknown) {
+						++metrics.unknownLivenessCount;
+						live.liveness = ExactCardLivenessV4::CardLiveness::Active;
+						++metrics.livenessFallbackCount;
+					}
+					if (live.liveness == ExactCardLivenessV4::CardLiveness::Passive) {
+						passivePool.atoms.push_back({ atom.cardId, found->second });
+						passivePool.count += found->second;
+						assigned.insert(atom.cardId);
+						metrics.passiveCardCount += (unsigned long long)found->second;
+						continue;
+					}
+					metrics.activeCardCount += (unsigned long long)found->second;
+				}
 				target.atoms.push_back({ atom.cardId, found->second });
 				target.count += found->second; assigned.insert(atom.cardId);
 			}
@@ -3796,18 +4366,43 @@ private:
 		}
 		// A stale or partially materialized profile must never silently drop an
 		// identity. Conservatively retain any unmatched card as a singleton class.
-		for (const auto& item : available) if (!assigned.contains(item.first))
-			result.push_back({ { { item.first, item.second } }, item.second });
+		for (const auto& item : available) if (!assigned.contains(item.first)) {
+			if (v4PassiveDrawEnabled) {
+				auto live = ExactCardLivenessV4::ClassifyCardId(state, actor, item.first, nullptr);
+				if (live.liveness == ExactCardLivenessV4::CardLiveness::Unknown) {
+					++metrics.unknownLivenessCount;
+					live.liveness = ExactCardLivenessV4::CardLiveness::Active;
+					++metrics.livenessFallbackCount;
+				}
+				if (live.liveness == ExactCardLivenessV4::CardLiveness::Passive) {
+					passivePool.atoms.push_back({ item.first, item.second });
+					passivePool.count += item.second;
+					metrics.passiveCardCount += (unsigned long long)item.second;
+					continue;
+				}
+				metrics.activeCardCount += (unsigned long long)item.second;
+			}
+			result.push_back({ { { item.first, item.second } }, item.second, false });
+		}
+		if (passivePool.count > 0) {
+			std::sort(passivePool.atoms.begin(), passivePool.atoms.end());
+			result.push_back(std::move(passivePool));
+			metrics.passiveCardsIntegrated += (unsigned long long)result.back().count;
+		}
 		std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
+			if (left.passiveIntegrated != right.passiveIntegrated) return left.passiveIntegrated < right.passiveIntegrated;
 			return left.atoms.front().first < right.atoms.front().first;
 		});
-		schema = "CONTINUATION-DRAW-V1|";
+		schema = v4PassiveDrawEnabled ? "CONTINUATION-DRAW-V4P|" : "CONTINUATION-DRAW-V1|";
 		for (const DrawContinuationClass& group : result) {
 			appendSemantic(schema, group.count); appendSemantic(schema, (long long)group.atoms.size());
+			appendSemantic(schema, group.passiveIntegrated ? 1 : 0);
 			for (const auto& atom : group.atoms) {
 				appendSemantic(schema, atom.first); appendSemantic(schema, atom.second);
 			}
 		}
+		metrics.livenessAnalysisNs += (unsigned long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+			std::chrono::steady_clock::now() - analysisStart).count();
 		return result;
 	}
 
@@ -3871,6 +4466,27 @@ private:
 					const DrawContinuationClass& group = classes[groupIndex];
 					const int take = classCounts[groupIndex];
 					outerWeight = ExactWeight::multiply(outerWeight, chooseCount(group.count, take));
+					if (group.passiveIntegrated) {
+						// Phase 4: Passive pool contributes hypergeometric mass without
+						// identity enumeration. Canonical physical draw preserves deck
+						// size/hand count; residual value is added once V4 weights load.
+						ConditionalAllocation allocation;
+						allocation.weight = chooseCount(group.count, take);
+						int remaining = take;
+						for (const auto& atom : group.atoms) {
+							const int use = std::min(remaining, atom.second);
+							if (use <= 0) continue;
+							allocation.counts.push_back({ typeIndex.at(atom.first), use });
+							remaining -= use;
+						}
+						appendSemantic(allocation.symmetricKey, (long long)0);
+						appendSemantic(allocation.symmetricKey, take);
+						appendSemantic(allocation.symmetricKey, 1); // passive marker
+						allocations[groupIndex].push_back(std::move(allocation));
+						metrics.passiveExpectationCalls++;
+						metrics.richPassiveIntegratedMass += take > 0 ? 1ULL : 0ULL;
+						continue;
+					}
 					std::vector<int> atomBounds; atomBounds.reserve(group.atoms.size());
 					for (const auto& atom : group.atoms) atomBounds.push_back(atom.second);
 					BoundedCompositionCursor atomCursor; atomCursor.reset(atomBounds, take);
@@ -3907,11 +4523,32 @@ private:
 				}
 				ExactWeight generatedForClassVector;
 				std::vector<int> atomCounts(bounds.size(), 0);
+				int passiveTakeForVector = 0;
+				int passivePoolSize = 0;
+				std::vector<std::pair<int, int>> passiveCopies;
+				for (int gi = 0; gi < (int)classes.size(); ++gi) if (classes[gi].passiveIntegrated) {
+					passiveTakeForVector = classCounts[gi];
+					passivePoolSize = classes[gi].count;
+					passiveCopies = classes[gi].atoms;
+				}
 				std::function<void(int, const ExactWeight&, std::string)> combine;
 				combine = [&](int groupIndex, const ExactWeight& weight, std::string key) {
 					if (groupIndex == (int)allocations.size()) {
-						auto [position, created] = byContinuation.emplace(key, partial.outcomes.size());
-						if (created) partial.outcomes.push_back({ atomCounts, weight, std::move(key) });
+						MultiDrawOutcome outcome;
+						outcome.atomCounts = atomCounts;
+						outcome.weight = weight;
+						outcome.continuationKey = std::move(key);
+						if (passiveTakeForVector > 0 && evaluator && evaluator->v4().isLoaded()
+							&& evaluator->v4().passiveEnabled()) {
+							std::array<std::int32_t, ExactSparseEvaluatorV4::ContextHidden> context{};
+							auto values = evaluator->v4().passiveValueTable(context);
+							outcome.expectedPassiveResidual = ExactPassiveExpectationV4::ExpectedPassiveResidual(
+								passivePoolSize, passiveTakeForVector, values, evaluator->v4().pairs(), passiveCopies);
+							outcome.hasPassiveExpectation = true;
+							metrics.passiveExpectationCalls++;
+						}
+						auto [position, created] = byContinuation.emplace(outcome.continuationKey, partial.outcomes.size());
+						if (created) partial.outcomes.push_back(std::move(outcome));
 						else partial.outcomes[position->second].weight += weight;
 						generated += weight; generatedForClassVector += weight;
 						metrics.rawOutcomes++; rawDrawOutcomes++;
@@ -3938,6 +4575,7 @@ private:
 				return left.continuationKey < right.continuationKey;
 			});
 			metrics.continuationPreparedOutcomes += partial.outcomes.size();
+			if (v4PassiveDrawEnabled) metrics.richActiveOutcomeCount += partial.outcomes.size();
 			metrics.groupedOutcomes += rawDrawOutcomes >= partial.outcomes.size()
 				? rawDrawOutcomes - partial.outcomes.size() : 0;
 			partial.initialized = true;
@@ -3982,6 +4620,64 @@ private:
 			}
 			~QuantumGuard() { limit = previous; }
 		} quantum(nodeQuantumDeadline, metrics.expanded);
+
+		// Phase 0 diagnostics: count turn-inert identities at the draw root.
+		{
+			auto inert = collectAssumedInert(state);
+			metrics.turnInertIdentities = std::max(metrics.turnInertIdentities, (unsigned long long)inert.size());
+		}
+
+		// Skeleton isomorphism classes: outcomes that share the same active
+		// multiset and inert cardinality expand once and sweep per member.
+		const bool useSkeleton = skeletonSharingEnabled
+			&& state.exact.pendingPlayer == actor
+			&& !partial.pending
+			&& partial.outcomeIndex == 0
+			&& partial.processedWeight.zero();
+		if (useSkeleton && partial.outcomes.size() > 1) {
+			std::vector<std::vector<int>> atomLists;
+			atomLists.reserve(partial.outcomes.size());
+			for (const MultiDrawOutcome& outcome : partial.outcomes)
+				atomLists.push_back(outcome.atomCounts);
+			auto classes = ExactSkeleton::ClassOutcomes(state, actor, types, atomLists);
+			ExactFraction classLower = ExactFraction::integer(0), classUpper = ExactFraction::integer(0);
+			bool classCertified = true;
+			bool skeletonComplete = true;
+			for (const ExactSkeleton::OutcomeClass& group : classes) {
+				if (expired()) { skeletonComplete = false; break; }
+				ExactScore score = solveSkeletonClass(state, types, partial.outcomes, group.memberIndices, total);
+				if (!score.certified) { skeletonComplete = false; break; }
+				// solveSkeletonClass already scales each member by weight/total.
+				classLower = ExactFraction::add(classLower, score.lower);
+				classUpper = ExactFraction::add(classUpper, score.upper);
+				if (!classLower.valid || !classUpper.valid) {
+					metrics.arithmeticOverflow = true; return unknown();
+				}
+				classCertified = classCertified && score.certified;
+				for (size_t member : group.memberIndices) {
+					partial.processedWeight += partial.outcomes[member].weight;
+					metrics.enumeratedHiddenWorlds++;
+					metrics.continuationDrawOutcomes++;
+				}
+			}
+			if (skeletonComplete && partial.processedWeight == total) {
+				ExactScore result{ classLower, classUpper, {},
+					classCertified && ExactCompare(classLower, classUpper) == 0 };
+				partialBytes -= std::min(partialBytes, partial.accountedBytes);
+				partialMultiDraws.erase(resumeKey);
+				return result;
+			}
+			// Incomplete skeleton pass: discard partial class aggregates and finish
+			// with the legacy per-outcome loop so mass accounting stays exact.
+			partial.completedLower = ExactFraction::integer(0);
+			partial.completedUpper = ExactFraction::integer(0);
+			partial.processedWeight = ExactWeight();
+			partial.outcomeIndex = 0;
+			partial.pending = false;
+			skeletonSharingEnabled = false;
+			metrics.skeletonGuardFallbacks++;
+		}
+
 		while (partial.outcomeIndex < partial.outcomes.size()) {
 			const MultiDrawOutcome& outcome = partial.outcomes[partial.outcomeIndex];
 			if (!partial.pending) {
@@ -3999,7 +4695,17 @@ private:
 					for (int n = 0; n < outcome.atomCounts[i]; ++n) resolveDraw(*child, types[i].first);
 			} catch (...) { return unknown(); }
 			const unsigned long long expandedBeforeOutcomeSlice = metrics.expanded;
+			const bool restoreStrip = v4StripPassiveOnly;
+			v4StripPassiveOnly = outcome.hasPassiveExpectation;
 			ExactScore score = solveOwned(std::move(child));
+			v4StripPassiveOnly = restoreStrip;
+			if (outcome.hasPassiveExpectation) {
+				ExactFraction residual;
+				residual.big = std::make_shared<ExactBigRational>(outcome.expectedPassiveResidual);
+				score.lower = ExactFraction::add(score.lower, residual);
+				score.upper = ExactFraction::add(score.upper, residual);
+				metrics.passiveResidualNs += 1;
+			}
 			if (metrics.expanded >= expandedBeforeOutcomeSlice)
 				partial.pendingExpandedNodes += metrics.expanded - expandedBeforeOutcomeSlice;
 			if (!score.certified) { metrics.partialChanceNodes++; return incomplete(&score); }
@@ -4287,6 +4993,25 @@ private:
 				&& state.exact.pending == ExactPendingType::None && state.selectType == SelectType::None) {
 				stepExact(state);
 				metrics.expanded++;
+				if (expired()) return unknown();
+			}
+			// Macro-collapse forced single-option effect selections into one edge.
+			while (!state.isFinish() && !IsExactTurnLeaf(state)
+				&& state.exact.pending == ExactPendingType::None
+				&& state.selectType != SelectType::Main
+				&& state.selectType != SelectType::Attack
+				&& state.selectType != SelectType::YesNo
+				&& state.selectMin == 1 && state.selectMax == 1
+				&& state.options.size() == 1) {
+				if (!advance(state, ExactSmallAction{ 0 })) break;
+				metrics.macroCollapsedTransitions++;
+				metrics.expanded++;
+				while (!state.isFinish() && !IsExactTurnLeaf(state)
+					&& state.exact.pending == ExactPendingType::None && state.selectType == SelectType::None) {
+					stepExact(state);
+					metrics.expanded++;
+					if (expired()) return unknown();
+				}
 				if (expired()) return unknown();
 			}
 		} catch (const std::exception& error) {

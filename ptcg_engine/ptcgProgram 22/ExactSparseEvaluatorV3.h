@@ -681,6 +681,28 @@ public:
 		return signature;
 	}
 
+	// First-order OwnHand contribution used to bootstrap V4 Passive bias from V3.
+	// Matches tools/bootstrap_evaluator_v4.py / nnue_v4.own_hand_linear_score.
+	long long estimateOwnHandLinearScore(int cardId) const {
+		if (!loaded) return 0;
+		const int token = indexFor(cardId);
+		size_t base = ((size_t)OwnHand * tokens.size() + token) * GlobalHiddenCount;
+		long long output = 0;
+		for (int h = 0; h < GlobalHiddenCount; ++h) {
+			long long delta = (long long)globalSparseWeight[base + h] * BeliefScale;
+			long long activation = std::clamp<std::int64_t>(delta, 0, (std::int64_t)127 * WeightScale);
+			output += (long long)outputWeight[h] * activation;
+		}
+		constexpr long long divisor = (long long)WeightScale * WeightScale;
+		long long magnitude = output >= 0 ? output : -output;
+		long long score = (magnitude / divisor) * ScoreScale
+			+ ((magnitude % divisor) * ScoreScale + divisor / 2) / divisor;
+		if (output < 0) score = -score;
+		return std::clamp(score, (long long)-NonTerminalLimit, (long long)NonTerminalLimit);
+	}
+
+	const std::vector<std::int32_t>& tokenTable() const { return tokens; }
+
 private:
 #pragma pack(push, 1)
 	struct Header {

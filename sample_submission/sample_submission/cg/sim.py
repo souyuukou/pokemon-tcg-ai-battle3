@@ -128,6 +128,12 @@ if hasattr(lib, "ExactEvaluatorTokensV3"):
     lib.ExactEvaluatorTokensV3.restype = ctypes.c_char_p
 if hasattr(lib, "ExactEvaluatorV3Diagnostics"):
     lib.ExactEvaluatorV3Diagnostics.restype = ctypes.c_char_p
+if hasattr(lib, "ExactCardLivenessV4Diagnostics"):
+    lib.ExactCardLivenessV4Diagnostics.restype = ctypes.c_char_p
+if hasattr(lib, "ExactPassiveExpectationV4Oracle"):
+    lib.ExactPassiveExpectationV4Oracle.restype = ctypes.c_char_p
+    lib.ExactPassiveExpectationV4Oracle.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
 if hasattr(lib, "ExactEvaluateFeaturesV3"):
     lib.ExactEvaluateFeaturesV3.restype = ctypes.c_int64
     lib.ExactEvaluateFeaturesV3.argtypes = [

@@ -42,12 +42,14 @@ extern "C" GAME_API const char8_t* ExactLoadEvaluatorModel(ApiData* data, const 
   auto evaluator = std::make_shared<ExactCpuEvaluator>();
   loaded = path != nullptr && evaluator->load(path, error);
   int schema = loaded ? evaluator->schemaVersion() : 0;
+  int evaluatorVersion = loaded ? (int)evaluator->evaluatorVersion() : 0;
   bool informationSetSafe = loaded && evaluator->informationSetSafe();
   unsigned long long modelHash = loaded ? evaluator->modelHash() : 0;
   unsigned long long residentBytes = loaded ? evaluator->residentBytes() : 0;
   if (loaded) data->exactEvaluator = std::move(evaluator);
   j.appendKeyValue("loaded", loaded);
   j.appendCommaKeyValue("schemaVersion", schema);
+  j.appendCommaKeyValue("evaluatorVersion", evaluatorVersion);
   j.appendCommaKeyValue("informationSetSafe", informationSetSafe);
   j.appendCommaKey("modelHash"); AppendUnsignedLongLong(j, modelHash);
   j.appendCommaKey("residentBytes"); AppendUnsignedLongLong(j, residentBytes);
@@ -83,6 +85,68 @@ extern "C" GAME_API const char8_t* ExactArithmeticDiagnostics() {
   j.appendCommaKeyValue("bits", (int)product.bitLength());
   j.appendCommaKeyValue("hashPairMatchesScalar", hashPairMatchesScalar);
   j.appendCommaKeyValue("promoted", product.isLarge()); j.append('}'); return j.buf.c_str();
+}
+
+extern "C" GAME_API const char8_t* ExactCardLivenessV4Diagnostics() {
+  static thread_local JsonBuilder j;
+  // Observation coverage: unclassified EffectType values fail closed as Unknown.
+  int classified = 0, unknown = 0;
+  for (int raw = 0; raw < 256; ++raw) {
+    auto kind = ExactCardLivenessV4::ObservationKindForEffect((EffectType)raw);
+    if (kind == ExactCardLivenessV4::CardObservationKind::Unknown) ++unknown;
+    else ++classified;
+  }
+  // Synthetic locked-energy Passive proof (no Game): energyPlayed + energy card.
+  int samplePassive = 0, sampleActive = 0, sampleUnknown = 0;
+  Game game; GameConfig config{}; game.init(config); State state{}; state.game = &game;
+  state.turn = 2; state.firstPlayer = 0; state.energyPlayed = true;
+  state.players[0].playerIndex = 0; state.players[1].playerIndex = 1;
+  int energyId = 0, itemId = 0, basicId = 0;
+  for (const auto& item : CardTable) {
+    if (energyId == 0 && IsEnergy(item.second.cardType)) energyId = item.first;
+    if (itemId == 0 && item.second.cardType == CardType::Item) itemId = item.first;
+    if (basicId == 0 && item.second.cardType == CardType::Pokemon
+      && item.second.evolutionType == EvolutionType::Basic) basicId = item.first;
+  }
+  auto classify = [&](int id) {
+    auto result = ExactCardLivenessV4::ClassifyCardId(state, 0, id, nullptr);
+    if (result.liveness == ExactCardLivenessV4::CardLiveness::Passive) ++samplePassive;
+    else if (result.liveness == ExactCardLivenessV4::CardLiveness::Active) ++sampleActive;
+    else ++sampleUnknown;
+  };
+  if (energyId) classify(energyId);
+  if (itemId) classify(itemId);
+  if (basicId) classify(basicId);
+  j.clear(); j.append('{');
+  j.appendKeyValue("livenessSchemaVersion", ExactCardLivenessV4::LivenessSchemaVersion);
+  j.appendCommaKeyValue("effectObservationClassified", classified);
+  j.appendCommaKeyValue("effectObservationUnknown", unknown);
+  j.appendCommaKeyValue("samplePassive", samplePassive);
+  j.appendCommaKeyValue("sampleActive", sampleActive);
+  j.appendCommaKeyValue("sampleUnknown", sampleUnknown);
+  j.appendCommaKeyValue("energyOncePassive", energyId != 0 && samplePassive >= 1);
+  j.append('}');
+  return j.buf.c_str();
+}
+
+extern "C" GAME_API const char8_t* ExactPassiveExpectationV4Oracle(
+    int poolSize, int take, int copiesI, int copiesJ, int mode) {
+  // mode: 0=E[X_i], 1=E[X_i X_j], 2=E[C(X_i,2)]
+  static thread_local JsonBuilder j;
+  ExactBigRational value(0, 1);
+  try {
+    if (mode == 0) value = ExactPassiveExpectationV4::ExpectedCount(poolSize, take, copiesI);
+    else if (mode == 1) value = ExactPassiveExpectationV4::ExpectedProductDistinct(poolSize, take, copiesI, copiesJ);
+    else value = ExactPassiveExpectationV4::ExpectedChoose2(poolSize, take, copiesI);
+  } catch (...) {
+    j.clear(); j.appendStr("{\"error\":1}"); return j.buf.c_str();
+  }
+  j.clear(); j.append('{');
+  j.appendKey("numerator"); j.appendDoubleQuote(value.numerator.text().c_str());
+  ExactBigUnsigned den = ExactBigRational::factorProduct(value.denominator);
+  j.appendCommaKey("denominator"); j.appendDoubleQuote(den.text().c_str());
+  j.append('}');
+  return j.buf.c_str();
 }
 
 extern "C" GAME_API const char8_t* ExactEvaluatorTokensV3() {
@@ -374,7 +438,8 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
   j.appendCommaKey("upperNumerator"); AppendExactNumerator(j, decision.score.upper);
   j.appendCommaKey("upperDenominator"); AppendExactDenominator(j, decision.score.upper);
   j.appendCommaKeyValue("certified", decision.score.certified);
-  j.appendCommaKey("certificationScope"); j.appendDoubleQuote("exact_evaluator_expectation");
+  j.appendCommaKey("certificationScope");
+  j.appendDoubleQuote(ExactSkeleton::CertScopeName(decision.metrics.certificationScope));
   j.appendCommaKeyValue("probabilityExact", decision.metrics.probabilityExact);
   j.appendCommaKeyValue("informationSetSafe", decision.metrics.informationSetSafe);
   j.appendCommaKeyValue("evaluatorApproximate", true);
@@ -521,7 +586,34 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
 	 j.appendCommaKey("continuationDrawOutcomes"); AppendUnsignedLongLong(j, decision.metrics.continuationDrawOutcomes);
 	 j.appendCommaKey("continuationCompletedOutcomeNodes"); AppendUnsignedLongLong(j, decision.metrics.continuationCompletedOutcomeNodes);
 	 j.appendCommaKey("continuationMaxOutcomeNodes"); AppendUnsignedLongLong(j, decision.metrics.continuationMaxOutcomeNodes);
-	 j.appendCommaKey("continuationAtomsMerged"); AppendUnsignedLongLong(j, decision.metrics.continuationAtomsMerged);
+	j.appendCommaKey("continuationAtomsMerged"); AppendUnsignedLongLong(j, decision.metrics.continuationAtomsMerged);
+	j.appendCommaKey("v4SemanticEvaluations"); AppendUnsignedLongLong(j, decision.metrics.v4SemanticEvaluations);
+	j.appendCommaKey("v4PassiveEvaluations"); AppendUnsignedLongLong(j, decision.metrics.v4PassiveEvaluations);
+	j.appendCommaKey("passiveCardsIntegrated"); AppendUnsignedLongLong(j, decision.metrics.passiveCardsIntegrated);
+	j.appendCommaKey("passivePairTermsEvaluated"); AppendUnsignedLongLong(j, decision.metrics.passivePairTermsEvaluated);
+	j.appendCommaKey("passiveExpectationCalls"); AppendUnsignedLongLong(j, decision.metrics.passiveExpectationCalls);
+	j.appendCommaKey("activeCardCount"); AppendUnsignedLongLong(j, decision.metrics.activeCardCount);
+	j.appendCommaKey("passiveCardCount"); AppendUnsignedLongLong(j, decision.metrics.passiveCardCount);
+	j.appendCommaKey("unknownLivenessCount"); AppendUnsignedLongLong(j, decision.metrics.unknownLivenessCount);
+	j.appendCommaKey("livenessFallbackCount"); AppendUnsignedLongLong(j, decision.metrics.livenessFallbackCount);
+	j.appendCommaKey("richActiveOutcomeCount"); AppendUnsignedLongLong(j, decision.metrics.richActiveOutcomeCount);
+	j.appendCommaKey("richPassiveIntegratedMass"); AppendUnsignedLongLong(j, decision.metrics.richPassiveIntegratedMass);
+	j.appendCommaKey("livenessAnalysisNs"); AppendUnsignedLongLong(j, decision.metrics.livenessAnalysisNs);
+	j.appendCommaKey("semanticForwardNs"); AppendUnsignedLongLong(j, decision.metrics.semanticForwardNs);
+	j.appendCommaKey("passiveResidualNs"); AppendUnsignedLongLong(j, decision.metrics.passiveResidualNs);
+	j.appendCommaKey("passiveExpectationNs"); AppendUnsignedLongLong(j, decision.metrics.passiveExpectationNs);
+	j.appendCommaKey("activeDrawEnumerationNs"); AppendUnsignedLongLong(j, decision.metrics.activeDrawEnumerationNs);
+	j.appendCommaKey("skeletonClasses"); AppendUnsignedLongLong(j, decision.metrics.skeletonClasses);
+	 j.appendCommaKey("skeletonClassMembers"); AppendUnsignedLongLong(j, decision.metrics.skeletonClassMembers);
+	 j.appendCommaKey("skeletonExpansions"); AppendUnsignedLongLong(j, decision.metrics.skeletonExpansions);
+	 j.appendCommaKey("skeletonSweeps"); AppendUnsignedLongLong(j, decision.metrics.skeletonSweeps);
+	 j.appendCommaKey("skeletonGuardFallbacks"); AppendUnsignedLongLong(j, decision.metrics.skeletonGuardFallbacks);
+	 j.appendCommaKey("skeletonNodes"); AppendUnsignedLongLong(j, decision.metrics.skeletonNodes);
+	 j.appendCommaKey("skeletonInteriorChances"); AppendUnsignedLongLong(j, decision.metrics.skeletonInteriorChances);
+	 j.appendCommaKey("turnInertIdentities"); AppendUnsignedLongLong(j, decision.metrics.turnInertIdentities);
+	 j.appendCommaKey("macroCollapsedTransitions"); AppendUnsignedLongLong(j, decision.metrics.macroCollapsedTransitions);
+	 j.appendCommaKey("sleepSetPrunes"); AppendUnsignedLongLong(j, decision.metrics.sleepSetPrunes);
+	 j.appendCommaKey("argmaxDominatedCuts"); AppendUnsignedLongLong(j, decision.metrics.argmaxDominatedCuts);
 	 j.appendCommaKeyValue("dynamicPartitionFallbackCardId", decision.metrics.dynamicPartitionFallbackCardId);
 	 j.appendCommaKeyValue("dynamicPartitionFallbackEffectType", decision.metrics.dynamicPartitionFallbackEffectType);
 	 j.appendCommaKeyValue("dynamicPartitionFallbackTargetType", decision.metrics.dynamicPartitionFallbackTargetType);
@@ -659,6 +751,35 @@ static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
 	into.continuationCompletedOutcomeNodes += from.continuationCompletedOutcomeNodes;
 	into.continuationMaxOutcomeNodes = std::max(into.continuationMaxOutcomeNodes, from.continuationMaxOutcomeNodes);
 	into.continuationAtomsMerged += from.continuationAtomsMerged;
+	into.v4SemanticEvaluations += from.v4SemanticEvaluations;
+	into.v4PassiveEvaluations += from.v4PassiveEvaluations;
+	into.passiveCardsIntegrated += from.passiveCardsIntegrated;
+	into.passivePairTermsEvaluated += from.passivePairTermsEvaluated;
+	into.passiveExpectationCalls += from.passiveExpectationCalls;
+	into.activeCardCount += from.activeCardCount;
+	into.passiveCardCount += from.passiveCardCount;
+	into.unknownLivenessCount += from.unknownLivenessCount;
+	into.livenessFallbackCount += from.livenessFallbackCount;
+	into.richActiveOutcomeCount += from.richActiveOutcomeCount;
+	into.richPassiveIntegratedMass += from.richPassiveIntegratedMass;
+	into.livenessAnalysisNs += from.livenessAnalysisNs;
+	into.semanticForwardNs += from.semanticForwardNs;
+	into.passiveResidualNs += from.passiveResidualNs;
+	into.passiveExpectationNs += from.passiveExpectationNs;
+	into.activeDrawEnumerationNs += from.activeDrawEnumerationNs;
+	into.skeletonClasses += from.skeletonClasses;
+	into.skeletonClassMembers += from.skeletonClassMembers;
+	into.skeletonExpansions += from.skeletonExpansions;
+	into.skeletonSweeps += from.skeletonSweeps;
+	into.skeletonGuardFallbacks += from.skeletonGuardFallbacks;
+	into.skeletonNodes += from.skeletonNodes;
+	into.skeletonInteriorChances += from.skeletonInteriorChances;
+	into.turnInertIdentities = std::max(into.turnInertIdentities, from.turnInertIdentities);
+	into.macroCollapsedTransitions += from.macroCollapsedTransitions;
+	into.sleepSetPrunes += from.sleepSetPrunes;
+	into.argmaxDominatedCuts += from.argmaxDominatedCuts;
+	if (from.certificationScope == ExactSkeleton::CertScope::Argmax)
+		into.certificationScope = ExactSkeleton::CertScope::Argmax;
 	if (from.dynamicPartitionFallbackCardId != 0) {
 		into.dynamicPartitionFallbackCardId = from.dynamicPartitionFallbackCardId;
 		into.dynamicPartitionFallbackEffectType = from.dynamicPartitionFallbackEffectType;
@@ -681,6 +802,7 @@ struct ExactTurnSession {
     Game game;
     std::unique_ptr<ExactPlanner> planner;
     std::vector<ExactScore> actions;
+    bool argmaxCut = false;
   };
 
   std::unique_ptr<Game> game;
@@ -789,6 +911,32 @@ struct ExactTurnSession {
 					attempted = true;
 					if (output->planner->resourceStopped()) { resourceStopped = true; break; }
 				}
+				// Argmax certification (opt-in): stop once one root action's lower
+				// bound dominates every other action's upper bound.
+				if (output->planner->currentMetrics().certificationScope
+					== ExactSkeleton::CertScope::Argmax) {
+					int best = -1;
+					for (int option : assigned) {
+						if (output->actions[option].action.empty()) continue;
+						if (best < 0 || ExactCompare(output->actions[option].lower,
+							output->actions[best].lower) > 0) best = option;
+					}
+					if (best >= 0 && output->actions[best].certified) {
+						bool dominates = true;
+						for (int option : assigned) {
+							if (option == best || output->actions[option].action.empty()) continue;
+							if (ExactCompare(output->actions[best].lower, output->actions[option].upper) < 0) {
+								dominates = false; break;
+							}
+						}
+						if (dominates) {
+							// Record the cut only. Do not mutate sibling upper bounds —
+							// tightening them to best.lower would falsify reported intervals.
+							output->argmaxCut = true;
+							break;
+						}
+					}
+				}
 				firstRound = false;
 				if (!pending || !attempted || resourceStopped) break;
 			}
@@ -828,6 +976,7 @@ struct ExactTurnSession {
 		  }
         }
         MergeExactMetrics(decision.metrics, workers[wi]->planner->currentMetrics());
+        if (workers[wi]->argmaxCut) decision.metrics.argmaxDominatedCuts++;
       }
 	  bool first = true, allCertified = true;
 	  ExactFraction maxUpper = ExactFraction::integer(-100'000'000);
