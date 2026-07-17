@@ -127,6 +127,7 @@ extern "C" GAME_API const char8_t* ExactCardLivenessV4Diagnostics() {
   state.supporterPlayed = true;
   ExactCardLivenessV4::OperatorClosure withUltra =
     ExactCardLivenessV4::BuildOperatorClosure({ ultraBallId }, 0);
+  ExactCardLivenessV4::ApplyStateCoverageScanners(withUltra, state);
   bool ultraDiscardCostObserved = false;
   for (const auto& fp : withUltra.footprints) {
     if (fp.operatorCardId == ultraBallId && fp.mayDiscardHand) {
@@ -145,6 +146,26 @@ extern "C" GAME_API const char8_t* ExactCardLivenessV4Diagnostics() {
     supporterId ? ExactCardLivenessV4::ClassifyCardId(state, 0, supporterId, empty)
       : ExactCardLivenessV4::CardLivenessResult{};
 
+  // Damage-only operator must not block Passive for a locked energy.
+  bool damageDoesNotBlockEnergy = false;
+  if (energyId && basicId) {
+    ExactCardLivenessV4::OperatorClosure damageOnly =
+      ExactCardLivenessV4::BuildOperatorClosure({ basicId }, 0);
+    ExactCardLivenessV4::ApplyStateCoverageScanners(damageOnly, state);
+    // Strip non-None footprints to simulate AttackDamage-only reachability.
+    std::vector<ExactCardLivenessV4::OperatorFootprint> kept;
+    for (const auto& fp : damageOnly.footprints) {
+      if (fp.observation == ExactCardLivenessV4::CardObservationKind::None
+        || fp.observation == ExactCardLivenessV4::CardObservationKind::CountOnly)
+        kept.push_back(fp);
+    }
+    damageOnly.footprints.swap(kept);
+    damageOnly.hasUnknown = false;
+    auto energyVsDamage = ExactCardLivenessV4::ClassifyCardId(state, 0, energyId, damageOnly);
+    damageDoesNotBlockEnergy =
+      energyVsDamage.liveness == ExactCardLivenessV4::CardLiveness::Passive;
+  }
+
   j.clear(); j.append('{');
   j.appendKeyValue("livenessSchemaVersion", ExactCardLivenessV4::LivenessSchemaVersion);
   j.appendCommaKeyValue("effectObservationClassified", classified);
@@ -157,6 +178,7 @@ extern "C" GAME_API const char8_t* ExactCardLivenessV4Diagnostics() {
   j.appendCommaKeyValue("ultraBallBlocksUsedSupporter", ultraBlocksSupporter);
   j.appendCommaKeyValue("usedSupporterPassiveWithoutUltra",
     supporterId != 0 && supporterAlone.liveness == ExactCardLivenessV4::CardLiveness::Passive);
+  j.appendCommaKeyValue("damageOnlyDoesNotBlockPassiveEnergy", damageDoesNotBlockEnergy);
   j.appendCommaKeyValue("supporterLiveness", (int)supporterVsUltra.liveness);
   j.append('}');
   return j.buf.c_str();
@@ -637,6 +659,15 @@ static const char8_t* ExactDecisionJson(ApiData* data, const ExactDecision& deci
 	j.appendCommaKeyValue("v4PassiveDrawExperimental", decision.metrics.v4PassiveDrawExperimental);
 	j.appendCommaKey("nestedChancePassiveFallbacks"); AppendUnsignedLongLong(j, decision.metrics.nestedChancePassiveFallbacks);
 	j.appendCommaKey("representativeInvariantFallbacks"); AppendUnsignedLongLong(j, decision.metrics.representativeInvariantFallbacks);
+	j.appendCommaKey("fallbackIncompletePending"); AppendUnsignedLongLong(j, decision.metrics.fallbackIncompletePending);
+	j.appendCommaKey("fallbackIncompleteGlobal"); AppendUnsignedLongLong(j, decision.metrics.fallbackIncompleteGlobal);
+	j.appendCommaKey("fallbackIncompleteCosts"); AppendUnsignedLongLong(j, decision.metrics.fallbackIncompleteCosts);
+	j.appendCommaKey("fallbackIncompleteSelection"); AppendUnsignedLongLong(j, decision.metrics.fallbackIncompleteSelection);
+	j.appendCommaKey("fallbackIncompleteConditions"); AppendUnsignedLongLong(j, decision.metrics.fallbackIncompleteConditions);
+	j.appendCommaKey("fallbackSemanticInvariant"); AppendUnsignedLongLong(j, decision.metrics.fallbackSemanticInvariant);
+	j.appendCommaKey("fallbackFurtherChance"); AppendUnsignedLongLong(j, decision.metrics.fallbackFurtherChance);
+	j.appendCommaKey("fallbackAnalyticBound"); AppendUnsignedLongLong(j, decision.metrics.fallbackAnalyticBound);
+	j.appendCommaKey("fallbackUnknownToken"); AppendUnsignedLongLong(j, decision.metrics.fallbackUnknownToken);
 	j.appendCommaKey("livenessAnalysisNs"); AppendUnsignedLongLong(j, decision.metrics.livenessAnalysisNs);
 	j.appendCommaKey("semanticForwardNs"); AppendUnsignedLongLong(j, decision.metrics.semanticForwardNs);
 	j.appendCommaKey("passiveExpectationNs"); AppendUnsignedLongLong(j, decision.metrics.passiveExpectationNs);
@@ -806,6 +837,15 @@ static void MergeExactMetrics(ExactMetrics& into, const ExactMetrics& from) {
 	into.v4PassiveDrawExperimental = into.v4PassiveDrawExperimental || from.v4PassiveDrawExperimental;
 	into.nestedChancePassiveFallbacks += from.nestedChancePassiveFallbacks;
 	into.representativeInvariantFallbacks += from.representativeInvariantFallbacks;
+	into.fallbackIncompletePending += from.fallbackIncompletePending;
+	into.fallbackIncompleteGlobal += from.fallbackIncompleteGlobal;
+	into.fallbackIncompleteCosts += from.fallbackIncompleteCosts;
+	into.fallbackIncompleteSelection += from.fallbackIncompleteSelection;
+	into.fallbackIncompleteConditions += from.fallbackIncompleteConditions;
+	into.fallbackSemanticInvariant += from.fallbackSemanticInvariant;
+	into.fallbackFurtherChance += from.fallbackFurtherChance;
+	into.fallbackAnalyticBound += from.fallbackAnalyticBound;
+	into.fallbackUnknownToken += from.fallbackUnknownToken;
 	into.livenessAnalysisNs += from.livenessAnalysisNs;
 	into.semanticForwardNs += from.semanticForwardNs;
 	into.passiveExpectationNs += from.passiveExpectationNs;

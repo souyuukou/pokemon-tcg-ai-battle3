@@ -736,6 +736,15 @@ struct ExactMetrics {
 	bool v4PassiveDrawExperimental = false;
 	unsigned long long nestedChancePassiveFallbacks = 0;
 	unsigned long long representativeInvariantFallbacks = 0;
+	unsigned long long fallbackIncompletePending = 0;
+	unsigned long long fallbackIncompleteGlobal = 0;
+	unsigned long long fallbackIncompleteCosts = 0;
+	unsigned long long fallbackIncompleteSelection = 0;
+	unsigned long long fallbackIncompleteConditions = 0;
+	unsigned long long fallbackSemanticInvariant = 0;
+	unsigned long long fallbackFurtherChance = 0;
+	unsigned long long fallbackAnalyticBound = 0;
+	unsigned long long fallbackUnknownToken = 0;
 	unsigned long long activeDrawEnumerationNs = 0;
 	unsigned long long skeletonClasses = 0;
 	unsigned long long skeletonClassMembers = 0;
@@ -1966,13 +1975,14 @@ private:
 					}
 				}
 				auto closure = ExactCardLivenessV4::BuildOperatorClosure(reachableSet, preHash);
+				ExactCardLivenessV4::ApplyStateCoverageScanners(closure, state);
 				int excludeOperatorCardId = 0;
 				if (state.exact.pendingSkillId > 0) {
 					auto skill = SkillTable.find(state.exact.pendingSkillId);
 					if (skill != SkillTable.end()) excludeOperatorCardId = skill->second.cardId;
 				}
-				(void)ExactCardLivenessV4::FurtherChanceUntilTurnEnd(closure, excludeOperatorCardId);
-				// Do not SealCoverage — uncovered flags stay false until real scanners exist.
+				(void)ExactCardLivenessV4::FurtherChanceUntilTurnEnd(closure, state, excludeOperatorCardId);
+				// Per-card proveCandidate inside ClassifyCardId — no SealCoverage.
 				partition.refineEquivalent([&](int cardId) {
 					auto live = ExactCardLivenessV4::ClassifyCardId(state, actor, cardId, closure);
 					if (live.liveness == ExactCardLivenessV4::CardLiveness::Passive
@@ -2560,6 +2570,7 @@ private:
 					for (int id : liveAnalysis.visibleIds) reachable.insert(id);
 					auto closure = ExactCardLivenessV4::BuildOperatorClosure(reachable,
 						ExactCardLivenessV4::StableHashString(liveAnalysis.schema));
+					ExactCardLivenessV4::ApplyStateCoverageScanners(closure, state);
 					ExactCpuEvaluator::splitOwnHandFeatures(features, state, actor, passive, closure);
 				}
 				metrics.activeCardCount += 0; // observational; counts updated in draw path
@@ -4515,21 +4526,24 @@ private:
 		const std::uint64_t partitionHash = ExactCardLivenessV4::StableHashString(analysis.schema);
 		ExactCardLivenessV4::OperatorClosure closure =
 			ExactCardLivenessV4::BuildOperatorClosure(reachable, partitionHash);
+		ExactCardLivenessV4::ApplyStateCoverageScanners(closure, state);
 		int excludeOperatorCardId = 0;
 		if (state.exact.pendingSkillId > 0) {
 			auto skill = SkillTable.find(state.exact.pendingSkillId);
 			if (skill != SkillTable.end()) excludeOperatorCardId = skill->second.cardId;
 		}
-		// Nested-chance safety: if further Draw/TakePrize/zone moves remain reachable
-		// after this chance resolves, never analytic-integrate Passive.
+		// Nested-chance safety: remaining effects on THIS pending skill only.
 		const bool furtherChance = ExactCardLivenessV4::FurtherChanceUntilTurnEnd(
-			closure, excludeOperatorCardId);
-		// Coverage flags stay false until real scanners exist (no SealCoverage).
+			closure, state, excludeOperatorCardId);
 		const bool analyticOk = evaluator && evaluator->v4().isLoaded()
 			&& evaluator->v4().analyticIntegralSafe();
-		const bool allowPassiveIntegral = v4PassiveDrawEnabled && !furtherChance && analyticOk
-			&& closure.complete();
-		if (v4PassiveDrawEnabled && furtherChance) ++metrics.nestedChancePassiveFallbacks;
+		// Per-card proveCandidate gates Passive — not closure.complete().
+		const bool allowPassiveIntegral = v4PassiveDrawEnabled && !furtherChance && analyticOk;
+		if (v4PassiveDrawEnabled && furtherChance) {
+			++metrics.nestedChancePassiveFallbacks;
+			++metrics.fallbackFurtherChance;
+		}
+		if (v4PassiveDrawEnabled && !analyticOk) ++metrics.fallbackAnalyticBound;
 		const int drawCount = state.exact.pendingCount;
 		ExactPassivePayloadV4 basePassiveForGuard;
 		{
@@ -4553,6 +4567,16 @@ private:
 				live.liveness = ExactCardLivenessV4::CardLiveness::Active;
 				live.reasonMask |= ExactCardLivenessV4::UnsupportedTarget;
 				++metrics.livenessFallbackCount;
+				++metrics.fallbackUnknownToken;
+			}
+			if (live.liveness != ExactCardLivenessV4::CardLiveness::Passive) {
+				if (!live.coverage.actionCostSafe) ++metrics.fallbackIncompleteCosts;
+				if (!closure.pendingEffectsCovered || !live.coverage.handIdentitySafe)
+					++metrics.fallbackIncompletePending;
+				if (!closure.globalEffectsCovered) ++metrics.fallbackIncompleteGlobal;
+				if (!live.coverage.selectionSafe) ++metrics.fallbackIncompleteSelection;
+				if (!live.coverage.conditionSafe) ++metrics.fallbackIncompleteConditions;
+				if (!live.proof.semanticInvariant) ++metrics.fallbackSemanticInvariant;
 			}
 			if (live.liveness == ExactCardLivenessV4::CardLiveness::Unknown) {
 				++metrics.unknownLivenessCount;
@@ -4594,6 +4618,7 @@ private:
 				if (!passiveSemanticInvariantAllTakes(state, target, drawCount, closure, basePassiveForGuard)) {
 					target.passiveIntegrated = false;
 					++metrics.representativeInvariantFallbacks;
+					++metrics.fallbackSemanticInvariant;
 				} else {
 					metrics.passiveCardsIntegrated += (unsigned long long)target.count;
 				}
@@ -4616,6 +4641,7 @@ private:
 					if (!passiveSemanticInvariantAllTakes(state, singleton, drawCount, closure, basePassiveForGuard)) {
 						singleton.passiveIntegrated = false;
 						++metrics.representativeInvariantFallbacks;
+						++metrics.fallbackSemanticInvariant;
 						metrics.activeCardCount += (unsigned long long)item.second;
 					} else {
 						metrics.passiveCardCount += (unsigned long long)item.second;
@@ -4665,6 +4691,7 @@ private:
 			for (int id : baseAnalysis.visibleIds) reachable.insert(id);
 			auto closure = ExactCardLivenessV4::BuildOperatorClosure(reachable,
 				ExactCardLivenessV4::StableHashString(baseAnalysis.schema));
+			ExactCardLivenessV4::ApplyStateCoverageScanners(closure, state);
 			auto split = ExactCardLivenessV4::SplitHandCounts(state, actor, handCounts, closure);
 			// Only keep basePassive when this chance itself may analytic-integrate.
 			// Otherwise nested chances would double-count base in E[R].

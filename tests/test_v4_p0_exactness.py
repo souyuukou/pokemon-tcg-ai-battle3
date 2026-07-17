@@ -91,16 +91,17 @@ def lib():
     return sim.lib
 
 
-def test_liveness_schema_v2(lib):
+def test_liveness_schema_v3(lib):
     if not hasattr(lib, "ExactCardLivenessV4Diagnostics"):
         pytest.skip("ExactCardLivenessV4Diagnostics not exported")
     import json
 
     raw = lib.ExactCardLivenessV4Diagnostics()
     data = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
-    assert data["livenessSchemaVersion"] == 2
+    assert data["livenessSchemaVersion"] == 3
     assert data["ultraBallBlocksUsedSupporter"] is True
     assert data.get("ultraBallDiscardCostObserved", True) is True
+    assert data.get("damageOnlyDoesNotBlockPassiveEnergy", False) is True
 
 
 def test_liveness_defaults_unknown_not_passive(lib):
@@ -116,9 +117,8 @@ def test_liveness_defaults_unknown_not_passive(lib):
 
 def test_deck_removal_classes_must_not_merge():
     """Documented invariant: different source classes stay separate when search exists."""
-    # Pure structural assertion for the P0-2 API shape.
     from exact_solver import nnue_v4
 
     assert nnue_v4.MODEL_SCHEMA == 2
-    assert nnue_v4.LIVENESS_SCHEMA == 2
+    assert nnue_v4.LIVENESS_SCHEMA == 3
     assert nnue_v4.FEATURE_SCHEMA == 2

@@ -22,10 +22,11 @@ def test_ultra_ball_discard_cost_makes_used_supporter_active(lib):
 
     raw = lib.ExactCardLivenessV4Diagnostics()
     data = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
-    assert data["livenessSchemaVersion"] == 2
+    assert data["livenessSchemaVersion"] == 3
     assert data["ultraBallDiscardCostObserved"] is True
     assert data["ultraBallBlocksUsedSupporter"] is True
     assert data["usedSupporterPassiveWithoutUltra"] is True
+    assert data["damageOnlyDoesNotBlockPassiveEnergy"] is True
 
 
 def test_zone_strip_keeps_deck_features():

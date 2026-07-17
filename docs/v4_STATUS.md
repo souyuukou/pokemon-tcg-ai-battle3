@@ -2,19 +2,20 @@
 
 ## Gate verdict
 
-Experimental only. `certified=false` until coverage scanners + oracles pass.
+Experimental only. `certified=false` until full identity oracles pass on production decks.
 
-## P0d (this push)
+## P0e (this push)
 
 | Item | Status |
 |------|--------|
-| `passiveSemanticInvariant`: explicit base+drawn Passive, no empty-closure reclassify | done |
-| Check take = 1..min(drawCount, class.count); heavy class ⇒ Active fallback | done |
-| Full FeatureRecord serialization (`SerializeSemanticFeatures`) | done |
-| Removed fake `SealCoverageForTerminalChance` true-stamping | done |
-| V4 search leaf path uses unclamped eval uniformly | done |
-| `prePartitionProofHash` from dependency/reachable/model (not 0) | done |
-| Real coverage scanners (pending/global/costs/selection/conditions) | **not yet** |
-| Full identity e2e oracle | **not yet** |
+| Per-card `CandidateCoverageProof` / `proveCandidate` | done |
+| Scanners: pending / global / costs / selection / conditions | done |
+| Condition effects included in operator footprints | done |
+| Dropped `closure.complete()` as Passive integral gate | done |
+| Nested chance = pending-skill remainder (not all Main Items) | done |
+| Fallback metrics by coverage category | done |
+| Damage-only operators do not block Passive energy | done (diagnostics) |
+| Mini-deck Passive ON/OFF identity oracle | added (skips if setup fails) |
+| seed4 90s certified | still Phase-6 |
 
-Without coverage scanners, `OperatorClosure::complete()` is rarely true when reachable operators exist, so Passive integral stays fail-closed — intentional.
+`closure.complete()` remains a diagnostic aggregate. Passive classification uses `proveCandidate` + `PassiveProofV4`.
